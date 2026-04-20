@@ -15,3 +15,6 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["ultracoustics*"]
+
+[tool.setuptools.package-data]
+"ultracoustics._internal" = ["bin/*.dll"]

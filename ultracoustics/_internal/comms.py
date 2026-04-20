@@ -30,7 +30,7 @@ from ..config import VENDOR_ID, PRODUCT_ID, SAMPLE_RATE
 
 # Resolve bundled libusb DLL on Windows so the SDK is self-contained
 _current_dir = os.path.dirname(os.path.abspath(__file__))
-_bin_path = os.path.join(_current_dir, '..', 'bin', 'libusb-1.0.dll')
+_bin_path = os.path.join(_current_dir, 'bin', 'libusb-1.0.dll')
 
 _backend = None
 if platform.system() == 'Windows' and os.path.exists(_bin_path):

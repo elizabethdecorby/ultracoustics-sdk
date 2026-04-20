@@ -21,10 +21,12 @@ Typical usage::
 
     ctrl = Controller(verbose=True)
     ctrl.connect()             # USB bulk to master board
-    ctrl.start()               # send BOOT command (turn on laser measurment system), begin reading streamed data
+    ctrl.begin_stream()        # start reading USB data into buffer (laser still off)
+    ctrl.start()               # send BOOT command (turn on laser measurement system)
     import time; time.sleep(2) # wait for system to lock, stabilize, and for buffer to fill
     data = ctrl.save(1.0)      # snapshot 1 second of samples
-    ctrl.stop()                # send IDLE (turn off laser measurement system), stop reading streamed data
+    ctrl.stop()                # send IDLE (turn off laser measurement system, stream keeps running)
+    ctrl.end_stream()          # stop reading USB data
     ctrl.close()               # release all resources
 """
 
@@ -46,10 +48,12 @@ class Controller:
 
     ctrl = Controller(verbose=True)
         ctrl.connect()             # USB bulk to master board
-        ctrl.start()               # send BOOT command (turn on laser measurment system), begin reading streamed data
+        ctrl.begin_stream()        # start reading USB data into buffer (laser still off)
+        ctrl.start()               # send BOOT command (turn on laser measurement system)
         import time; time.sleep(2) # wait for system to lock, stabilize, and for buffer to fill
         data = ctrl.save(1.0)      # snapshot 1 second of samples
-        ctrl.stop()                # send IDLE (turn off laser measurement system), stop reading streamed data
+        ctrl.stop()                # send IDLE (turn off laser, stream keeps running)
+        ctrl.end_stream()          # stop reading USB data
         ctrl.close()               # release all resources
 
         Real-time buffer access
@@ -96,6 +100,7 @@ class Controller:
         self._usb: USBBulkConnection | None = None
         self._stream: USBStream | None = None
         self._running = False
+        self._streaming = False
 
         # Rolling circular buffer (uint16, 1.2 s default)
         self._buf_len = int(SAMPLE_RATE * 1.2)
@@ -148,23 +153,57 @@ class Controller:
 
     @property
     def running(self) -> bool:
-        """``True`` while acquisition is active (between :meth:`start` and :meth:`stop`)."""
+        """``True`` while the laser measurement system is active (between :meth:`start` and :meth:`stop`)."""
         return self._running
+
+    @property
+    def streaming(self) -> bool:
+        """``True`` while USB data is being read into the buffer (between :meth:`begin_stream` and :meth:`end_stream`)."""
+        return self._streaming
 
     # -- State management -----------------------------------------------------
 
-    def start(self):
-        """Send BOOT command to turn laser system on (thus start measurements), and run logic to read back stream of usb data."""
+    def begin_stream(self):
+        """Start reading USB bulk data into the circular buffer without turning the laser on.
+
+        Call this after :meth:`connect` to begin collecting data immediately.
+        The laser measurement system remains off until :meth:`start` is called.
+        """
         self._ensure_connected()
-        self._stream.start(callback=self._on_data)
+        if not self._streaming:
+            self._stream.start(callback=self._on_data)
+            self._streaming = True
+
+    def end_stream(self):
+        """Stop reading USB bulk data from the device.
+
+        This does *not* send an IDLE command — use :meth:`stop` first if the
+        laser is currently active.
+        """
+        self._streaming = False
+        if self._stream:
+            self._stream.stop()
+
+    def start(self):
+        """Send BOOT command to turn the laser measurement system on.
+
+        If :meth:`begin_stream` has not been called yet, the USB data stream
+        is started automatically so that samples begin arriving in the buffer.
+        """
+        self._ensure_connected()
+        if not self._streaming:
+            self.begin_stream()
         self._send(CMD_BOOT)
         self._running = True
 
     def stop(self):
-        """Send IDLE command to turn off lasers, and run logic to stop reading streamed data."""
+        """Send IDLE command to turn off the laser measurement system.
+
+        The USB data stream continues running so the buffer stays live and
+        the GUI can keep displaying data. Call :meth:`end_stream` (or
+        :meth:`close`) to fully halt data collection.
+        """
         self._running = False
-        if self._stream:
-            self._stream.stop()
         try:
             self._send(CMD_IDLE)
         except Exception:
@@ -177,9 +216,10 @@ class Controller:
 
     def close(self):
         """Release all hardware resources."""
-        self.stop()
+        if self._running:
+            self.stop()
+        self.end_stream()
         if self._stream:
-            self._stream.stop()
             self._stream = None
         if self._usb:
             self._usb.close()
