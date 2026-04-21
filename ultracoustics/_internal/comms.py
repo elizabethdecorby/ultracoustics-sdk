@@ -171,19 +171,35 @@ class USBStream:
     High-throughput threaded USB Bulk streaming.  (Internal)
 
     Wraps a ``USBBulkConnection`` and pumps data from the IN endpoint
-    into a :class:`queue.Queue` (or invokes a user callback) in a
-    background thread.
+    into either:
+    - a pre-allocated circular buffer (preferred path),
+    - a user callback, or
+    - a :class:`queue.Queue` fallback.
+
+    The controller binds the circular-buffer sink at construction time to
+    avoid queue handoff and per-chunk callback overhead in the normal
+    live-stream path.
     """
 
-    def __init__(self, connection: USBBulkConnection, buffer_size=65536):
+    def __init__(
+        self,
+        connection: USBBulkConnection,
+        buffer_size=65536,
+        ring_buffer: Optional[np.ndarray] = None,
+    ):
         self._conn = connection
         self._buffer_size = buffer_size
         self._running = False
         self._thread = None
         self._callback = None
         self.data_queue: queue.Queue = queue.Queue(maxsize=200)
+        self._ring_buffer: Optional[np.ndarray] = None
+        self._ring_head = 0
+        self._ring_total = 0
         self.disconnected = False
         self.last_error: Optional[Exception] = None
+        if ring_buffer is not None:
+            self._set_ring_buffer(ring_buffer, reset=True)
 
     # -- Public API -----------------------------------------------------------
 
@@ -203,6 +219,17 @@ class USBStream:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
+    def _set_ring_buffer(self, ring_buffer: np.ndarray, reset=True):
+        """Bind a pre-allocated uint16 circular buffer as stream sink."""
+        if ring_buffer.dtype != np.uint16:
+            raise ValueError("ring_buffer must be dtype uint16")
+        if ring_buffer.ndim != 1:
+            raise ValueError("ring_buffer must be a 1D array")
+        self._ring_buffer = ring_buffer
+        if reset:
+            self._ring_head = 0
+            self._ring_total = 0
+
     def stop(self):
         """Stop streaming and join the background thread."""
         self._running = False
@@ -213,6 +240,14 @@ class USBStream:
     @property
     def running(self):
         return self._running
+
+    @property
+    def ring_head(self) -> int:
+        return self._ring_head
+
+    @property
+    def ring_total(self) -> int:
+        return self._ring_total
 
     # -- Internal -------------------------------------------------------------
 
@@ -227,6 +262,24 @@ class USBStream:
 
                 if self._callback:
                     self._callback(data_array)
+                elif self._ring_buffer is not None:
+                    samples = np.frombuffer(data_array, dtype=np.uint16)
+                    n = len(samples)
+                    buf = self._ring_buffer
+                    head = self._ring_head
+                    buf_len = len(buf)
+
+                    if head + n <= buf_len:
+                        buf[head : head + n] = samples
+                        head += n
+                    else:
+                        first = buf_len - head
+                        buf[head:] = samples[:first]
+                        buf[: n - first] = samples[first:]
+                        head = n - first
+
+                    self._ring_head = head
+                    self._ring_total += n
                 else:
                     samples = np.frombuffer(data_array, dtype=np.uint16)
                     try:

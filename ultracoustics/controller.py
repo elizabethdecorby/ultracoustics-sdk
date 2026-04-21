@@ -123,7 +123,7 @@ class Controller:
             If the Master Board is not found or the USB claim fails.
         """
         self._usb = USBBulkConnection(verbose=self.verbose)
-        self._stream = USBStream(self._usb)
+        self._stream = USBStream(self._usb, ring_buffer=self._buf)
 
     @property
     def connected(self) -> bool:
@@ -140,7 +140,9 @@ class Controller:
     @property
     def buffer_head(self) -> int:
         """Current write-head index in the circular buffer."""
-        return self._buf_idx
+        if self._stream is None:
+            return self._buf_idx
+        return self._stream.ring_head
 
     @property
     def buffer_capacity(self) -> int:
@@ -150,7 +152,9 @@ class Controller:
     @property
     def samples_received(self) -> int:
         """Cumulative number of samples received since streaming started."""
-        return self._total_samples
+        if self._stream is None:
+            return self._total_samples
+        return self._stream.ring_total
 
     @property
     def running(self) -> bool:
@@ -172,7 +176,7 @@ class Controller:
         """
         self._ensure_connected()
         if not self._streaming:
-            self._stream.start(callback=self._on_data)
+            self._stream.start()
             self._streaming = True
 
     def end_stream(self):
@@ -235,20 +239,22 @@ class Controller:
         file.  The captured numpy array is always returned.
         """
         samples_needed = int(SAMPLE_RATE * duration_s)
+        total_samples = self.samples_received
+        buf_idx = self.buffer_head
 
-        if self._total_samples < samples_needed:
+        if total_samples < samples_needed:
             raise RuntimeError(
-                f"Buffer contains only {self._total_samples} samples "
+                f"Buffer contains only {total_samples} samples "
                 f"({samples_needed} needed for {duration_s}s)."
             )
 
         # Extract from circular buffer
-        if self._buf_idx >= samples_needed:
-            data = self._buf[self._buf_idx - samples_needed : self._buf_idx].copy()
+        if buf_idx >= samples_needed:
+            data = self._buf[buf_idx - samples_needed : buf_idx].copy()
         else:
             data = np.concatenate([
-                self._buf[self._buf_len - (samples_needed - self._buf_idx) :],
-                self._buf[: self._buf_idx],
+                self._buf[self._buf_len - (samples_needed - buf_idx) :],
+                self._buf[:buf_idx],
             ])
 
         if path is not None:
@@ -271,11 +277,9 @@ class Controller:
         self._usb.send_command(cmd_byte, wValue, wIndex, extra, timeout_ms)
 
     def _on_data(self, data_array):
-        """Callback from USBStream – appends raw bytes to the circular buffer.
+        """Legacy callback path that appends raw bytes to the circular buffer.
 
-        Called on the USBStream reader thread each time a USB bulk packet
-        arrives.  The bytes are interpreted as little-endian ``uint16``
-        samples and written into ``_buf`` with wrap-around.
+        The preferred path is direct ring-buffer writes inside ``USBStream``.
         """
         samples = np.frombuffer(data_array, dtype=np.uint16)
         n = len(samples)
