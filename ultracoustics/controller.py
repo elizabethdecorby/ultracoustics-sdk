@@ -4,8 +4,8 @@ High-level controller for the Ultracoustics BROADSONIC System.
 This module provides the :class:`Controller` class, which is the primary
 user-facing interface for the Ultracoustics SDK. It manages:
 
-- **USB Bulk connection** to the Master Board for streaming measurement data
 - **System state management** (BOOT / IDLE / WARM modes)
+- **USB Bulk connection** to the Master Board for streaming measurement data
 - **Data acquisition** with read access to a rolling circular buffer and snapshot-based saving
 
 Internally uses a :class:`comms.USBBulkConnection` and
