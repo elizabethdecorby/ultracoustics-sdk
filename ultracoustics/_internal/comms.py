@@ -17,6 +17,7 @@ import platform
 import threading
 import time
 import queue
+from typing import Optional
 
 import numpy as np
 import usb.core
@@ -65,12 +66,7 @@ class USBBulkConnection:
             print(f"Finding device {hex(self.vid)}:{hex(self.pid)}...")
 
         def find_dev():
-            d = usb.core.find(idVendor=self.vid, idProduct=self.pid, backend=_backend)
-            if d is None and self.pid == 0x000A:
-                d = usb.core.find(idVendor=0x0483, idProduct=0x000A, backend=_backend)
-                if d:
-                    self.vid = 0x0483
-            return d
+            return usb.core.find(idVendor=self.vid, idProduct=self.pid, backend=_backend)
 
         self.dev = find_dev()
         if self.dev is None:
@@ -187,6 +183,7 @@ class USBStream:
         self._callback = None
         self.data_queue: queue.Queue = queue.Queue(maxsize=200)
         self.disconnected = False
+        self.last_error: Optional[Exception] = None
 
     # -- Public API -----------------------------------------------------------
 
@@ -202,6 +199,7 @@ class USBStream:
         self._running = True
         self._callback = callback
         self.disconnected = False
+        self.last_error = None
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -243,8 +241,12 @@ class USBStream:
                     self._conn.connected = False
                     self.disconnected = True
                     break
-            except Exception:
-                pass
+            except Exception as e:
+                self.last_error = e
+                self._running = False
+                if getattr(self._conn, "verbose", False):
+                    print(f"USB stream loop error: {e}")
+                break
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +286,7 @@ class SerialConnection:
             desc = str(p.description).lower()
             if "broadsonic" in desc or "ultracoustics" in desc:
                 candidates.insert(0, p)
-            elif "tty.usbmodem" in p.device or "COM" in p.device:
+            elif "tty.usbmodem" in p.device:
                 candidates.append(p)
         if not candidates:
             return None

@@ -7,6 +7,7 @@ from .controller import Controller
 from .processing import compute_psd, load_binary, adc_to_uw
 
 __all__ = [
+    "__version__",
     "Controller",
     "compute_psd",
     "load_binary",

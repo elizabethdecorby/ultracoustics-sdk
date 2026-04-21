@@ -32,6 +32,7 @@ Typical usage::
 
 import time
 from pathlib import Path
+from typing import Optional, Union
 
 import numpy as np
 
@@ -97,8 +98,8 @@ class Controller:
             (default capacity ~1.2 s at the configured sample rate).
         """
         self.verbose = verbose
-        self._usb: USBBulkConnection | None = None
-        self._stream: USBStream | None = None
+        self._usb: Optional[USBBulkConnection] = None
+        self._stream: Optional[USBStream] = None
         self._running = False
         self._streaming = False
 
@@ -227,7 +228,7 @@ class Controller:
 
     # -- Data capture ---------------------------------------------------------
 
-    def save(self, duration_s: float = 1.0, path: str | Path | None = None) -> np.ndarray:
+    def save(self, duration_s: float = 1.0, path: Optional[Union[str, Path]] = None) -> np.ndarray:
         """Capture *duration_s* seconds of data and optionally write to disk.
 
         If *path* is given the raw uint16 samples are written as a binary
