@@ -6,7 +6,7 @@ Classes:
         (STM32H7RS).  Handles device discovery, configuration, and
         provides raw send/receive primitives.
     USBStream -- Background-threaded reader that continuously pulls data
-        from a USBBulkConnection and delivers it via a queue or callback.
+        from a USBBulkConnection directly into a circular buffer or callback.
     SerialConnection -- USB-Serial (VCP) link to a Slave Laser Board
         (STM32G4).  Auto-detects the COM/tty port and exposes a
         line-oriented text interface.
@@ -16,7 +16,6 @@ import os
 import platform
 import threading
 import time
-import queue
 from typing import Optional
 
 import numpy as np
@@ -171,14 +170,12 @@ class USBStream:
     High-throughput threaded USB Bulk streaming.  (Internal)
 
     Wraps a ``USBBulkConnection`` and pumps data from the IN endpoint
-    into either:
-    - a pre-allocated circular buffer (preferred path),
-    - a user callback, or
-    - a :class:`queue.Queue` fallback.
+    directly into either:
+    - a pre-allocated circular buffer (normal path, zero-copy), or
+    - a user callback.
 
     The controller binds the circular-buffer sink at construction time to
-    avoid queue handoff and per-chunk callback overhead in the normal
-    live-stream path.
+    avoid intermediate allocations and per-chunk callback overhead.
     """
 
     def __init__(
@@ -192,7 +189,6 @@ class USBStream:
         self._running = False
         self._thread = None
         self._callback = None
-        self.data_queue: queue.Queue = queue.Queue(maxsize=200)
         self._ring_buffer: Optional[np.ndarray] = None
         self._ring_head = 0
         self._ring_total = 0
@@ -208,7 +204,7 @@ class USBStream:
 
         Args:
             callback: Optional ``callback(data_bytes)`` invoked for every
-                chunk.  If *None*, chunks are placed on ``self.data_queue``.
+                chunk.  If *None*, data is written into the attached ring buffer.
         """
         if self._running:
             return
@@ -280,12 +276,6 @@ class USBStream:
 
                     self._ring_head = head
                     self._ring_total += n
-                else:
-                    samples = np.frombuffer(data_array, dtype=np.uint16)
-                    try:
-                        self.data_queue.put_nowait(samples)
-                    except queue.Full:
-                        pass  # drop oldest implicitly
 
             except usb.core.USBError as e:
                 if e.errno == 110:  # timeout – normal when idle
