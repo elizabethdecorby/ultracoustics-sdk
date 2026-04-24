@@ -181,7 +181,7 @@ class USBStream:
     def __init__(
         self,
         connection: USBBulkConnection,
-        buffer_size=65536,
+        buffer_size=262144,
         ring_buffer: Optional[np.ndarray] = None,
     ):
         self._conn = connection
@@ -248,6 +248,9 @@ class USBStream:
     # -- Internal -------------------------------------------------------------
 
     def _loop(self):
+        _chunk_log_interval = 200  # Log every N chunks
+        _chunk_count = 0
+        _chunk_sizes = []
         while self._running and self._conn.connected:
             try:
                 data_array = self._conn.dev.read(
@@ -255,6 +258,18 @@ class USBStream:
                 )
                 if len(data_array) == 0:
                     continue
+
+                # Chunk size diagnostics — remove once behaviour is understood
+                if getattr(self._conn, 'verbose', False):
+                    _chunk_sizes.append(len(data_array))
+                    _chunk_count += 1
+                    if _chunk_count % _chunk_log_interval == 0:
+                        avg = sum(_chunk_sizes) / len(_chunk_sizes)
+                        print(
+                            f"[USBStream] chunk stats over last {_chunk_log_interval}: "
+                            f"min={min(_chunk_sizes)}, max={max(_chunk_sizes)}, avg={avg:.0f} bytes"
+                        )
+                        _chunk_sizes.clear()
 
                 if self._callback:
                     self._callback(data_array)
