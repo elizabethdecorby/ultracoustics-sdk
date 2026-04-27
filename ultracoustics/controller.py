@@ -98,50 +98,65 @@ class Controller:
             (default capacity ~1.2 s at the configured sample rate).
         """
         self.verbose = verbose
-        self._usb: Optional[USBBulkConnection] = None
         self._stream: Optional[USBStream] = None
         self._running = False
         self._streaming = False
+        self._connected = False
 
-        # Rolling circular buffer (uint16, 1.2 s default)
+        # Default ring capacity: ~1.2 s at the configured sample rate.
+        # Lives in shared memory once the stream subprocess is spawned
+        # (allocated by USBStream) so the parent and reader share it
+        # zero-copy.
         self._buf_len = int(SAMPLE_RATE * 1.2)
-        self._buf = np.zeros(self._buf_len, dtype=np.uint16)
-        self._buf_idx = 0
-        self._total_samples = 0
 
     # -- Connection lifecycle -------------------------------------------------
 
     def connect(self):
-        """Open the USB Bulk connection to the Master Board.
+        """Probe for the Master Board and prepare a streaming session.
 
-        Creates a :class:`USBBulkConnection` and wraps it in a
-        :class:`USBStream` for background data ingestion.
+        Performs a quick :class:`USBBulkConnection` open/close to fail fast
+        if the device is missing, then constructs a :class:`USBStream`.  The
+        stream's reader subprocess is *not* spawned here — that happens in
+        :meth:`begin_stream` — which avoids holding the USB device claim
+        between :meth:`connect` and :meth:`begin_stream`.
 
         Raises
         ------
-        usb.core.USBError
+        RuntimeError
             If the Master Board is not found or the USB claim fails.
         """
-        self._usb = USBBulkConnection(verbose=self.verbose)
-        self._stream = USBStream(self._usb, ring_buffer=self._buf)
+        probe = USBBulkConnection(verbose=self.verbose)
+        probe.close()  # release the device so the reader subprocess can claim it
+        self._stream = USBStream(
+            ring_capacity_samples=self._buf_len,
+            verbose=self.verbose,
+        )
+        self._connected = True
 
     @property
     def connected(self) -> bool:
-        """``True`` if the USB connection to the Master Board is active."""
-        return self._usb is not None and self._usb.connected
+        """``True`` once :meth:`connect` has succeeded and resources are live."""
+        return self._connected and self._stream is not None
 
     # -- Live buffer access (read-only) ---------------------------------------
 
     @property
     def buffer(self) -> np.ndarray:
-        """Read-only view of the live circular sample buffer (uint16)."""
-        return self._buf
+        """Read-only view of the live circular sample buffer (uint16).
+
+        Backed by shared memory written by the reader subprocess.
+        """
+        if self._stream is None:
+            # Pre-connect: return an empty placeholder so callers don't
+            # crash on attribute access.
+            return np.zeros(0, dtype=np.uint16)
+        return self._stream.buffer
 
     @property
     def buffer_head(self) -> int:
         """Current write-head index in the circular buffer."""
         if self._stream is None:
-            return self._buf_idx
+            return 0
         return self._stream.ring_head
 
     @property
@@ -153,7 +168,7 @@ class Controller:
     def samples_received(self) -> int:
         """Cumulative number of samples received since streaming started."""
         if self._stream is None:
-            return self._total_samples
+            return 0
         return self._stream.ring_total
 
     @property
@@ -165,6 +180,17 @@ class Controller:
     def streaming(self) -> bool:
         """``True`` while USB data is being read into the buffer (between :meth:`begin_stream` and :meth:`end_stream`)."""
         return self._streaming
+
+    @property
+    def stream_stats(self) -> Optional[dict]:
+        """Packet-level stream diagnostics when supported by firmware.
+
+        Returns a dict with ``packets``, ``drops_host``, ``malformed``, and
+        ``last_seq`` while streaming; returns ``None`` when not connected.
+        """
+        if self._stream is None:
+            return None
+        return self._stream.get_stream_stats()
 
     # -- State management -----------------------------------------------------
 
@@ -224,11 +250,10 @@ class Controller:
         if self._running:
             self.stop()
         self.end_stream()
-        if self._stream:
+        if self._stream is not None:
+            self._stream.close()
             self._stream = None
-        if self._usb:
-            self._usb.close()
-            self._usb = None
+        self._connected = False
 
     # -- Data capture ---------------------------------------------------------
 
@@ -248,13 +273,15 @@ class Controller:
                 f"({samples_needed} needed for {duration_s}s)."
             )
 
-        # Extract from circular buffer
+        buf = self.buffer
+        # Extract from circular buffer (shared memory — we copy on the way
+        # out so callers can hold the result independently of the reader).
         if buf_idx >= samples_needed:
-            data = self._buf[buf_idx - samples_needed : buf_idx].copy()
+            data = buf[buf_idx - samples_needed : buf_idx].copy()
         else:
             data = np.concatenate([
-                self._buf[self._buf_len - (samples_needed - buf_idx) :],
-                self._buf[:buf_idx],
+                buf[self._buf_len - (samples_needed - buf_idx) :],
+                buf[:buf_idx],
             ])
 
         if path is not None:
@@ -273,22 +300,17 @@ class Controller:
             raise RuntimeError("Not connected. Call connect() first.")
 
     def _send(self, cmd_byte, wValue=0, wIndex=0, extra=b"", timeout_ms=5000):
-        """Send a command packet over USB bulk to the Master Board."""
-        self._usb.send_command(cmd_byte, wValue, wIndex, extra, timeout_ms)
+        """Send a command packet over USB bulk to the Master Board.
 
-    def _on_data(self, data_array):
-        """Legacy callback path that appends raw bytes to the circular buffer.
-
-        The preferred path is direct ring-buffer writes inside ``USBStream``.
+        Routes through the streaming subprocess's command queue, since that
+        process owns the libusb device handle exclusively.  ``timeout_ms`` is
+        accepted for API compatibility; the subprocess applies its own
+        bulkWrite timeout (2 s) which is sufficient for command packets.
         """
-        samples = np.frombuffer(data_array, dtype=np.uint16)
-        n = len(samples)
-        if self._buf_idx + n <= self._buf_len:
-            self._buf[self._buf_idx : self._buf_idx + n] = samples
-            self._buf_idx += n
-        else:
-            first = self._buf_len - self._buf_idx
-            self._buf[self._buf_idx :] = samples[:first]
-            self._buf[: n - first] = samples[first:]
-            self._buf_idx = n - first
-        self._total_samples += n
+        from ._internal.protocol import pack_command
+        if self._stream is None or not self._stream.running:
+            raise RuntimeError(
+                "Not streaming — call begin_stream() before sending commands."
+            )
+        pkt = pack_command(cmd_byte, wValue, wIndex) + extra
+        self._stream.send_command(pkt)
