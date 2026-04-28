@@ -21,6 +21,7 @@ ultracoustics-sdk/
         ├── comms.py
         ├── maintenance.py
         ├── protocol.py
+        ├── stream_proc.py
         └── bin/
 ```
 
@@ -28,6 +29,7 @@ ultracoustics-sdk/
 
 - The public API is exposed through the `ultracoustics` package.
 - Modules under `_internal` are implementation details and are included for guided diagnostics.
+- USB ingestion runs in a **separate reader process** using async `libusb1` transfers. Samples are written directly into a **shared-memory ring buffer** so the parent process (your script or GUI) reads them lock-free and zero-copy.
 
 ## Installation
 
@@ -45,17 +47,17 @@ py -3.13 -m venv venv_name
 macOS / Linux:
 
 ```bash
-python3 -m venv venv _name
+python3 -m venv venv_name
 source venv_name/bin/activate
 ```
 
-2. Install the SDK from the repository root (the folder that contains pyproject.toml).
+2. From within the new venv, install the SDK from the repository root (the folder that contains pyproject.toml).
 
 ```bash
 pip install -e .
 ```
 
-This installs NumPy, PyUSB, and PySerial automatically.
+This installs NumPy, PyUSB, libusb1, and PySerial automatically.
 
 ## Hardware Connection
 
@@ -81,7 +83,7 @@ ctrl.begin_stream()
 ctrl.start()
 
 # Wait for system lock and buffer fill
-time.sleep(3.1)
+time.sleep(5.1)
 
 # Save 1 second of raw uint16 ADC data
 data = ctrl.save(duration_s=1.0, path="capture.bin")
@@ -133,7 +135,7 @@ ctrl = Controller(verbose=True)
 
 | Property | Type | Description |
 |---|---|---|
-| `buffer` | `np.ndarray` (uint16) | The live circular sample ring. |
+| `buffer` | `np.ndarray` (uint16) | The live circular sample ring (backed by shared memory written by the reader subprocess). |
 | `buffer_head` | `int` | Current write-head index in the ring. |
 | `buffer_capacity` | `int` | Ring length in samples (~1.2 s at 10 MHz). |
 | `samples_received` | `int` | Cumulative samples received since streaming started. |
@@ -194,10 +196,9 @@ power_uw = adc_to_uw(samples, baseline=samples.mean())
 
 Run examples from the repository root after installation:
 
-```bash
+
 python examples/basic_capture.py
 python examples/offline_psd.py
-```
 
 ## Troubleshooting
 

@@ -345,6 +345,24 @@ def reader_main(
         if not ready_event.is_set():
             ready_event.set()
     finally:
+        # Final drain of the outbound command queue — ensures late-enqueued
+        # commands (e.g. IDLE sent immediately before terminate_event) reach
+        # the device before we tear down the handle. Without this, ctrl.stop()
+        # followed promptly by ctrl.end_stream()/close() can race the loop
+        # and leave the laser on.
+        if handle is not None and cmd_queue is not None:
+            try:
+                while True:
+                    cmd_bytes = cmd_queue.get_nowait()
+                    if cmd_bytes is None:
+                        continue
+                    try:
+                        handle.bulkWrite(BULK_OUT_EP, cmd_bytes, timeout=2000)
+                    except Exception:  # noqa: BLE001
+                        counters[4] += 1
+            except Exception:  # noqa: BLE001 — queue.Empty / closed queue
+                pass
+
         # Cancel pending transfers and wait briefly for callbacks to fire.
         for t in transfers:
             try:

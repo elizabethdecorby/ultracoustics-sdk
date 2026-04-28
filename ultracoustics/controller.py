@@ -8,9 +8,16 @@ user-facing interface for the Ultracoustics SDK. It manages:
 - **USB Bulk connection** to the Master Board for streaming measurement data
 - **Data acquisition** with read access to a rolling circular buffer and snapshot-based saving
 
-Internally uses a :class:`comms.USBBulkConnection` and
-:class:`comms.USBStream` for low-level I/O, exposing a simple
-connect / start / stop / save interface.
+Internally, :meth:`Controller.connect` performs a quick probe via
+:class:`comms.USBBulkConnection`, then constructs a
+:class:`comms.USBStream`.  The stream spawns a dedicated reader
+*subprocess* (see :mod:`ultracoustics._internal.stream_proc`) which owns
+the libusb-1.0 device handle exclusively and pumps async USB transfers
+directly into a **shared-memory ring buffer**.  The parent process reads
+samples lock-free and zero-copy via the ``buffer`` / ``buffer_head`` /
+``samples_received`` properties.  Outbound commands (BOOT/IDLE/WARM) are
+routed to the subprocess through a multiprocessing queue, since only the
+subprocess holds the device handle.
 
 For diagnostics, override mode, firmware queries, laser serial control, and
 firmware flashing, see :mod:`ultracoustics._internal.maintenance`.
@@ -68,11 +75,15 @@ class Controller:
             ctrl.buffer_head      # int        – current write-head index
             ctrl.buffer_capacity  # int        – ring length in samples
             ctrl.samples_received # int        – cumulative sample count
-            ctrl.running          # bool       – True while streaming
+            ctrl.streaming        # bool       – True while reader subprocess is running
+            ctrl.running          # bool       – True between start() and stop()
+            ctrl.stream_stats     # dict       – packet-level diagnostics
 
-        The buffer is written by a background thread; readers should
-        treat it as a lock-free snapshot (read the head index first,
-        then slice the array).
+        The buffer is written by the reader *subprocess* into shared
+        memory; readers in the parent process should treat it as a
+        lock-free snapshot (read ``buffer_head`` first, then slice the
+        array).  Counter reads are atomic 64-bit aligned loads on
+        x86-64.
     """
 
     def __init__(self, verbose=False):
@@ -86,16 +97,20 @@ class Controller:
 
         Attributes
         ----------
-        _usb : USBBulkConnection or None
-            Low-level USB bulk endpoint wrapper (set by :meth:`connect`).
         _stream : USBStream or None
-            Background reader that feeds samples to the circular buffer.
+            Wrapper around the reader subprocess and its shared-memory
+            ring buffer (set by :meth:`connect`).
         _running : bool
-            ``True`` while acquisition is active (between :meth:`start`
+            ``True`` while measurement is active (between :meth:`start`
             and :meth:`stop`).
-        _buf : numpy.ndarray
-            Rolling circular buffer of raw ``uint16`` ADC samples
-            (default capacity ~1.2 s at the configured sample rate).
+        _streaming : bool
+            ``True`` while the reader subprocess is alive (between
+            :meth:`begin_stream` and :meth:`end_stream`).
+        _connected : bool
+            ``True`` once :meth:`connect` has succeeded.
+        _buf_len : int
+            Capacity of the shared-memory ring buffer in samples
+            (default ~1.2 s at the configured sample rate).
         """
         self.verbose = verbose
         self._stream: Optional[USBStream] = None
