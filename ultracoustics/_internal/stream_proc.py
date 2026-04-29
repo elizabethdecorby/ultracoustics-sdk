@@ -29,10 +29,14 @@ Drop counter taxonomy
 The single ``drops_host`` of the previous implementation conflated several
 distinct failure modes.  This module separates them:
 
-- ``drops_seq``    : packets missing per the firmware sequence header.  Data
-                    was lost between firmware FIFO write and host receive —
-                    could be firmware FIFO overflow OR USB stack loss.
-                    Distinguishing the two requires firmware-side counters.
+- ``drops_seq``    : packets missing per the firmware sequence header.
+                    End-to-end loss indicator — could be firmware ring
+                    overflow OR host/kernel/USB-stack loss.
+- ``drops_fw``     : highest value of the firmware-side ``usb_dropped_buffers``
+                    counter ever observed in a delivered packet's header.
+                    Increments only when the firmware itself dropped a packet
+                    because its 4-deep pending ring was full.  Subtract from
+                    ``drops_seq`` to obtain host-attributable loss.
 - ``transfer_errors``   : libusb reported ``TRANSFER_ERROR`` / ``STALL`` /
                           ``OVERFLOW`` / ``NO_DEVICE`` on a completed transfer.
 - ``transfer_timeouts`` : libusb reported ``TRANSFER_TIMED_OUT``.  Normal in
@@ -63,10 +67,10 @@ import numpy as np
 # Shared memory layout
 # ---------------------------------------------------------------------------
 
-# Counter block: 8 × uint64 = 64 bytes, naturally aligned for atomic writes
+# Counter block: 9 × uint64 = 72 bytes, naturally aligned for atomic writes
 # on x86-64.
 _COUNTER_DTYPE = np.uint64
-_COUNTER_BYTES = 64
+_COUNTER_BYTES = 72
 _COUNTER_FIELDS = (
     'head_samples',      # 0  — write index in ring buffer (mod capacity)
     'total_samples',     # 1  — cumulative samples written
@@ -76,6 +80,7 @@ _COUNTER_FIELDS = (
     'transfer_timeouts', # 5  — libusb timeout count
     'malformed',         # 6  — packets with invalid byte count
     'flags',             # 7  — bit0: ready, bit1: fatal_error, bit2: device_lost
+    'drops_fw',          # 8  — latest firmware-reported ring-full drop count
 )
 
 FLAG_READY        = 1 << 0
@@ -107,15 +112,18 @@ def read_counters(shm: SharedMemory) -> dict:
 
 # Wire format constants (mirrored from comms.py to avoid importing it in the
 # subprocess — keeps the import surface small for ``spawn`` start method).
-PSSI_HEADER_BYTES = 4
+# 8-byte header = uint32 sequence + uint32 drops_fw (in-band firmware drop
+# counter). MUST stay in sync with comms.py and the firmware
+# pssi_packet_t in pssi_packet.h.
+PSSI_HEADER_BYTES = 8
 PSSI_PAYLOAD_BYTES = 16384
 PSSI_PACKET_WIRE_BYTES = PSSI_HEADER_BYTES + PSSI_PAYLOAD_BYTES
 
 # Async transfer pool — see module docstring for sizing rationale.
 #
 # Sizing note: USB bulk transfers terminate on a short packet, and our
-# 16388-byte wire payload ends with a 4-byte short packet (16388 mod
-# wMaxPacketSize=512 == 4).  Therefore each completed transfer carries
+# 16392-byte wire payload ends with an 8-byte short packet (16392 mod
+# wMaxPacketSize=512 == 8).  Therefore each completed transfer carries
 # **exactly one** logical packet, regardless of the buffer size we hand
 # libusb.  Buffering in flight = NUM_TRANSFERS packets, NOT
 # NUM_TRANSFERS * TRANSFER_SIZE / packet_size.
@@ -125,7 +133,7 @@ PSSI_PACKET_WIRE_BYTES = PSSI_HEADER_BYTES + PSSI_PAYLOAD_BYTES
 # letting the firmware FIFO overflow.  Bump higher (env override) if you
 # still see drops_seq incrementing while xerr/xto stay at 0.
 NUM_TRANSFERS = int(os.environ.get('UC_NUM_TRANSFERS', '256'))
-TRANSFER_SIZE = int(os.environ.get('UC_TRANSFER_SIZE', str(64 * 1024)))  # >= 16388
+TRANSFER_SIZE = int(os.environ.get('UC_TRANSFER_SIZE', str(64 * 1024)))  # >= 16392
 TRANSFER_TIMEOUT_MS = 1000
 
 # Bulk endpoint addresses (device-specific; mirrored from protocol.py).
@@ -244,13 +252,23 @@ def reader_main(
                     counters[6] += 1  # malformed
                 else:
                     raw = transfer.getBuffer()[:length]
-                    seq = struct.unpack_from('<I', raw, 0)[0]
+                    # 8-byte header: <I sequence, <I drops_fw
+                    seq, drops_fw = struct.unpack_from('<II', raw, 0)
 
                     if last_seq is not None:
                         delta = (seq - last_seq) & 0xFFFFFFFF
                         if 1 < delta <= _MAX_SANE_GAP:
                             counters[3] += (delta - 1)  # drops_seq
                     last_seq = seq
+
+                    # drops_fw is a snapshot of the firmware-side cumulative
+                    # ring-full drop counter at the moment this packet was
+                    # stamped. It is monotonic across a streaming session
+                    # (firmware zeroes it only on Boot_TriggerStart).
+                    # Publish the latest observed value; consumers compute
+                    # deltas. We don't take max() because a wraparound or
+                    # firmware reset should be reflected verbatim.
+                    counters[8] = drops_fw
 
                     # Convert payload to uint16 sample view (zero-copy slice
                     # of the libusb-owned buffer).

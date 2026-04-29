@@ -43,7 +43,7 @@ if platform.system() == 'Windows' and os.path.exists(_bin_path):
 
 
 # Streaming wire format used by recent firmware revisions.
-PSSI_HEADER_BYTES = 4
+PSSI_HEADER_BYTES = 8
 PSSI_PAYLOAD_BYTES = 16384
 PSSI_PACKET_WIRE_BYTES = PSSI_HEADER_BYTES + PSSI_PAYLOAD_BYTES
 
@@ -408,6 +408,14 @@ class USBStream:
 
         - ``packets``           : valid packets received.
         - ``drops_seq``         : packets missing per firmware sequence header.
+                                  End-to-end loss indicator (firmware ring
+                                  overflow OR host/kernel/USB-stack loss).
+        - ``drops_fw``          : firmware-reported ring-full drop counter,
+                                  delivered in-band in each packet's header.
+                                  Increments only when the firmware itself
+                                  dropped a packet. Compute
+                                  ``drops_seq - drops_fw`` to isolate
+                                  host/kernel-side loss.
         - ``transfer_errors``   : libusb non-OK transfer completions.
         - ``transfer_timeouts`` : libusb timeout completions.
         - ``malformed``         : packets with invalid byte counts.
