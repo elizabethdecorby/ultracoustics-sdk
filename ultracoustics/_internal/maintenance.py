@@ -85,9 +85,71 @@ class Programmer:
     MASTER_PAGE_SIZE = 512
     MASTER_MAX_FW = 65536  # 64 KB
 
+    # ---- Master IAP magic header (must match Boot/Core/Inc/firmware_info.h)
+    MASTER_MAGIC_BYTES         = b"UCBT"   # FW_MAGIC_BYTES
+    MASTER_MAGIC_HEADER_VER    = 1         # FW_MAGIC_HEADER_VERSION
+    MASTER_TARGET_ID           = 0x0001    # FW_TARGET_MASTER_BOOT_H7RS
+    MASTER_MAGIC_SCAN_BYTES    = 4096      # FW_MAGIC_SCAN_BYTES
+    MASTER_MAGIC_STRUCT_SIZE   = 16        # sizeof(fw_magic_t)
+
     def __init__(self, connection: USBBulkConnection, verbose=False):
         self._conn = connection
         self.verbose = verbose
+
+    # -- Magic header pre-flight --------------------------------------------
+
+    @classmethod
+    def _validate_master_magic(cls, firmware: bytes):
+        """Verify a candidate master firmware contains the UCBT magic header.
+
+        Mirrors ``iap_validate_magic`` in ``Boot/Core/Src/iap_receiver.c``.
+        Scans the first ``MASTER_MAGIC_SCAN_BYTES`` of the image on a
+        4-byte alignment for the ``UCBT`` tag, then checks header version
+        and target id.
+
+        Raises
+        ------
+        ValueError
+            If no valid magic header is present, or the header indicates
+            a different target / unsupported schema version.
+        """
+        scan_limit = min(len(firmware), cls.MASTER_MAGIC_SCAN_BYTES)
+        if scan_limit < cls.MASTER_MAGIC_STRUCT_SIZE:
+            raise ValueError(
+                "Firmware too small to contain a UCBT magic header — "
+                "this does not look like a Boot firmware image."
+            )
+
+        for off in range(0, scan_limit - cls.MASTER_MAGIC_STRUCT_SIZE + 1, 4):
+            if firmware[off:off + 4] != cls.MASTER_MAGIC_BYTES:
+                continue
+            header_ver, target_id, image_size, _reserved = struct.unpack_from(
+                "<HHII", firmware, off + 4
+            )
+            if header_ver != cls.MASTER_MAGIC_HEADER_VER:
+                raise ValueError(
+                    f"Firmware magic header_version={header_ver} is not "
+                    f"supported by this SDK (expected "
+                    f"{cls.MASTER_MAGIC_HEADER_VER})."
+                )
+            if target_id != cls.MASTER_TARGET_ID:
+                raise ValueError(
+                    f"Firmware target_id=0x{target_id:04X} does not match "
+                    f"this device (expected 0x{cls.MASTER_TARGET_ID:04X} "
+                    f"= master Boot for STM32H7RS)."
+                )
+            if image_size != 0 and image_size != len(firmware):
+                raise ValueError(
+                    f"Firmware magic image_size={image_size} disagrees with "
+                    f"file size {len(firmware)}."
+                )
+            return  # valid
+
+        raise ValueError(
+            "No 'UCBT' magic header found in the first "
+            f"{cls.MASTER_MAGIC_SCAN_BYTES} bytes — this file is not a "
+            "Boot firmware image built for this device. Refusing to flash."
+        )
 
     # -- Board 2: 1550 nm Slave -----------------------------------------------
 
@@ -128,6 +190,12 @@ class Programmer:
             raise ValueError(
                 f"Firmware size {fw_size} out of range (1–{self.MASTER_MAX_FW})"
             )
+
+        # Reject obviously wrong files (text files, slave images, images for
+        # the wrong product, etc.) BEFORE we touch the device.  See
+        # Boot/Core/Src/iap_receiver.c::iap_validate_magic for the device-side
+        # check that backs this up.
+        self._validate_master_magic(bytes(fw))
 
         # Pad to 16-byte alignment (quad-word flash programming unit)
         pad = (16 - (fw_size % 16)) % 16
