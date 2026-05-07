@@ -94,10 +94,11 @@ def compute_psd(samples, fft_size=8192, num_averages=1, sample_rate=SAMPLE_RATE)
     """Compute one-sided Power Spectral Density in physical units.
 
     Segments the input into *num_averages* non-overlapping blocks of
-    *fft_size*, applies a Hanning window, computes the real FFT, and
-    averages the magnitudes.  The result is converted from ADC counts
-    through the transimpedance / responsivity chain into W²/Hz, then
-    expressed in dB (10·log10).
+    *fft_size*, removes the per-segment DC level, applies a Hanning
+    window, computes the real FFT and averages the **power** spectra
+    (Welch's method).  The result is converted from ADC counts through
+    the transimpedance / responsivity chain into W²/Hz, then expressed
+    in dB (10·log10).
 
     Args:
         samples: 1-D array of raw ADC values (at least
@@ -115,7 +116,7 @@ def compute_psd(samples, fft_size=8192, num_averages=1, sample_rate=SAMPLE_RATE)
     Raises:
         ValueError: If *samples* is shorter than ``fft_size * num_averages``.
     """
-    samples = np.asarray(samples)
+    samples = np.asarray(samples, dtype=np.float64)
     total_needed = fft_size * num_averages
     if len(samples) < total_needed:
         raise ValueError(
@@ -125,28 +126,27 @@ def compute_psd(samples, fft_size=8192, num_averages=1, sample_rate=SAMPLE_RATE)
 
     window = np.hanning(fft_size)
 
-    # Reshape into segments and window
+    # Reshape into segments and detrend (remove per-segment DC).
     segments = samples[:total_needed].reshape(num_averages, fft_size)
+    segments = segments - segments.mean(axis=1, keepdims=True)
     windowed = segments * window
 
-    # Vectorised FFT
+    # Vectorised FFT, average |X|² (Welch).
     ffts = np.fft.rfft(windowed, axis=1)
-    magnitude_avg = np.mean(np.abs(ffts), axis=0)
+    power_avg = np.mean(np.abs(ffts) ** 2, axis=0)
 
-    # Convert magnitude (ADC counts) → optical power (µW)
-    # Note: use ADC_TO_POWER without differential factor for PSD
-    # (PSD is inherent to the measured signal)
+    # Convert ADC-count² spectrum → W²/Hz using the writeup's
+    # transimpedance / responsivity chain.
     adc_to_power_fft = _ADC_TO_CURRENT_UA / _RESPONSIVITY  # µW / count
-    power_mag = magnitude_avg * adc_to_power_fft
+    # Welch normalisation: 2 / (fs · Σw²); DC and Nyquist halved below.
+    norm = 2.0 / (sample_rate * np.sum(window ** 2))
+    psd_uw2 = power_avg * (adc_to_power_fft ** 2) * norm
+    psd_uw2[0] *= 0.5
+    psd_uw2[-1] *= 0.5
+    # µW²/Hz → W²/Hz
+    psd_w = psd_uw2 * 1e-12
 
-    # PSD = |X|² / (N · fs)   [µW²/Hz]
-    psd_uw = (power_mag ** 2) / (fft_size * sample_rate)
-    # One-sided spectrum: double all bins except DC and Nyquist
-    psd_uw[1:-1] *= 2
-    # µW² → W²  (1 µW = 1e-6 W → 1 µW² = 1e-12 W²)
-    psd_w = psd_uw / 1e12
-
-    psd_db = 10 * np.log10(psd_w + 1e-30)  # dB re 1 W²/Hz
+    psd_db = 10 * np.log10(psd_w + 1e-30)
 
     freq_hz = np.fft.rfftfreq(fft_size, 1.0 / sample_rate)
     return freq_hz, psd_db
