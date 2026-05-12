@@ -292,17 +292,35 @@ def fit_sho_log(freqs, psd,
                 peak_psd: float | None = None,
                 peak2_freq: float | None = None,
                 peak2_fwhm: float | None = None,
-                peak2_psd: float | None = None) -> dict:
+                peak2_psd: float | None = None,
+                psd_dark=None,
+                shot_psd_w2hz: float = 0.0) -> dict:
     """Log-space damped-oscillator fit to a measured PSD.
 
     Implements the procedure in writeup §4.  Single-mode fit by default;
     pass ``peak2_*`` kwargs for the two-mode model.
 
+    By default this routine performs a **forward-model fit**: the
+    measured PSD passed in as ``psd`` is treated as the *raw* total
+    PSD, and the model that is fitted is
+
+        S_TOT(ω) = SHO(ω; A, ω_n, Q)  +  S_DARK(ω)  +  S_SHOT
+
+    where ``psd_dark`` is the per-bin dark PSD on the same frequency
+    grid as ``freqs`` (in W²/Hz) and ``shot_psd_w2hz`` is the scalar
+    shot-noise floor.  Both default to zero, in which case the call
+    reduces to a pure SHO fit (equivalent to the legacy
+    subtraction-based behaviour when the caller passes
+    ``psd = psd_clean``).
+
     The returned dict mirrors the keys consumed elsewhere in the codebase
     (``fit_A``, ``fit_omega_n``, ``fit_Q_n``, optional ``fit_A2``,
     ``fit_omega_n2``, ``fit_Q_n2``, ``fit_C``, ``fit_freqs``,
-    ``fit_curve``, ``fit_error``).  ``fit_curve`` is evaluated on
-    ``freqs[1:]`` (DC bin skipped).
+    ``fit_curve``, ``fit_error``).  ``fit_curve`` is the **pure SHO**
+    component evaluated on ``freqs[1:]`` (DC bin skipped) so it overlays
+    cleanly onto the dark/shot-subtracted PSD.  ``fit_curve_total``
+    contains the full forward-model evaluation (SHO + dark + shot) on
+    the same grid for overlay onto the raw PSD.
     """
     is_dual = peak2_freq is not None and peak2_freq > 0 and peak2_fwhm
 
@@ -317,23 +335,40 @@ def fit_sho_log(freqs, psd,
     freqs = np.asarray(freqs, dtype=np.float64)
     psd = np.asarray(psd, dtype=np.float64)
 
+    # Background components for the forward model.  Default to zero so the
+    # call degrades to a pure SHO fit when the caller passes a
+    # pre-cleaned PSD.
+    shot_term = max(float(shot_psd_w2hz or 0.0), 0.0)
+    if psd_dark is None:
+        dark_full = np.zeros_like(freqs)
+    else:
+        dark_full = np.asarray(psd_dark, dtype=np.float64)
+        if dark_full.shape != freqs.shape:
+            result = dict(fit_A=None, fit_omega_n=None, fit_Q_n=None,
+                          fit_C=0.0, fit_freqs=None, fit_curve=None,
+                          fit_curve_total=None,
+                          fit_error="psd_dark length must match freqs")
+            return result
+
     si = np.searchsorted(freqs, fit_lo_hz, side='left')
     ci = np.searchsorted(freqs, fit_hi_hz, side='right')
 
     result = dict(fit_A=None, fit_omega_n=None, fit_Q_n=None,
                   fit_C=0.0, fit_freqs=None, fit_curve=None,
-                  fit_error=None)
+                  fit_curve_total=None, fit_error=None)
     if ci - si < 5:
         result["fit_error"] = "Not enough points in fit window"
         return result
 
     f_fit = freqs[si:ci]
     p_fit = psd[si:ci]
+    dark_fit = dark_full[si:ci]
     mask = np.ones(f_fit.size, dtype=bool)
     for ilo, ihi in ignore_regions:
         mask &= ~((f_fit >= ilo) & (f_fit <= ihi))
     f_fit = f_fit[mask]
     p_fit = p_fit[mask]
+    dark_fit = dark_fit[mask]
     if f_fit.size < 5:
         result["fit_error"] = "Not enough points after ignore-mask"
         return result
@@ -350,25 +385,33 @@ def fit_sho_log(freqs, psd,
 
     df = float(freqs[1] - freqs[0]) if freqs.size > 1 else 1.0
 
+    # Peak-power estimate above the dark+shot floor for the SHO amplitude
+    # initial guess.
     omega_n0 = 2.0 * np.pi * peak_freq
     Q0 = peak_freq / fwhm
     region = (freqs > peak_freq - 2 * fwhm) & (freqs < peak_freq + 2 * fwhm)
-    power_est = float(np.sum(psd[region]) * df)
+    psd_region_sho = np.maximum(psd[region] - dark_full[region] - shot_term, 0.0)
+    power_est = float(np.sum(psd_region_sho) * df)
     A0 = power_est * 4.0 * (omega_n0 ** 3) / Q0
     if A0 <= 0:
         peak_p_guess = peak_psd if peak_psd is not None else 1e-30
-        A0 = max(peak_p_guess, 1e-35) * (omega_n0 ** 2 / Q0) ** 2
+        # peak_psd from the caller may be on the clean PSD already; if it
+        # was measured on raw, subtract the local floor before seeding.
+        peak_p_guess = max(peak_p_guess, 1e-35)
+        A0 = peak_p_guess * (omega_n0 ** 2 / Q0) ** 2
 
     f_disp = freqs[1:]
     omega_disp = 2.0 * np.pi * f_disp
+    dark_disp = dark_full[1:]
 
     try:
         if not is_dual:
+            def sho_eval(o, A, wn, Q):
+                return A / ((wn ** 2 - o ** 2) ** 2 + (wn * o / Q) ** 2)
+
             def model(o, A, wn, Q):
-                return np.log10(
-                    A / ((wn ** 2 - o ** 2) ** 2 + (wn * o / Q) ** 2)
-                    + 1e-35
-                )
+                return np.log10(sho_eval(o, A, wn, Q) + dark_fit + shot_term
+                                + 1e-35)
 
             popt, _ = curve_fit(
                 model, omega_fit, log_p,
@@ -378,28 +421,34 @@ def fit_sho_log(freqs, psd,
                 sigma=sigma, maxfev=50_000,
             )
             A, wn, Q = popt
+            sho_disp = sho_eval(omega_disp, A, wn, Q)
             result.update(fit_A=float(A),
                           fit_omega_n=float(wn),
                           fit_Q_n=float(Q),
                           fit_freqs=f_disp,
-                          fit_curve=10 ** model(omega_disp, *popt))
+                          fit_curve=sho_disp,
+                          fit_curve_total=sho_disp + dark_disp + shot_term)
         else:
             omega_n2_0 = 2.0 * np.pi * peak2_freq
             Q2_0 = peak2_freq / peak2_fwhm
             region2 = ((freqs > peak2_freq - 2 * peak2_fwhm)
                        & (freqs < peak2_freq + 2 * peak2_fwhm))
-            power_est2 = float(np.sum(psd[region2]) * df)
+            psd_region2_sho = np.maximum(
+                psd[region2] - dark_full[region2] - shot_term, 0.0
+            )
+            power_est2 = float(np.sum(psd_region2_sho) * df)
             A2_0 = power_est2 * 4.0 * (omega_n2_0 ** 3) / Q2_0
             if A2_0 <= 0:
                 peak2_p_guess = peak2_psd if peak2_psd is not None else 1e-30
                 A2_0 = max(peak2_p_guess, 1e-35) * (omega_n2_0 ** 2 / Q2_0) ** 2
 
+            def sho2_eval(o, A1, w1, Q1, A2, w2, Q2):
+                return (A1 / ((w1 ** 2 - o ** 2) ** 2 + (w1 * o / Q1) ** 2)
+                        + A2 / ((w2 ** 2 - o ** 2) ** 2 + (w2 * o / Q2) ** 2))
+
             def model2(o, A1, w1, Q1, A2, w2, Q2):
-                return np.log10(
-                    A1 / ((w1 ** 2 - o ** 2) ** 2 + (w1 * o / Q1) ** 2)
-                    + A2 / ((w2 ** 2 - o ** 2) ** 2 + (w2 * o / Q2) ** 2)
-                    + 1e-35
-                )
+                return np.log10(sho2_eval(o, A1, w1, Q1, A2, w2, Q2)
+                                + dark_fit + shot_term + 1e-35)
 
             popt, _ = curve_fit(
                 model2, omega_fit, log_p,
@@ -411,6 +460,7 @@ def fit_sho_log(freqs, psd,
                 sigma=sigma, maxfev=150_000,
             )
             A1, w1, Q1, A2, w2, Q2 = popt
+            sho_disp = sho2_eval(omega_disp, A1, w1, Q1, A2, w2, Q2)
             result.update(fit_A=float(A1),
                           fit_omega_n=float(w1),
                           fit_Q_n=float(Q1),
@@ -418,7 +468,8 @@ def fit_sho_log(freqs, psd,
                           fit_omega_n2=float(w2),
                           fit_Q_n2=float(Q2),
                           fit_freqs=f_disp,
-                          fit_curve=10 ** model2(omega_disp, *popt))
+                          fit_curve=sho_disp,
+                          fit_curve_total=sho_disp + dark_disp + shot_term)
     except Exception as e:  # noqa: BLE001 — surface fit error to caller
         result["fit_error"] = str(e)
 
@@ -451,18 +502,50 @@ def nep_th(omega_n: float, Q_n: float, **kwargs) -> float:
 
 
 def psd_to_pressure_pa2hz(psd_tot_w2hz, psd_th_fit_w2hz,
-                          nep_th_squared_value: float):
-    """Calibrated pressure PSD in Pa²/Hz, writeup §2.6::
+                          nep_th_squared_value: float,
+                          psd_dark_w2hz=None,
+                          shot_psd_w2hz: float = 0.0):
+    """Calibrated pressure PSD in Pa²/Hz, writeup §2.6.
+
+    Default (legacy) behaviour::
 
         S_pp^TOT(ω) = (S_WW^TOT / S_WW^TH(fit)) · NEP_TH²
 
-    ``psd_th_fit_w2hz`` is the *fitted* (analytical) thermomechanical PSD
-    evaluated on the same frequency grid as ``psd_tot_w2hz`` — typically
-    via :func:`evaluate_sho_psd`.  Division is clamped at a tiny positive
-    floor so the result stays finite.
+    When ``psd_dark_w2hz`` and/or ``shot_psd_w2hz`` are supplied, the
+    known non-thermomechanical noise contributions are removed from the
+    numerator first (Option 2 from the project discussion)::
+
+        S_pp(ω) = ((S_WW^TOT − S_DARK − S_SHOT) / S_WW^TH(fit)) · NEP_TH²
+
+    This yields a calibrated spectrum whose *expected* baseline (when
+    only thermomechanical + dark + shot are present) is NEP_TH², instead
+    of being inflated by the dark+shot floor.  Bin-to-bin statistical
+    variance in the wings is unchanged — see project notes.
+
+    Parameters
+    ----------
+    psd_tot_w2hz
+        Raw measured PSD on the analysis grid (W²/Hz).
+    psd_th_fit_w2hz
+        Pure-SHO model PSD on the same grid (W²/Hz), typically from
+        :func:`evaluate_sho_psd`.
+    nep_th_squared_value
+        Thermomechanical NEP² (Pa²/Hz), e.g. :func:`nep_th_squared`.
+    psd_dark_w2hz
+        Optional per-bin dark PSD on the same grid (W²/Hz).  ``None``
+        leaves the dark contribution in the numerator (legacy).
+    shot_psd_w2hz
+        Optional scalar shot-noise floor (W²/Hz).  ``0.0`` leaves it in
+        the numerator (legacy).
     """
     psd_th_fit_w2hz = np.maximum(np.asarray(psd_th_fit_w2hz), 1e-300)
-    return (np.asarray(psd_tot_w2hz) / psd_th_fit_w2hz) * float(nep_th_squared_value)
+    numerator = np.asarray(psd_tot_w2hz, dtype=np.float64).copy()
+    if psd_dark_w2hz is not None:
+        numerator = numerator - np.asarray(psd_dark_w2hz, dtype=np.float64)
+    shot_val = float(shot_psd_w2hz or 0.0)
+    if shot_val:
+        numerator = numerator - shot_val
+    return (numerator / psd_th_fit_w2hz) * float(nep_th_squared_value)
 
 
 def spl_db_per_rthz(psd_pa2hz, p_ref: float = 20e-6):
