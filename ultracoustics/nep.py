@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.optimize import curve_fit
+from scipy.signal import find_peaks
 
 from .config import SAMPLE_RATE
 
@@ -276,6 +277,204 @@ def find_peak(freqs, psd, fmin: float | None = None,
         fwhm=(f_right - f_left) if (f_left and f_right) else None,
         fw10m=(f_r10 - f_l10) if (f_l10 and f_r10) else None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Automated peak picker (drop-in replacement for InteractiveFitDialog)
+# ---------------------------------------------------------------------------
+
+def auto_select_peaks(freqs, psd_clean,
+                      n_peaks: int = 2,
+                      fmin_hz: float | None = None,
+                      fmax_hz: float | None = None,
+                      prominence_db: float = 6.0,
+                      ignore_fwhm_mult: float = 5.0,
+                      fit_lo_from_fw10m: bool = True) -> dict:
+    """Build the ``analysis`` dict that :class:`InteractiveFitDialog`
+    would have produced, without user interaction.
+
+    Strategy
+    --------
+    1. Run :func:`scipy.signal.find_peaks` on ``10·log10(psd_clean)`` with
+       a configurable prominence threshold (in dB) to find every candidate
+       above the local noise floor.
+    2. Keep the ``n_peaks`` highest-prominence peaks as "real"; refine
+       each with :func:`find_peak` over a local window so peak frequency
+       / FWHM / FW10M match the dialog's parabolic-interp output.
+    3. Every other candidate becomes an ``ignore_region`` of
+       ``±ignore_fwhm_mult × FWHM`` (or ``±10 bins`` when FWHM unknown).
+    4. ``fit_lo_hz`` defaults to the lower real peak's left FW10M edge.
+
+    Parameters
+    ----------
+    freqs, psd_clean
+        1-D arrays of frequency (Hz) and dark/shot-subtracted PSD
+        (linear W²/Hz). Must be the same length.
+    n_peaks
+        Number of real peaks to keep (1 or 2). The result always sorts
+        peaks by frequency: peak 1 is the lower-frequency one.
+    fmin_hz, fmax_hz
+        Optional frequency-band restriction. Candidates outside this
+        band are not considered "real" — they will be treated as
+        ignore regions if they exceed the prominence threshold.
+    prominence_db
+        Minimum prominence in dB for a bin to be flagged as a peak.
+    ignore_fwhm_mult
+        Half-width (in units of the spurious peak's FWHM) of each
+        ignore region. Default 5×FWHM is conservative.
+    fit_lo_from_fw10m
+        If True (default), ``fit_lo_hz`` is set to the lower peak's
+        FW10M-left edge. If False, it is left ``None`` and
+        :func:`fit_sho_log` picks its own default.
+
+    Returns
+    -------
+    analysis : dict
+        Same keys :func:`InteractiveFitDialog._on_accept` would set::
+
+            peak_freq, peak_psd, half_max, f_left, f_right, fwhm,
+            fw10m, span_lo, span_hi,
+            (peak2_* analogues if n_peaks == 2 and a second was found),
+            fit_lo_hz, ignore_regions
+
+        Plus a debug-friendly ``auto_peak_candidates`` listing every
+        candidate the picker considered.
+    """
+    f = np.asarray(freqs, dtype=np.float64)
+    p = np.asarray(psd_clean, dtype=np.float64)
+    if f.size != p.size or f.size < 8:
+        return {"fit_lo_hz": None, "ignore_regions": [],
+                "auto_peak_candidates": []}
+
+    # Log-domain so prominence threshold is in dB and peaks of very
+    # different absolute heights are weighed fairly.
+    log_p = 10.0 * np.log10(np.maximum(p, 1e-35))
+
+    # In-band mask for "real" candidates. Out-of-band peaks above the
+    # threshold still go into ignore_regions.
+    lo_idx = int(np.searchsorted(f, fmin_hz)) if fmin_hz else 0
+    hi_idx = int(np.searchsorted(f, fmax_hz)) if fmax_hz else f.size
+
+    cand_idx, cand_props = find_peaks(log_p, prominence=prominence_db)
+    if cand_idx.size == 0:
+        return {"fit_lo_hz": None, "ignore_regions": [],
+                "auto_peak_candidates": []}
+
+    prominences = cand_props["prominences"]
+
+    # Split into in-band vs out-of-band.
+    in_band_mask = (cand_idx >= lo_idx) & (cand_idx < hi_idx)
+    in_band = cand_idx[in_band_mask]
+    in_prom = prominences[in_band_mask]
+    out_band = cand_idx[~in_band_mask]
+
+    # Rank in-band by prominence, take top n_peaks as real.
+    order = np.argsort(in_prom)[::-1]
+    real_idx = in_band[order[:n_peaks]]
+    spurious_in = in_band[order[n_peaks:]]
+    spurious_all = np.concatenate([spurious_in, out_band]) \
+        if spurious_in.size or out_band.size else np.array([], dtype=int)
+
+    # ---- Refine real peaks with parabolic interp + FWHM/FW10M walk ----
+    def _refine(center_i: int) -> dict | None:
+        # Local window: half-distance to neighbouring candidate, but at
+        # least ~5% of the band and at most ~20%.
+        all_i = np.sort(cand_idx)
+        pos = int(np.searchsorted(all_i, center_i))
+        left_neighbor = all_i[pos - 1] if pos > 0 else 0
+        right_neighbor = (all_i[pos + 1]
+                          if pos + 1 < all_i.size else f.size - 1)
+        gap_lo = (center_i - left_neighbor) // 2 if pos > 0 else f.size
+        gap_hi = ((right_neighbor - center_i) // 2
+                  if pos + 1 < all_i.size else f.size)
+        band_min = max(8, f.size // 50)
+        band_max = f.size // 5
+        half_w = int(np.clip(min(gap_lo, gap_hi), band_min, band_max))
+        lo = max(0, center_i - half_w)
+        hi = min(f.size, center_i + half_w + 1)
+        fp = find_peak(f, p, fmin=float(f[lo]), fmax=float(f[hi - 1]))
+        if fp is None:
+            return None
+        fp["span_lo"] = float(f[lo])
+        fp["span_hi"] = float(f[hi - 1])
+        return fp
+
+    refined = []
+    for ci in real_idx:
+        r = _refine(int(ci))
+        if r is not None and r.get("peak_freq"):
+            refined.append(r)
+    refined.sort(key=lambda d: d["peak_freq"])
+
+    # ---- Build ignore regions for spurious candidates ----
+    ignore_regions: list[tuple[float, float]] = []
+    df_bin = float(f[1] - f[0]) if f.size > 1 else 0.0
+    for ci in spurious_all:
+        f_spur = float(f[int(ci)])
+        # Try to estimate this spurious peak's FWHM via find_peak in a
+        # small local window so the ignore region scales with the peak.
+        local_lo = max(0, int(ci) - max(8, f.size // 100))
+        local_hi = min(f.size, int(ci) + max(8, f.size // 100) + 1)
+        local = find_peak(f, p, fmin=float(f[local_lo]),
+                          fmax=float(f[local_hi - 1]))
+        fwhm = local.get("fwhm") if local else None
+        if fwhm and fwhm > 0:
+            half_w = ignore_fwhm_mult * fwhm
+        else:
+            half_w = 10.0 * df_bin
+        ignore_regions.append((f_spur - half_w, f_spur + half_w))
+    ignore_regions = _merge_ignore_regions(ignore_regions)
+
+    # ---- Assemble final analysis dict ----
+    analysis: dict = {
+        "ignore_regions": ignore_regions,
+        "auto_peak_candidates": [
+            {"freq_hz": float(f[int(i)]), "prominence_db": float(pr)}
+            for i, pr in zip(cand_idx, prominences)
+        ],
+    }
+    if refined:
+        analysis.update(refined[0])
+        if len(refined) > 1:
+            for k, v in refined[1].items():
+                analysis[f"peak2_{k}"] = v
+        # Default fit_lo_hz: lower peak's FW10M-left if available.
+        if fit_lo_from_fw10m:
+            fw10 = refined[0].get("fw10m")
+            f_lo_pk = refined[0].get("f_left")
+            if fw10 and f_lo_pk:
+                # FW10M-left ≈ f_left - (fw10m - fwhm)/2 if available
+                fwhm = refined[0].get("fwhm")
+                if fwhm and fw10 > fwhm:
+                    analysis["fit_lo_hz"] = float(f_lo_pk
+                                                  - 0.5 * (fw10 - fwhm))
+                else:
+                    analysis["fit_lo_hz"] = float(f_lo_pk)
+            elif f_lo_pk:
+                analysis["fit_lo_hz"] = float(f_lo_pk)
+            else:
+                analysis["fit_lo_hz"] = None
+        else:
+            analysis["fit_lo_hz"] = None
+    else:
+        analysis["fit_lo_hz"] = None
+
+    return analysis
+
+
+def _merge_ignore_regions(regions, tol_hz: float = 0.0):
+    """Merge overlapping/adjacent (lo, hi) tuples; returns sorted list."""
+    if not regions:
+        return []
+    rs = sorted((float(lo), float(hi)) for lo, hi in regions if hi > lo)
+    out = [rs[0]]
+    for lo, hi in rs[1:]:
+        plo, phi = out[-1]
+        if lo <= phi + tol_hz:
+            out[-1] = (plo, max(phi, hi))
+        else:
+            out.append((lo, hi))
+    return out
 
 
 # ---------------------------------------------------------------------------
