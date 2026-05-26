@@ -26,18 +26,21 @@ from .config import SAMPLE_RATE
 ADC_FULL_SCALE = 16383          # 14-bit ADC
 ADC_VREF = 5.0                  # Volts
 TRANSIMPEDANCE = 20_000         # 20 kΩ
+DIFF_GAIN = 5.0 / 3.0           # ADA4940 differential driver gain
+                                # (annotated 1.667× on the schematic)
 
 # Derived
-_ADC_TO_VOLTAGE = ADC_VREF / ADC_FULL_SCALE          # V / count
-_VOLTAGE_TO_CURRENT = 1.0 / TRANSIMPEDANCE           # A / V
-_ADC_TO_CURRENT_UA = _ADC_TO_VOLTAGE * _VOLTAGE_TO_CURRENT * 1e6  # µA / count
+_ADC_TO_VOLTAGE = ADC_VREF / ADC_FULL_SCALE          # V / count (at ADC pin)
+_VOLTAGE_TO_CURRENT = 1.0 / TRANSIMPEDANCE           # A / V (at TIA output)
+# ADA4940 amplifies TIA → ADC by DIFF_GAIN, so the photocurrent that
+# produced one ADC count is reduced by 1/DIFF_GAIN.
+_ADC_TO_CURRENT_UA = (_ADC_TO_VOLTAGE / DIFF_GAIN) * _VOLTAGE_TO_CURRENT * 1e6  # µA / count
 
-# Responsivity: 140 µA ≙ 156 µW → 0.897 µA/µW
+# Responsivity: 140 µA ≡ 156 µW → 0.897 µA/µW
 _RESPONSIVITY = 140.0 / 156.0   # µA / µW
-_DIFFERENTIAL_FACTOR = 0.5      # differential mode sees half
 
-ADC_TO_POWER_UW = (_ADC_TO_CURRENT_UA / _RESPONSIVITY) * _DIFFERENTIAL_FACTOR
-"""µW per ADC count (with differential-mode correction)."""
+ADC_TO_POWER_UW = _ADC_TO_CURRENT_UA / _RESPONSIVITY
+"""µW per ADC count (full signal chain incl. ADA4940 1.667× gain)."""
 
 
 # ---------------------------------------------------------------------------
@@ -73,8 +76,10 @@ def load_binary(path, dtype=np.uint16):
 def adc_to_uw(samples, baseline=0.0):
     """Convert raw ADC counts to optical power in µW.
 
-    Applies the full signal chain: ADC→voltage→current→optical power,
-    including the 0.5× differential-mode correction factor.
+    Applies the full signal chain: ADC → voltage → (÷ ADA4940 gain) →
+    current → optical power. The ADA4940 differential driver amplifies
+    the TIA output by 5/3 before the ADC, so the photocurrent is the
+    ADC voltage divided by ``R_f · DIFF_GAIN``.
 
     Args:
         samples: Array of uint16 ADC values (14-bit range 0–16383).
