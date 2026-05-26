@@ -63,7 +63,9 @@ DEFAULT_TEMPERATURE = 300.0  # ambient                 [K]
 # ADC / TIA chain (matches nep_calculator.py and the master-board schematic)
 DEFAULT_R_PD = 0.9            # photodiode responsivity   [A/W]
 DEFAULT_R_FEEDBACK = 20_000.0 # TIA feedback resistor     [Ω]
-DEFAULT_DIFF_GAIN = 5.0 / 3.0 # differential front-end gain
+DEFAULT_DIFF_GAIN = 1.0       # differential front-end gain (matches
+                              # processing.compute_psd, which applies no
+                              # differential factor in the FFT path)
 DEFAULT_V_REF = 5.0           # ADC full-scale reference  [V]
 DEFAULT_ADC_FULLSCALE = 16383 # 14-bit max code
 
@@ -142,6 +144,11 @@ def compute_psd_w2hz(samples,
 
     norm = 2.0 / (float(sample_rate) * np.sum(win ** 2))
     psd_counts2 = (spec_pow * norm).mean(axis=0)
+    # DC and Nyquist bins are not duplicated in the one-sided spectrum,
+    # so the factor-of-2 in ``norm`` over-counts them. Halve them so the
+    # integral of the PSD equals the variance of the windowed signal.
+    psd_counts2[0] *= 0.5
+    psd_counts2[-1] *= 0.5
 
     if w_per_count_value is None:
         w_per_count_value = w_per_count()
