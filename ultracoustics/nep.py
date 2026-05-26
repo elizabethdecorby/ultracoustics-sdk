@@ -773,7 +773,7 @@ __all__ = [
     # models
     "sho_psd", "dual_sho_psd", "evaluate_sho_psd",
     # peak + fit
-    "find_peak", "fit_sho_log",
+    "find_peak", "auto_select_peaks", "fit_sho_log",
     # NEP / pressure
     "nep_th", "nep_th_squared",
     "psd_to_pressure_pa2hz", "spl_db_per_rthz",
