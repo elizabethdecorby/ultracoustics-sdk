@@ -16,6 +16,8 @@ ultracoustics-sdk/
     ├── config.py
     ├── controller.py
     ├── processing.py
+    ├── nep_dialog.py
+    ├── nep.py
     └── _internal/
         ├── __init__.py
         ├── comms.py
@@ -98,6 +100,8 @@ freq_hz, psd_db = compute_psd(samples, fft_size=8192, num_averages=20)
 ```
 
 ## API Reference
+
+NEED to ADD NEP notes***
 
 ### `Controller(verbose=False)`
 
