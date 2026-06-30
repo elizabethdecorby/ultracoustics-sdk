@@ -86,7 +86,7 @@ class Controller:
         x86-64.
     """
 
-    def __init__(self, verbose=False):
+    def __init__(self, verbose=False, ring_seconds: float = 1.2):
         """Initialise the controller (no hardware interaction yet).
 
         Parameters
@@ -94,6 +94,14 @@ class Controller:
         verbose : bool, optional
             If ``True``, print diagnostic messages during USB I/O
             and data capture operations. Defaults to ``False``.
+        ring_seconds : float, optional
+            Capacity of the shared-memory ring buffer, expressed in
+            seconds of samples at the configured sample rate. Defaults
+            to ``1.2`` (the live-display window the GUI expects). Increase
+            this for long unattended captures that must fit in the ring
+            in one piece (e.g. an ~8 s probe-characterization ramp);
+            remember each second is ``SAMPLE_RATE`` uint16 samples
+            (~20 MB/s at 10 MSPS).
 
         Attributes
         ----------
@@ -118,11 +126,10 @@ class Controller:
         self._streaming = False
         self._connected = False
 
-        # Default ring capacity: ~1.2 s at the configured sample rate.
-        # Lives in shared memory once the stream subprocess is spawned
-        # (allocated by USBStream) so the parent and reader share it
-        # zero-copy.
-        self._buf_len = int(SAMPLE_RATE * 1.2)
+        # Ring capacity in samples, sized from ring_seconds. Lives in shared
+        # memory once the stream subprocess is spawned (allocated by USBStream)
+        # so the parent and reader share it zero-copy.
+        self._buf_len = int(SAMPLE_RATE * ring_seconds)
 
     # -- Connection lifecycle -------------------------------------------------
 
