@@ -23,6 +23,7 @@ CMD_IAP = ord('U')          # In-Application Programming (self-update master cod
 CMD_BOOT_VERSION = ord('V')      # Query 1550nm bootloader firmware version
 CMD_BOOT_VERSION_638 = ord('v')  # Query 638nm bootloader firmware version
 CMD_FWINFO = ord('i')       # Query master board firmware version
+CMD_PROBE_CHAR = ord('Z')   # Probe characterization: stamp SPI command_id (1=start, 0=stop)
 
 # Target IDs for Manual Control
 TARGET_1550 = 1550
