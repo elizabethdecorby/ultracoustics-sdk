@@ -44,8 +44,13 @@ from typing import Optional, Union
 import numpy as np
 
 from ._internal.comms import USBBulkConnection, USBStream
-from ._internal.protocol import CMD_BOOT, CMD_IDLE, CMD_WARM
-from .config import SAMPLE_RATE
+from ._internal.protocol import (
+    CMD_BOOT, CMD_IDLE, CMD_WARM,
+    CMD_OVERRIDE_ENTER, CMD_POWER, CMD_TRIGGER, CMD_PROBE_CHAR,
+    TARGET_1550, TARGET_638,
+)
+from .config import SAMPLE_RATE, ADC_MAX_VALUE
+from .characterization import bin_ramp, ProbeCharacterizationResult
 
 
 class Controller:
@@ -313,6 +318,233 @@ class Controller:
                 print(f"Saved {len(data):,} samples ({mb:.2f} MB) to {path}")
 
         return data
+
+    # -- Probe characterization -----------------------------------------------
+
+    def run_probe_characterization(
+        self,
+        *,
+        max_current: int = 33000,
+        step_size: int = 100,
+        bin_seconds: float = 0.025,
+        start_offset_s: float = 0.0,
+        laser_warmup_s: float = 3.0,
+        boot_settle_s: float = 2.0,
+        capture_guard_s: float = 0.7,
+        saturation_threshold: float = 0.95,
+        verbose: Optional[bool] = None,
+    ) -> ProbeCharacterizationResult:
+        """Run the bulk-only probe-characterization ramp and return the curve.
+
+        Drives the 638 probe-characterization self-ramp over the **master USB
+        bulk connection only** (no USB-serial connection to the 638 required).
+        The host sends one bulk start command; the master stamps the SPI
+        command_id; the 638 edge-detects it and self-ramps its DAC
+        ``0 -> max_current`` at 40 Hz; the master streams photodetector data
+        continuously; this method time-bins the stream into
+        ``max_current // step_size + 1`` windows of ``bin_seconds`` each.
+
+        Override / power / trigger sequencing is handled internally and is
+        **not** part of the public API — callers only invoke this method.
+
+        .. note::
+
+            The capture must fit in the ring buffer in one piece. The
+            :class:`Controller` must therefore be constructed with
+            ``ring_seconds`` large enough for the whole sweep, e.g.::
+
+                ctrl = Controller(ring_seconds=12)  # >= ramp + guard + margin
+
+            This method raises a clear :class:`RuntimeError` if the ring is
+            too small, quoting the required ``ring_seconds``.
+
+        Parameters
+        ----------
+        max_current : int
+            DAC setpoint the ramp tops out at. Must match the 638 firmware
+            ``PROBE_RAMP_MAX`` (default 33000 = ``CALIBRATION_DAC_VALUE``).
+        step_size : int
+            DAC increment per ``bin_seconds`` tick (default 100). Must match
+            firmware; the host cannot change the firmware step.
+        bin_seconds : float
+            One ramp tick in seconds (25 ms at the firmware 40 Hz rate).
+        start_offset_s : float
+            Forward-bin offset (seconds) between recording T0 and the first
+            40 Hz tick taking effect. Default 0.0 is correct within ~1 bin;
+            tune only if bin 0/1 clearly mix setpoints on a given setup.
+        laser_warmup_s : float
+            Time for the 1550 turn-on transient to settle before the 638 ramp
+            begins, so the low-DAC start of the curve is flat.
+        boot_settle_s : float
+            638 boot / rail settle time after power-on.
+        capture_guard_s : float
+            Extra capture beyond the ramp duration for startup + stop latency.
+        saturation_threshold : float
+            Fraction of ``ADC_MAX_VALUE`` treated as photodetector saturation;
+            if exceeded the sweep aborts early and the curve is trimmed.
+        verbose : bool, optional
+            Override ``Controller.verbose`` for this call only. Defaults to
+            the controller's setting.
+
+        Returns
+        -------
+        ProbeCharacterizationResult
+            Binned ``current`` / ``photodetector`` curve plus the
+            ``saturated`` flag and the binning parameters used.
+
+        Raises
+        ------
+        RuntimeError
+            If the ring buffer is too small, no samples are captured, the PD
+            signal is flat, or binning produces no points.
+        """
+        if verbose is None:
+            verbose = self.verbose
+
+        bin_samples = int(SAMPLE_RATE * bin_seconds)   # 250_000 samples / 25 ms
+        n_steps = max_current // step_size             # 330 steps (100..max)
+        ramp_seconds = (n_steps + 1) * bin_seconds     # 331 ticks @ 25 ms
+        capture_seconds = ramp_seconds + capture_guard_s
+        # Ring must hold the whole capture + post-stop settle in one piece.
+        ring_seconds_needed = capture_seconds + 1.5
+
+        saturation_limit = int(ADC_MAX_VALUE * saturation_threshold)
+
+        if verbose:
+            print("\n" + "=" * 60)
+            print("PROBE CHARACTERIZATION (BULK-ONLY)")
+            print("=" * 60)
+            print(f"Current range: 0 to {max_current} (step {step_size})")
+            print(f"Setpoints: {n_steps + 1} | bin: {bin_seconds*1e3:.0f} ms "
+                  f"({bin_samples:,} samples @ {SAMPLE_RATE/1e6:.0f} MSPS)")
+            print(f"Capture: ~{capture_seconds:.2f} s "
+                  f"(ring >= {ring_seconds_needed:.1f} s)")
+            print("=" * 60 + "\n")
+
+        # Ring-capacity guard: save() snapshots the last N samples, which
+        # equals [T0, now] only if the ring never wrapped past T0.
+        if self._buf_len < int(SAMPLE_RATE * ring_seconds_needed):
+            raise RuntimeError(
+                f"Ring buffer too small for this sweep: need ring_seconds >= "
+                f"{ring_seconds_needed:.1f} ({int(SAMPLE_RATE * ring_seconds_needed):,} "
+                f"samples), but this Controller was built with "
+                f"{self._buf_len / SAMPLE_RATE:.1f} s. Reconstruct with "
+                f"Controller(ring_seconds={ring_seconds_needed:.1f})."
+            )
+
+        self._ensure_connected()
+        if not self._streaming:
+            self.begin_stream()
+
+        saturated = False
+        ramp = None
+        try:
+            # -- 1. Override + power rails ------------------------------------
+            if verbose:
+                print("Entering override and powering rails...")
+            self._send(CMD_OVERRIDE_ENTER, wValue=1)
+            time.sleep(0.1)
+            # 1550 nm first: power ON, trigger ON, then let it settle so its
+            # turn-on transient is done before readout begins. The 638 is
+            # powered after the warmup so its boot settle is unaffected.
+            self._send(CMD_POWER, wValue=1, wIndex=TARGET_1550)
+            self._send(CMD_TRIGGER, wValue=1, wIndex=TARGET_1550)
+            if verbose:
+                print(f"Waiting {laser_warmup_s:.1f} s for 1550 to settle...")
+            time.sleep(laser_warmup_s)
+            # 638 nm: power ON, trigger OFF -> 638 stays IDLE (DAC free for ramp)
+            self._send(CMD_POWER, wValue=1, wIndex=TARGET_638)
+            self._send(CMD_TRIGGER, wValue=0, wIndex=TARGET_638)
+            if verbose:
+                print(f"Waiting {boot_settle_s:.1f} s for 638 to boot...")
+            time.sleep(boot_settle_s)
+
+            # -- 2. Start the ramp; record sample-count origin ----------------
+            t0_sample = self.samples_received
+            if verbose:
+                print("Starting 638 self-ramp (CMD_PROBE_CHAR start)...")
+            self._send(CMD_PROBE_CHAR, wValue=1)
+
+            # -- 3. Capture, monitoring for saturation ------------------------
+            t_start = time.monotonic()
+            t_end = t_start + capture_seconds
+            while time.monotonic() < t_end:
+                time.sleep(0.1)
+                # Recent ~20 ms mean as a saturation trip (save() handles wrap).
+                try:
+                    recent = self.save(0.02)
+                except Exception:
+                    continue
+                if recent.size and float(np.mean(recent)) >= saturation_limit:
+                    saturated = True
+                    if verbose:
+                        print(f"\n⚠ Saturation detected "
+                              f"({float(np.mean(recent)):.0f} counts) — "
+                              f"aborting ramp early.")
+                    break
+
+            if verbose:
+                print(f"Capture window: {time.monotonic() - t_start:.2f} s.")
+
+            # -- 4. Stop the ramp (restore command_id; the 638 self-terminates
+            # at max_current anyway). Post-stop sleep lets the stream settle
+            # before the snapshot; binning forward-bins from T0, not the stop.
+            if verbose:
+                print("Stopping ramp (CMD_PROBE_CHAR stop)...")
+            self._send(CMD_PROBE_CHAR, wValue=0)
+            time.sleep(0.3)
+
+            # -- 5. Extract [T0, now] from the ring --------------------------
+            # save(N) returns the last N samples = [samples_received - N,
+            # samples_received] = [t0_sample, now] when N = now - t0_sample.
+            n_ramp = self.samples_received - t0_sample
+            if n_ramp <= 0:
+                raise RuntimeError("No samples captured during the ramp.")
+            ramp = self.save(n_ramp / SAMPLE_RATE)
+            if verbose:
+                print(f"Extracted {ramp.size:,} ramp samples "
+                      f"(~{ramp.size / SAMPLE_RATE:.2f} s).\n")
+
+        except Exception:
+            # Ensure the ramp is stopped even if capture/setup failed.
+            try:
+                self._send(CMD_PROBE_CHAR, wValue=0)
+            except Exception:
+                pass
+            raise
+        finally:
+            # Always exit override (streaming is ended/closed by the caller).
+            try:
+                self._send(CMD_OVERRIDE_ENTER, wValue=0)
+            except Exception:
+                pass
+
+        if ramp is None:
+            raise RuntimeError("No ramp data captured.")
+
+        if verbose:
+            print(f"Binning {ramp.size:,} ramp samples into "
+                  f"{n_steps + 1} windows...")
+        binned = bin_ramp(
+            ramp,
+            sample_rate=SAMPLE_RATE,
+            bin_seconds=bin_seconds,
+            step_size=step_size,
+            max_current=max_current,
+            saturated=saturated,
+            saturation_limit=saturation_limit,
+            start_offset_samples=int(SAMPLE_RATE * start_offset_s),
+        )
+
+        return ProbeCharacterizationResult(
+            current=binned["current"],
+            photodetector=binned["photodetector"],
+            saturated=saturated,
+            sample_rate=SAMPLE_RATE,
+            bin_seconds=bin_seconds,
+            step_size=step_size,
+            max_current=max_current,
+        )
 
     # -- Internals ------------------------------------------------------------
 

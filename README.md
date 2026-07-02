@@ -10,11 +10,13 @@ ultracoustics-sdk/
 ├── README.md
 ├── examples/
 │   ├── basic_capture.py
-│   └── offline_psd.py
+│   ├── offline_psd.py
+│   └── probe_characterization.py
 └── ultracoustics/
     ├── __init__.py
     ├── config.py
     ├── controller.py
+    ├── characterization.py
     ├── processing.py
     ├── nep_dialog.py
     ├── nep.py
@@ -196,6 +198,54 @@ power_uw = adc_to_uw(samples, baseline=samples.mean())
 
 ---
 
+## Probe Characterization
+
+`Controller.run_probe_characterization(...)` runs the bulk-only probe-characterization ramp over the master USB bulk connection (no USB-serial connection to the 638 required) and returns the binned LI curve. Override / power / trigger sequencing is handled internally and is **not** exposed.
+
+The capture must fit in the ring buffer in one piece, so construct the `Controller` with a large enough `ring_seconds` (the method raises a clear `RuntimeError` quoting the required value if it is too small).
+
+```python
+from ultracoustics import Controller
+
+ctrl = Controller(verbose=True, ring_seconds=12)  # >= ramp (~9 s) + margin
+ctrl.connect()
+ctrl.begin_stream()
+
+result = ctrl.run_probe_characterization()
+# result.current          -> [0, 100, ..., 33000]  (DAC setpoints)
+# result.photodetector     -> mean ADC counts per setpoint
+# result.saturated         -> True if the PD saturated mid-ramp (curve trimmed)
+
+ctrl.end_stream()
+ctrl.close()
+```
+
+| Parameter | Default | Description |
+|---|---|---|
+| `max_current` | `33000` | DAC setpoint the ramp tops out at (must match firmware `PROBE_RAMP_MAX`). |
+| `step_size` | `100` | DAC increment per bin (must match firmware; host cannot change it). |
+| `bin_seconds` | `0.025` | One ramp tick in seconds (25 ms at the firmware 40 Hz rate). |
+| `start_offset_s` | `0.0` | Forward-bin offset (s) for the unknown 40 Hz tick phase; correct within ~1 bin. |
+| `laser_warmup_s` | `3.0` | 1550 turn-on transient settle time before the 638 ramp begins. |
+| `boot_settle_s` | `2.0` | 638 boot / rail settle time after power-on. |
+| `capture_guard_s` | `0.7` | Extra capture beyond the ramp for startup + stop latency. |
+| `saturation_threshold` | `0.95` | Fraction of `ADC_MAX_VALUE` treated as PD saturation; aborts + trims. |
+| `verbose` | `Controller.verbose` | Per-call verbose override. |
+
+Returns a `ProbeCharacterizationResult` (`current`, `photodetector`, `saturated`, `sample_rate`, `bin_seconds`, `step_size`, `max_current`; `.as_dict()` for a JSON-friendly view).
+
+**Post-analysis helpers** (pure functions, no hardware needed — operate on a `ProbeCharacterizationResult` or a saved curve):
+
+| Function | Description |
+|---|---|
+| `bin_ramp(ramp, ...)` | Time-bin a captured ramp array into setpoint → mean-PD pairs. |
+| `load_laser_calibration(path)` | Load a laser current → optical power (mW) calibration CSV; `None` if missing. |
+| `apply_laser_calibration(probe_data, laser_cal)` | Interpolate laser current → optical power (mW). |
+| `detect_resonance_dips(optical_power_mw, photodetector, ...)` | Find resonance dips via `scipy.signal.find_peaks`. |
+| `analyze_dips(optical_power_mw, photodetector, dip_indices)` | Summarize dips (depth %, spacing, baseline). |
+
+---
+
 ## Examples
 
 Run examples from the repository root after installation:
@@ -203,6 +253,13 @@ Run examples from the repository root after installation:
 
 python examples/basic_capture.py
 python examples/offline_psd.py
+python examples/probe_characterization.py
+
+`probe_characterization.py` produces a CSV + plot; the plot needs the optional `plot` extra:
+
+```bash
+pip install -e ".[plot]"
+```
 
 ## Troubleshooting
 

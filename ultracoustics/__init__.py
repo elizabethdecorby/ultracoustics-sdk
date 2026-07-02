@@ -19,6 +19,14 @@ from .nep import (
     psd_to_pressure_pa2hz,
     spl_db_per_rthz,
 )
+from .characterization import (
+    ProbeCharacterizationResult,
+    bin_ramp,
+    load_laser_calibration,
+    apply_laser_calibration,
+    detect_resonance_dips,
+    analyze_dips,
+)
 
 __all__ = [
     "__version__",
@@ -39,4 +47,11 @@ __all__ = [
     "nep_th_squared",
     "psd_to_pressure_pa2hz",
     "spl_db_per_rthz",
+    # Probe characterization
+    "ProbeCharacterizationResult",
+    "bin_ramp",
+    "load_laser_calibration",
+    "apply_laser_calibration",
+    "detect_resonance_dips",
+    "analyze_dips",
 ]

@@ -15,6 +15,11 @@ dependencies = [
     "pyserial>=3.5",
 ]
 
+# Optional: plotting for the probe-characterization example.
+# Install with:  pip install -e ".[plot]"
+[project.optional-dependencies]
+plot = ["matplotlib>=3.5"]
+
 [tool.setuptools.packages.find]
 include = ["ultracoustics*"]
 
