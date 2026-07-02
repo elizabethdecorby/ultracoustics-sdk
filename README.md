@@ -226,7 +226,7 @@ ctrl.close()
 | `step_size` | `100` | DAC increment per bin (must match firmware; host cannot change it). |
 | `bin_seconds` | `0.025` | One ramp tick in seconds (25 ms at the firmware 40 Hz rate). |
 | `start_offset_s` | `0.0` | Forward-bin offset (s) for the unknown 40 Hz tick phase; correct within ~1 bin. |
-| `laser_warmup_s` | `3.0` | 1550 turn-on transient settle time before the 638 ramp begins. |
+| `laser_warmup_s` | `10.0` | 1550 turn-on transient settle time before the 638 ramp begins. |
 | `boot_settle_s` | `2.0` | 638 boot / rail settle time after power-on. |
 | `capture_guard_s` | `0.7` | Extra capture beyond the ramp for startup + stop latency. |
 | `saturation_threshold` | `0.95` | Fraction of `ADC_MAX_VALUE` treated as PD saturation; aborts + trims. |

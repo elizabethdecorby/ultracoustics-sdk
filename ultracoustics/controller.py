@@ -328,7 +328,7 @@ class Controller:
         step_size: int = 100,
         bin_seconds: float = 0.025,
         start_offset_s: float = 0.0,
-        laser_warmup_s: float = 3.0,
+        laser_warmup_s: float = 10.0,
         boot_settle_s: float = 2.0,
         capture_guard_s: float = 0.7,
         saturation_threshold: float = 0.95,
