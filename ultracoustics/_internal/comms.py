@@ -501,13 +501,23 @@ class SerialConnection:
         for p in ports:
             if "STLINK" in str(p.description).upper():
                 continue
-            if p.vid == 0x0483 and p.pid == 0x5740:
+            # STM32 Virtual COM Port: VID 0x0483 (STMicro) / PID 0x5740.
+            # Match on p.vid/p.pid when pyserial populates them, and also
+            # fall back to the hwid string (e.g. "USB VID:PID=0483:5740...")
+            # which is populated on Windows even when p.vid/p.pid are None.
+            hwid = str(getattr(p, "hwid", "") or "").upper()
+            if (p.vid == 0x0483 and p.pid == 0x5740) or "0483:5740" in hwid:
                 candidates.insert(0, p)
                 continue
             desc = str(p.description).lower()
             if "broadsonic" in desc or "ultracoustics" in desc:
                 candidates.insert(0, p)
-            elif "tty.usbmodem" in p.device:
+            elif "tty.usbmodem" in p.device or p.device.upper().startswith("COM"):
+                # Last-resort fallback: a USB-CDC COM port (Windows) or
+                # tty.usbmodem (macOS/Linux). This mirrors the original
+                # slave_board.py detection, which matched "COM" in the
+                # device name so the slave VCP was found even when
+                # pyserial did not report VID/PID.
                 candidates.append(p)
         if not candidates:
             return None

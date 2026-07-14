@@ -49,8 +49,10 @@ from ._internal.protocol import (
     CMD_OVERRIDE_ENTER, CMD_POWER, CMD_TRIGGER, CMD_PROBE_CHAR,
     TARGET_1550, TARGET_638,
 )
+from ._internal.maintenance import LaserSerialController
 from .config import SAMPLE_RATE, ADC_MAX_VALUE
 from .characterization import bin_ramp, ProbeCharacterizationResult
+from .processing import compute_noise_metrics
 
 
 class Controller:
@@ -545,6 +547,366 @@ class Controller:
             step_size=step_size,
             max_current=max_current,
         )
+
+    # -- Laser noise characterization -----------------------------------------
+
+    def collect_fresh(self, n_samples: int, timeout_s: float = 5.0) -> np.ndarray:
+        """Collect *n_samples* generated AFTER this call, discarding stale data.
+
+        Records the cumulative sample counter, waits until at least
+        *n_samples* new samples have arrived in the ring, then snapshots
+        that fresh window. Use this (rather than :meth:`save`) when you
+        need data produced *after* a setpoint change — e.g. after stepping
+        a laser DAC, so the block does not include samples from the
+        previous setpoint.
+
+        Parameters
+        ----------
+        n_samples : int
+            Number of fresh samples to collect. Must be ≤ the ring buffer
+            capacity (see ``ring_seconds`` at construction).
+        timeout_s : float
+            Maximum wait for the samples to arrive.
+
+        Returns
+        -------
+        numpy.ndarray
+            uint16 array of length ~*n_samples* (may be a few longer due to
+            the race between the wait loop and the snapshot).
+
+        Raises
+        ------
+        RuntimeError
+            If not streaming, or *n_samples* exceeds the ring capacity.
+        TimeoutError
+            If fewer than *n_samples* arrive within *timeout_s*.
+        """
+        self._ensure_connected()
+        if not self._streaming:
+            raise RuntimeError(
+                "Not streaming — call begin_stream() before collecting samples."
+            )
+        if n_samples > self._buf_len:
+            raise RuntimeError(
+                f"Requested {n_samples} fresh samples but ring holds only "
+                f"{self._buf_len}. Reconstruct with a larger ring_seconds."
+            )
+
+        t0 = self.samples_received
+        deadline = time.time() + timeout_s
+        while self.samples_received - t0 < n_samples:
+            if time.time() > deadline:
+                got = self.samples_received - t0
+                raise TimeoutError(
+                    f"Only got {got}/{n_samples} fresh samples before timeout."
+                )
+            time.sleep(0.002)
+
+        have = self.samples_received - t0
+        return self.save(have / SAMPLE_RATE)
+
+    def run_laser_noise_sweep(
+        self,
+        *,
+        target=TARGET_1550,
+        dac_start: int = 10000,
+        dac_end: int = 33000,
+        dac_step: int = 100,
+        samples_per_point: int = 32768,
+        settle_delay_s: float = 0.1,
+        slave_boot_s: float = 2.0,
+        laser_port=None,
+        on_ready=None,
+        repetitions: int = 1,
+        sample_rate_hz=None,
+        dc_guard_bins: int = 1,
+        saturation_threshold: float = 0.95,
+        verbose: Optional[bool] = None,
+    ):
+        """Sweep a laser DAC and capture per-setpoint photodetector noise.
+
+        Drives the chosen slave laser's current over USB-serial while the
+        master streams photodetector samples over USB-bulk, computing a
+        battery of noise metrics at each setpoint. Override / power /
+        trigger sequencing and the 1550 vs 638 serial dialect differences
+        are handled internally — callers only invoke this method.
+
+        For each DAC setpoint it sends the current command, waits
+        *settle_delay_s*, collects *samples_per_point* fresh photodetector
+        samples, and computes :func:`~ultracoustics.compute_noise_metrics`
+        (mean, AC RMS, peak-to-peak, CV, FFT-band integral, RIN).
+
+        Parameters
+        ----------
+        target : int
+            ``TARGET_1550`` or ``TARGET_638``. Determines the rail/trigger
+            wiring (1550 needs trigger ON; 638 needs trigger OFF so its DAC
+            stays free) and the serial command dialect.
+        dac_start, dac_end, dac_step : int
+            DAC sweep range and increment (inclusive of ``dac_end``).
+        samples_per_point : int
+            Fresh photodetector samples captured per setpoint. Must be ≤
+            ring capacity (default ring of 1.2 s holds ~12 M samples, so
+            this is rarely a constraint).
+        settle_delay_s : float
+            Pause after sending each DAC value before collecting samples,
+            so the current driver and analog filtering settle.
+        slave_boot_s : float
+            Time to wait for the slave to boot / enumerate after its power
+            rail is raised, before opening the serial link.
+        laser_port : str or None
+            Explicit serial port, or ``None`` to auto-detect.
+        on_ready : callable, optional
+            Called as ``on_ready(laser)`` with the connected
+            :class:`LaserSerialController` after power-up + serial connect,
+            before the sweep begins. Use it for manual warm-up. Return
+            falsy to abort the sweep (the laser is safely disabled and the
+            method returns ``None``).
+        repetitions : int
+            Number of full sweeps to run. Each repetition's metrics are
+            returned separately.
+        sample_rate_hz : float or None
+            Passed to :func:`compute_noise_metrics`. When given (default
+            :data:`~ultracoustics.config.SAMPLE_RATE`), RIN is reported in
+            dB/Hz.
+        dc_guard_bins : int
+            Low-frequency bins dropped from the FFT integral.
+        saturation_threshold : float or None
+            Fraction of :data:`~ultracoustics.config.ADC_MAX_VALUE` treated
+            as photodetector saturation (default 0.95 → 15564 counts, the
+            analog front-end clip point — same convention as
+            :meth:`run_probe_characterization`). When the per-setpoint PD
+            mean exceeds it the sweep aborts early (further setpoints would
+            only be clipped) and ``saturated`` is set in the result. Pass
+            ``None`` or a value ≥ 1.0 to disable the check.
+        verbose : bool, optional
+            Override ``Controller.verbose`` for this call only.
+
+        Returns
+        -------
+        dict or None
+            ``None`` if *on_ready* aborted. Otherwise a dict with:
+
+            * ``dac_values`` – np.ndarray of setpoints actually measured
+              (trimmed if the sweep aborted early on saturation).
+            * ``metrics`` – list (one per repetition) of dicts mapping each
+              metric name to an np.ndarray over setpoints.
+            * ``saturated`` – bool, True if the sweep aborted on saturation.
+            * ``target``, ``sample_rate`` – echo of inputs.
+            * ``params`` – the sweep parameters used.
+
+        Raises
+        ------
+        RuntimeError
+            If not connected, the slave does not enumerate, or no samples
+            are captured.
+        """
+        if verbose is None:
+            verbose = self.verbose
+        if sample_rate_hz is None:
+            sample_rate_hz = SAMPLE_RATE
+
+        dac_values = list(range(dac_start, dac_end + 1, dac_step))
+        total = len(dac_values)
+        if total == 0:
+            raise RuntimeError("Empty DAC sweep range.")
+
+        is_1550 = (target == TARGET_1550)
+
+        if verbose:
+            print("\n" + "=" * 60)
+            print("LASER NOISE CHARACTERIZATION SWEEP")
+            print("=" * 60)
+            print(f"Target        : {'1550 nm' if is_1550 else '638 nm'}")
+            print(f"DAC range     : {dac_start} -> {dac_end} (step {dac_step})")
+            print(f"Setpoints     : {total}")
+            print(f"Samples/point : {samples_per_point}")
+            print(f"Settle delay  : {settle_delay_s*1000:.0f} ms")
+            print(f"Repetitions   : {repetitions}")
+            print("=" * 60 + "\n")
+
+        self._ensure_connected()
+        if not self._streaming:
+            self.begin_stream()
+
+        # Saturation trip level (None / >=1.0 disables). Same convention as
+        # run_probe_characterization: 0.95 of ADC full-scale is the analog
+        # front-end clip point, so any setpoint whose PD mean reaches it is
+        # clipped and not worth sweeping past.
+        if saturation_threshold is not None and saturation_threshold < 1.0:
+            saturation_limit = int(ADC_MAX_VALUE * saturation_threshold)
+        else:
+            saturation_limit = None
+        saturated = False
+
+        laser: Optional[LaserSerialController] = None
+        aborted = False
+        all_metrics = []
+        start_t = time.time()
+        try:
+            # -- 1. Override + power rails ----------------------------------
+            if verbose:
+                print("Entering override and powering rails...")
+            self._send(CMD_OVERRIDE_ENTER, wValue=1)
+            time.sleep(0.1)
+            if is_1550:
+                self._send(CMD_POWER, wValue=1, wIndex=TARGET_1550)
+                self._send(CMD_TRIGGER, wValue=0, wIndex=TARGET_1550)
+                self._send(CMD_POWER, wValue=0, wIndex=TARGET_638)
+                self._send(CMD_TRIGGER, wValue=0, wIndex=TARGET_638)
+            else:
+                self._send(CMD_POWER, wValue=1, wIndex=TARGET_638)
+                self._send(CMD_TRIGGER, wValue=0, wIndex=TARGET_638)
+                self._send(CMD_POWER, wValue=0, wIndex=TARGET_1550)
+                self._send(CMD_TRIGGER, wValue=0, wIndex=TARGET_1550)
+            time.sleep(0.1)
+
+            # -- 2. Wait for slave, then open the serial link --------------
+            if verbose:
+                print(f"Waiting {slave_boot_s:.1f} s for slave to boot...")
+            time.sleep(slave_boot_s)
+            if verbose:
+                print("Connecting to slave laser over USB-serial...")
+            laser = LaserSerialController.connect_with_retry(
+                timeout_s=15.0, poll_interval_s=0.5,
+                port=laser_port, verbose=verbose,
+            )
+
+            # -- 3. Optional manual warm-up callback -----------------------
+            if on_ready is not None:
+                if verbose:
+                    print("Calling on_ready() for manual warm-up...")
+                try:
+                    proceed = on_ready(laser)
+                except Exception as exc:
+                    if verbose:
+                        print(f"on_ready raised: {exc}")
+                    proceed = False
+                if not proceed:
+                    if verbose:
+                        print("on_ready aborted the sweep.")
+                    aborted = True
+            else:
+                proceed = True
+
+            # -- 4. The sweep ----------------------------------------------
+            if proceed:
+                if is_1550:
+                    if verbose:
+                        print(f"Setting initial 1550 current (l {dac_start}) and enabling output (on)...")
+                    laser.set_current(dac_start, target=TARGET_1550)
+                    time.sleep(0.1)
+                    laser.enable(target=TARGET_1550)
+                    time.sleep(0.3)
+                    laser.drain()
+
+                for rep in range(repetitions):
+                    if repetitions > 1 and verbose:
+                        print(f"\n--- Sweep run {rep+1} of {repetitions} ---")
+                    metrics_by_name = {
+                        "mean": [], "std_ac_rms": [], "peak_to_peak": [],
+                        "cv": [], "fft_integral": [], "rin": [], "rin_db": [],
+                    }
+                    for i, dac in enumerate(dac_values):
+                        laser.set_current(dac, target=target)
+                        time.sleep(settle_delay_s)
+                        if is_1550:
+                            laser.drain()
+
+                        samples = self.collect_fresh(samples_per_point)
+                        m = compute_noise_metrics(
+                            samples,
+                            sample_rate_hz=sample_rate_hz,
+                            dc_guard_bins=dc_guard_bins,
+                        )
+                        for k, v in m.items():
+                            metrics_by_name[k].append(v)
+
+                        if verbose:
+                            elapsed = time.time() - start_t
+                            eta = (elapsed / (i + 1)) * (total - i - 1) if i > 0 else 0
+                            print(
+                                f"  [r{rep+1} {i+1:5d}/{total}] DAC={dac:5d} "
+                                f"PD={m['mean']:8.1f} AC_RMS={m['std_ac_rms']:7.2f} "
+                                f"RIN_dB={m['rin_db']:7.2f} ETA {eta:5.1f}s   ",
+                                end="\r",
+                            )
+
+                        # Saturation check: abort the sweep once the PD mean
+                        # reaches the front-end clip — higher DAC only clips
+                        # further, so stop (and skip remaining repetitions).
+                        if (saturation_limit is not None
+                                and m["mean"] >= saturation_limit):
+                            saturated = True
+                            if verbose:
+                                print(f"\n⚠ Saturation detected "
+                                      f"(PD mean {m['mean']:.0f} counts >= "
+                                      f"{saturation_limit}) — aborting sweep "
+                                      f"early at DAC={dac}.")
+                            break
+                    if verbose:
+                        print()
+                    all_metrics.append(
+                        {k: np.array(v) for k, v in metrics_by_name.items()}
+                    )
+                    if saturated:
+                        break  # skip remaining repetitions
+        finally:
+            # Safety: always drive the laser to 0 and exit override.
+            if verbose:
+                print("\nSetting laser to 0 (safety)...")
+            if laser is not None:
+                try:
+                    laser.disable(target=target)
+                    time.sleep(0.05)
+                except Exception as exc:
+                    if verbose:
+                        print(f"  WARN: failed to disable laser: {exc}")
+                try:
+                    laser.close()
+                except Exception:
+                    pass
+            try:
+                self._send(CMD_OVERRIDE_ENTER, wValue=0)
+            except Exception:
+                pass
+
+        if aborted:
+            return None
+
+        if not all_metrics:
+            raise RuntimeError("No sweep data captured.")
+
+        # If the sweep aborted on saturation, dac_values is longer than the
+        # measured metrics — trim to the number of points actually captured
+        # (only one partial repetition exists in that case).
+        n_pts = len(all_metrics[0]["mean"])
+        dac_arr = np.array(dac_values[:n_pts])
+
+        elapsed = time.time() - start_t
+        if verbose:
+            msg = f"Sweep complete in {elapsed:.1f} s"
+            if saturated:
+                msg += f" (aborted early on saturation after {n_pts} point(s))"
+            msg += ".\n"
+            print(msg)
+
+        return {
+            "dac_values": dac_arr,
+            "metrics": all_metrics,
+            "saturated": saturated,
+            "target": target,
+            "sample_rate": SAMPLE_RATE,
+            "params": {
+                "dac_start": dac_start, "dac_end": dac_end, "dac_step": dac_step,
+                "samples_per_point": samples_per_point,
+                "settle_delay_s": settle_delay_s,
+                "repetitions": repetitions,
+                "sample_rate_hz": sample_rate_hz,
+                "dc_guard_bins": dc_guard_bins,
+                "saturation_threshold": saturation_threshold,
+            },
+        }
 
     # -- Internals ------------------------------------------------------------
 

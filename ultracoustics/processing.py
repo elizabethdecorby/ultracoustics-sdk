@@ -157,3 +157,83 @@ def compute_psd(samples, fft_size=8192, num_averages=1, sample_rate=SAMPLE_RATE)
     return freq_hz, psd_db
 
 
+# ---------------------------------------------------------------------------
+# Time-domain noise metrics
+# ---------------------------------------------------------------------------
+
+def compute_noise_metrics(samples, sample_rate_hz=None, dc_guard_bins: int = 1):
+    """Compute a battery of noise metrics on a single sample block.
+
+    There is no single "the" noise number for a photodetector signal, so
+    this returns several established figures side by side. All are
+    expressed in raw ADC counts (or dimensionless ratios); for calibrated
+    W²/Hz spectral density use :func:`compute_psd` / the :mod:`ultracoustics.nep`
+    helpers instead.
+
+    Parameters
+    ----------
+    samples : array-like
+        1-D array of raw ADC values (uint16 or float).
+    sample_rate_hz : float or None
+        Sampling frequency in Hz. When given, ``rin_db`` is normalised to
+        a per-Hz noise density (dB/Hz) over the analysis bandwidth
+        ``fs / 2``; otherwise it is the unnormalised
+        ``10·log10(var / mean²)`` in dB.
+    dc_guard_bins : int
+        Number of low-frequency bins (including DC) to drop from the FFT
+        integral. Defaults to 1 (DC only).
+
+    Returns
+    -------
+    dict
+        Keys:
+
+        * ``mean`` – DC level (ADC counts).
+        * ``std_ac_rms`` – AC RMS = std of DC-removed signal (counts).
+        * ``peak_to_peak`` – max − min (counts).
+        * ``cv`` – coefficient of variation = std / mean (dimensionless).
+        * ``fft_integral`` – sum(|FFT(x_ac)|²)/n over the AC band
+          (Parseval-consistent, raw units²).
+        * ``rin`` – variance / mean² (dimensionless intensity noise).
+        * ``rin_db`` – ``10·log10(rin)`` dB, or dB/Hz when
+          *sample_rate_hz* is given.
+    """
+    x = np.asarray(samples, dtype=np.float64).ravel()
+    n = x.size
+
+    mean_val = float(np.mean(x)) if n else float("nan")
+    std_ac = float(np.std(x, ddof=1)) if n > 1 else float("nan")
+    pkpk = float(np.max(x) - np.min(x)) if n else float("nan")
+    cv = std_ac / mean_val if mean_val != 0 else float("nan")
+
+    # Spectral noise: rfft of DC-removed signal.
+    x_ac = x - mean_val
+    spec = np.fft.rfft(x_ac) if n else np.zeros(0, dtype=complex)
+    psd_like = (np.abs(spec) ** 2) / n if n else np.zeros(0)
+
+    guard = max(1, int(dc_guard_bins))
+    fft_integral = float(np.sum(psd_like[guard:])) if psd_like.size > guard else float("nan")
+
+    # RIN-like ratio: variance / mean^2 (intensity noise).
+    if mean_val > 0 and np.isfinite(std_ac):
+        rin = (std_ac ** 2) / (mean_val ** 2)
+        if sample_rate_hz and sample_rate_hz > 0:
+            analysis_bw = sample_rate_hz / 2.0
+            rin_db = 10.0 * np.log10(rin / analysis_bw)
+        else:
+            rin_db = 10.0 * np.log10(rin) if rin > 0 else float("nan")
+    else:
+        rin = float("nan")
+        rin_db = float("nan")
+
+    return {
+        "mean": mean_val,
+        "std_ac_rms": std_ac,
+        "peak_to_peak": pkpk,
+        "cv": cv,
+        "fft_integral": fft_integral,
+        "rin": rin,
+        "rin_db": rin_db,
+    }
+
+

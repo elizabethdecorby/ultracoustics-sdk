@@ -337,7 +337,6 @@ class DiagnosticsManager:
         conn = USBBulkConnection()
         diag = DiagnosticsManager(conn, verbose=True)
         print(diag.query_firmware_info())
-        diag.close()
     """
 
     def __init__(self, connection: USBBulkConnection, verbose=False):
@@ -560,13 +559,31 @@ class DiagnosticsManager:
 class LaserSerialController:
     """Serial interface to a slave laser board for current control.
 
+    The two slave lasers use slightly different serial command dialects:
+
+    * **638 nm** – current is set with ``l=<value>`` (equals sign). No
+      explicit enable/disable command is required; the rail power + trigger
+      state set on the master board turn the output on.
+    * **1550 nm** – current is set with ``l <value>`` (space), and the
+      output must be explicitly enabled with ``on`` and disabled with
+      ``off``. The 1550 firmware also emits a temperature log line every
+      ~2 s that must be drained (:meth:`drain`) to avoid overflowing the
+      serial receive buffer during long sweeps.
+
+    The target-aware methods (:meth:`set_current`, :meth:`enable`,
+    :meth:`disable`) pick the correct dialect automatically. The plain
+    :meth:`send` / :meth:`read_line` / :meth:`drain` passthroughs are
+    exposed for anything else.
+
     Usage::
 
         from ultracoustics._internal.maintenance import LaserSerialController
+        from ultracoustics._internal.protocol import TARGET_1550
 
         laser = LaserSerialController(port="COM3", verbose=True)
-        laser.set_current(2048)
-        laser.disable()
+        laser.enable(target=TARGET_1550)
+        laser.set_current(2048, target=TARGET_1550)
+        laser.disable(target=TARGET_1550)
         laser.close()
     """
 
@@ -585,19 +602,134 @@ class LaserSerialController:
         self._serial = SerialConnection(port=port, verbose=verbose)
         self.verbose = verbose
 
-    def set_current(self, dac_value: int):
-        """Set the laser driver current.
+    # -- Construction helper --------------------------------------------------
+
+    @classmethod
+    def connect_with_retry(cls, timeout_s: float = 15.0,
+                           poll_interval_s: float = 0.5,
+                           port=None, verbose=False) -> "LaserSerialController":
+        """Open the laser serial link, retrying until the slave enumerates.
+
+        After the master board powers a slave rail via override mode, the
+        slave's USB-serial (VCP) port can take a few seconds to appear.
+        Poll for up to *timeout_s* and only re-raise the last error if it
+        still has not enumerated.
+
+        Parameters
+        ----------
+        timeout_s : float
+            Maximum total time to wait for the port to appear.
+        poll_interval_s : float
+            Time between connection attempts.
+        port : str or None
+            Explicit port name, or ``None`` to auto-detect each attempt.
+        verbose : bool
+            Passed through to :class:`LaserSerialController`; the first
+            attempt is verbose, subsequent attempts are quietened.
+
+        Returns
+        -------
+        LaserSerialController
+            A connected controller.
+
+        Raises
+        ------
+        RuntimeError
+            If the slave does not enumerate within *timeout_s*.
+        """
+        import time as _time
+        deadline = _time.time() + timeout_s
+        last_exc = None
+        attempt = 0
+        while _time.time() < deadline:
+            attempt += 1
+            try:
+                if verbose and attempt > 1:
+                    remaining = deadline - _time.time()
+                    print(f"  [{attempt:2d}] slave serial not yet enumerated "
+                          f"({remaining:.1f}s left)...", end="\r")
+                return cls(port=port, verbose=(verbose and attempt == 1))
+            except RuntimeError as exc:
+                last_exc = exc
+                _time.sleep(poll_interval_s)
+        if verbose:
+            print()
+        raise RuntimeError(
+            f"Laser serial port not found after {timeout_s:.0f}s "
+            f"({attempt} attempts). Last error: {last_exc}"
+        )
+
+    # -- Target-aware current control ----------------------------------------
+
+    def set_current(self, dac_value: int, target=None):
+        """Set the laser driver current, picking the dialect by target.
 
         Parameters
         ----------
         dac_value : int
-            Raw DAC value forwarded over the serial ``l=<value>`` command.
+            Raw DAC value forwarded to the slave.
+        target : int or None
+            ``TARGET_1550`` sends the 1550 ``l <value>`` (space) form;
+            ``TARGET_638`` or ``None`` sends the 638 ``l=<value>`` (equals)
+            form. ``None`` preserves the historical default behaviour.
         """
-        self._serial.send(f"l={int(dac_value)}")
+        v = int(dac_value)
+        if target == TARGET_1550:
+            self._serial.send(f"l {v}")
+        else:
+            self._serial.send(f"l={v}")
 
-    def disable(self):
-        """Disable the laser driver by setting current to 0."""
-        self._serial.send("l=0")
+    def enable(self, target=None):
+        """Enable the laser output.
+
+        The 1550 nm slave requires an explicit ``on`` command; the 638 nm
+        slave is enabled by its power rail and trigger state on the master
+        board, so this is a no-op for ``TARGET_638`` / ``None``.
+        """
+        if target == TARGET_1550:
+            self._serial.send("on")
+
+    def disable(self, target=None):
+        """Disable the laser driver.
+
+        For ``TARGET_1550`` this drives the current to 0 (``l 0``) and then
+        sends ``off``. For ``TARGET_638`` / ``None`` it sends ``l=0``
+        (matching the historical behaviour).
+        """
+        if target == TARGET_1550:
+            self._serial.send("l 0")
+            self._serial.send("off")
+        else:
+            self._serial.send("l=0")
+
+    # -- Raw passthrough ------------------------------------------------------
+
+    def send(self, cmd: str):
+        """Send an arbitrary string command (CRLF appended).
+
+        Exposed so callers can issue commands outside the documented
+        ``l``/``on``/``off`` set (e.g. status queries ``s``).
+        """
+        self._serial.send(cmd)
+
+    def read_line(self):
+        """Non-blocking readline. Returns stripped string or ``None``."""
+        return self._serial.read_line()
+
+    def drain(self, max_lines: int = 1000):
+        """Read and discard all pending serial output.
+
+        The 1550 nm slave emits a temperature log line every ~2 s; if left
+        undrained during a slow sweep the serial receive buffer overflows.
+        Call this between setpoints (1550 only) to keep the buffer empty.
+        Returns the number of lines discarded.
+        """
+        n = 0
+        for _ in range(max_lines):
+            if self.read_line() is None:
+                break
+            n += 1
+        return n
 
     def close(self):
         """Close the serial connection."""

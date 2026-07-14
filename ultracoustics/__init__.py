@@ -4,7 +4,7 @@ __version__ = "0.1.0"
 
 # High-level tools for External Use
 from .controller import Controller
-from .processing import compute_psd, load_binary, adc_to_uw
+from .processing import compute_psd, load_binary, adc_to_uw, compute_noise_metrics
 from .nep import (
     compute_psd_w2hz,
     shot_noise_psd_w2hz,
@@ -34,6 +34,7 @@ __all__ = [
     "compute_psd",
     "load_binary",
     "adc_to_uw",
+    "compute_noise_metrics",
     # NEP / pressure-calibration helpers
     "compute_psd_w2hz",
     "shot_noise_psd_w2hz",
