@@ -507,7 +507,6 @@ class DiagnosticsManager:
                 "version": version_str,
                 "build_date": build_dt,
                 "hardware_rev": hw_rev,
-                "raw": chunk,
             }
         raise TimeoutError("No firmware info response received.")
 
@@ -547,8 +546,7 @@ class DiagnosticsManager:
             return {
                 "boot": {"version": boot_ver, "build_date": boot_dt, "hardware_rev": boot_hw},
                 "app": {"version": app_ver, "build_date": app_dt, "hardware_rev": app_hw},
-                "raw": chunk,
-            }
+                }
         raise TimeoutError("No version response received.")
 
 
@@ -654,6 +652,25 @@ class LaserSerialController:
                 _time.sleep(poll_interval_s)
         if verbose:
             print()
+            # Dump every visible COM port so the caller can see whether the
+            # slave enumerated at all (and with what VID/PID/description).
+            # A 638 slave should appear as VID=0x0483 PID=0x5740
+            # "STM32 Virtual ComPort"; a 1550 as the custom Broadsonic PID.
+            try:
+                import serial.tools.list_ports as _lp
+                ports = list(_lp.comports())
+                if ports:
+                    print("  Visible COM ports:")
+                    for _p in ports:
+                        _vid = hex(_p.vid) if _p.vid is not None else "None"
+                        _pid = hex(_p.pid) if _p.pid is not None else "None"
+                        print(f"    {_p.device}  VID={_vid} PID={_pid}  "
+                              f"{_p.description}")
+                else:
+                    print("  No COM ports visible at all — is the slave USB "
+                          "cable connected to the host and the board powered?")
+            except Exception:
+                pass
         raise RuntimeError(
             f"Laser serial port not found after {timeout_s:.0f}s "
             f"({attempt} attempts). Last error: {last_exc}"

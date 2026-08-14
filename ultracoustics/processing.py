@@ -8,7 +8,7 @@ Functions
 ---------
 load_binary(path, dtype)
     Load raw ADC samples from a binary file on disk.
-adc_to_uw(samples, baseline)
+adc_to_uw(samples, baseline, responsivity)
     Convert raw 14-bit ADC counts to optical power in µW.
 compute_psd(samples, fft_size, num_averages, sample_rate)
     Compute a Hanning-windowed, averaged one-sided PSD in dB re 1 W²/Hz.
@@ -73,7 +73,7 @@ def load_binary(path, dtype=np.uint16):
 # Unit conversion helpers
 # ---------------------------------------------------------------------------
 
-def adc_to_uw(samples, baseline=0.0):
+def adc_to_uw(samples, baseline=0.0, responsivity=None):
     """Convert raw ADC counts to optical power in µW.
 
     Applies the full signal chain: ADC → voltage → (÷ ADA4940 gain) →
@@ -84,11 +84,19 @@ def adc_to_uw(samples, baseline=0.0):
     Args:
         samples: Array of uint16 ADC values (14-bit range 0–16383).
         baseline: ADC-count DC offset to subtract before conversion.
+        responsivity: Detector responsivity in A/W (== µA/µW). Defaults
+            to the 1550 nm InGaAs value; pass the value for the detector
+            actually in use when measuring another channel (the analog
+            front end is shared, so only the photodiode differs).
 
     Returns:
         numpy.ndarray: Optical power values in µW (float64).
     """
-    return (samples.astype(np.float64) - baseline) * ADC_TO_POWER_UW
+    if responsivity is None:
+        scale = ADC_TO_POWER_UW
+    else:
+        scale = _ADC_TO_CURRENT_UA / responsivity
+    return (samples.astype(np.float64) - baseline) * scale
 
 
 # ---------------------------------------------------------------------------
