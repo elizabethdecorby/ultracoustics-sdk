@@ -60,12 +60,12 @@ DEFAULT_M_EFF = 25e-12       # effective modal mass    [kg]   (25 pg)
 DEFAULT_DOME_RADIUS = 50e-6  # dome radius             [m]    (50 µm)
 DEFAULT_TEMPERATURE = 300.0  # ambient                 [K]
 
-# ADC / TIA chain (matches nep_calculator.py and the master-board schematic)
-DEFAULT_R_PD = 0.9            # photodiode responsivity   [A/W]
+# ADC / TIA chain (matches processing.py, nep_calculator.py? and the master-board schematic)
+DEFAULT_R_PD = 1.077            # photodiode responsivity   [A/W]
 DEFAULT_R_FEEDBACK = 20_000.0 # TIA feedback resistor     [Ω]
-DEFAULT_DIFF_GAIN = 5.0 / 3.0 # ADA4940 differential driver gain (1.667×)
+DEFAULT_DIFF_GAIN = 470 / 280 # ADA4940 differential driver gain (~1.68)
                               # — annotated on the schematic. The ADC sees
-                              # a voltage 1.667× the TIA output.
+                              # a voltage 1.68× the TIA output.
 DEFAULT_V_REF = 5.0           # ADC full-scale reference  [V]
 DEFAULT_ADC_FULLSCALE = 16383 # 14-bit max code
 

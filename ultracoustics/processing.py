@@ -26,8 +26,8 @@ from .config import SAMPLE_RATE
 ADC_FULL_SCALE = 16383          # 14-bit ADC
 ADC_VREF = 5.0                  # Volts
 TRANSIMPEDANCE = 20_000         # 20 kΩ
-DIFF_GAIN = 5.0 / 3.0           # ADA4940 differential driver gain
-                                # (annotated 1.667× on the schematic)
+DIFF_GAIN = 470 / 280           # ADA4940 differential driver gain
+                                # (annotated 1.667× on the schematic but actual ratio is 1.679)
 
 # Derived
 _ADC_TO_VOLTAGE = ADC_VREF / ADC_FULL_SCALE          # V / count (at ADC pin)
@@ -36,11 +36,14 @@ _VOLTAGE_TO_CURRENT = 1.0 / TRANSIMPEDANCE           # A / V (at TIA output)
 # produced one ADC count is reduced by 1/DIFF_GAIN.
 _ADC_TO_CURRENT_UA = (_ADC_TO_VOLTAGE / DIFF_GAIN) * _VOLTAGE_TO_CURRENT * 1e6  # µA / count
 
-# Responsivity: 140 µA ≡ 156 µW → 0.897 µA/µW
-_RESPONSIVITY = 140.0 / 156.0   # µA / µW
+# Responsivity: R = η·q·λ/(hc). Spec sheet says R=0.9A/wW @ 1310nm. Solving for quuantum efficiency gives 0.9 × 1240/1310 = 0.852. 
+# so then R(1550) = 0.852 × 1550/1240 = 1.065 A/W. This is approximate and assuming quantum eff is completely flat. 
+# likely the quantum efficiency peaks a bit around 1550 giving an even higher responsivity
+
+_RESPONSIVITY = 1.077  # µA / µW
 
 ADC_TO_POWER_UW = _ADC_TO_CURRENT_UA / _RESPONSIVITY
-"""µW per ADC count (full signal chain incl. ADA4940 1.667× gain)."""
+"""µW per ADC count (full signal chain incl. ADA4940 ~1.68× gain)."""
 
 
 # ---------------------------------------------------------------------------
