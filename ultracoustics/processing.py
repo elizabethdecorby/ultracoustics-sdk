@@ -98,7 +98,7 @@ def adc_to_uw(samples, baseline=0.0, responsivity=None):
     if responsivity is None:
         scale = ADC_TO_POWER_UW
     else:
-        scale = _ADC_TO_CURRENT_UA / responsivity
+        scale = (_ADC_TO_VOLTAGE / DIFF_GAIN) * (1/10000) * 1e6  / responsivity
     return (samples.astype(np.float64) - baseline) * scale
 
 
