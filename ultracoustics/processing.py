@@ -8,7 +8,7 @@ Functions
 ---------
 load_binary(path, dtype)
     Load raw ADC samples from a binary file on disk.
-adc_to_uw(samples, baseline, responsivity)
+adc_to_uw(samples, baseline, responsivity, transimpedance)
     Convert raw 14-bit ADC counts to optical power in µW.
 compute_psd(samples, fft_size, num_averages, sample_rate)
     Compute a Hanning-windowed, averaged one-sided PSD in dB re 1 W²/Hz.
@@ -25,9 +25,17 @@ from .config import SAMPLE_RATE
 
 ADC_FULL_SCALE = 16383          # 14-bit ADC
 ADC_VREF = 5.0                  # Volts
-TRANSIMPEDANCE = 20_000         # 20 kΩ
+TRANSIMPEDANCE = 20_000         # 20 kΩ — the 1550 nm channel, and the default
 DIFF_GAIN = 470 / 280           # ADA4940 differential driver gain
                                 # (annotated 1.667× on the schematic but actual ratio is 1.679)
+
+# Feedback resistor per readout channel. The two channels do NOT share one
+# front end: the 638 nm channel uses a 10 kΩ TIA and the 1550 nm channel a
+# 20 kΩ TIA, so a given ADC count corresponds to twice the photocurrent on
+# the 638 channel. Pass the matching value to :func:`adc_to_uw` — the
+# default is the 1550 nm value for backwards compatibility.
+TRANSIMPEDANCE_1550 = 20_000    # Ω
+TRANSIMPEDANCE_638 = 10_000     # Ω
 
 # Derived
 _ADC_TO_VOLTAGE = ADC_VREF / ADC_FULL_SCALE          # V / count (at ADC pin)
@@ -76,29 +84,49 @@ def load_binary(path, dtype=np.uint16):
 # Unit conversion helpers
 # ---------------------------------------------------------------------------
 
-def adc_to_uw(samples, baseline=0.0, responsivity=None):
+def adc_to_uw(samples, baseline=0.0, responsivity=None, transimpedance=None):
     """Convert raw ADC counts to optical power in µW.
 
     Applies the full signal chain: ADC → voltage → (÷ ADA4940 gain) →
-    current → optical power. The ADA4940 differential driver amplifies
-    the TIA output by 5/3 before the ADC, so the photocurrent is the
-    ADC voltage divided by ``R_f · DIFF_GAIN``.
+    (÷ R_f) → current → (÷ responsivity) → optical power. The ADA4940
+    differential driver amplifies the TIA output before the ADC, so the
+    photocurrent is the ADC voltage divided by ``R_f · DIFF_GAIN``.
+
+    Both the photodiode and the feedback resistor differ between the two
+    readout channels, so a full conversion needs both values:
+
+    ==========  ==================  ==================
+    Channel     Responsivity (A/W)  Transimpedance (Ω)
+    ==========  ==================  ==================
+    1550 nm     1.077 (InGaAs)      20 000
+    638 nm      0.3 (Si visible)    10 000
+    ==========  ==================  ==================
 
     Args:
         samples: Array of uint16 ADC values (14-bit range 0–16383).
         baseline: ADC-count DC offset to subtract before conversion.
         responsivity: Detector responsivity in A/W (== µA/µW). Defaults
-            to the 1550 nm InGaAs value; pass the value for the detector
-            actually in use when measuring another channel (the analog
-            front end is shared, so only the photodiode differs).
+            to the 1550 nm InGaAs value.
+        transimpedance: TIA feedback resistance in ohms. Defaults to
+            :data:`TRANSIMPEDANCE` (the 1550 nm value). Pass
+            :data:`TRANSIMPEDANCE_638` when converting 638 nm data.
 
     Returns:
         numpy.ndarray: Optical power values in µW (float64).
+
+    Note:
+        Every argument combination goes through one formula, so calling
+        this with the default responsivity and transimpedance spelled out
+        explicitly gives exactly the same scale as omitting them. An
+        earlier revision had a second code path that hardcoded a 10 kΩ
+        feedback resistor, which silently doubled every converted value
+        whenever a responsivity was supplied.
     """
     if responsivity is None:
-        scale = ADC_TO_POWER_UW
-    else:
-        scale = (_ADC_TO_VOLTAGE / DIFF_GAIN) * (1/10000) * 1e6  / responsivity
+        responsivity = _RESPONSIVITY
+    if transimpedance is None:
+        transimpedance = TRANSIMPEDANCE
+    scale = (_ADC_TO_VOLTAGE / DIFF_GAIN) / transimpedance * 1e6 / responsivity
     return (samples.astype(np.float64) - baseline) * scale
 
 

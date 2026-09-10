@@ -182,19 +182,35 @@ Returns `(freq_hz, psd_db)` — both 1-D float64 arrays of length `fft_size // 2
 
 ---
 
-### `adc_to_uw(samples, baseline=0.0) → np.ndarray`
+### `adc_to_uw(samples, baseline=0.0, responsivity=None, transimpedance=None) → np.ndarray`
 
-Convert raw 14-bit ADC counts to optical power in µW, applying the full signal chain (ADC → voltage → current → optical power, with 0.5× differential-mode correction).
+Convert raw 14-bit ADC counts to optical power in µW, applying the full signal chain: ADC → voltage → ÷ ADA4940 gain → ÷ R_f → photocurrent → ÷ responsivity → optical power.
+
+The two readout channels differ in **both** the photodiode and the TIA feedback resistor, so converting 638 nm data needs both values passed:
+
+| Channel | Responsivity | Transimpedance | Full scale (16383 counts) |
+|---|---|---|---|
+| 1550 nm (InGaAs) | 1.077 A/W | 20 kΩ | ≈ 138 µW |
+| 638 nm (Si visible) | 0.3 A/W | 10 kΩ | ≈ 993 µW |
 
 ```python
 from ultracoustics import adc_to_uw
+from ultracoustics.processing import TRANSIMPEDANCE_638
+
+# 1550 nm — the defaults already match this channel
 power_uw = adc_to_uw(samples, baseline=samples.mean())
+
+# 638 nm — pass both channel constants
+power_uw = adc_to_uw(samples, baseline=samples.mean(),
+                     responsivity=0.3, transimpedance=TRANSIMPEDANCE_638)
 ```
 
 | Parameter | Default | Description |
 |---|---|---|
 | `samples` | — | uint16 array of raw ADC values (0–16383). |
 | `baseline` | `0.0` | ADC-count DC offset to subtract before conversion (e.g. dark-current baseline). |
+| `responsivity` | `1.077` | Detector responsivity in A/W (== µA/µW). |
+| `transimpedance` | `20_000` | TIA feedback resistance in ohms. Use `TRANSIMPEDANCE_638` (10 kΩ) for the 638 nm channel. |
 
 ---
 
