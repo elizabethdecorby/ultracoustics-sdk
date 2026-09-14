@@ -85,15 +85,16 @@ class TelemetryParserTests(unittest.TestCase):
         with self.assertRaises(TelemetryFormatError):
             parse_record(format1_record(tlvs=tlvs), 1)
 
-    def test_unknown_required_and_reserved_bytes_fail(self):
+    def test_unknown_required_fails_and_link_flags_are_preserved(self):
         tlvs = [(1, board_blob(638) + b"\0\0"),
                 (3, board_blob(1550) + b"\0\0")]
         with self.assertRaisesRegex(TelemetryFormatError, "unknown required"):
             parse_record(format1_record(tlvs=tlvs), 1)
-        tlvs = [(1, board_blob(638) + b"\0\1"),
+        tlvs = [(1, board_blob(638) + struct.pack("<H", 0x8001)),
                 (2, board_blob(1550) + b"\0\0")]
-        with self.assertRaisesRegex(TelemetryFormatError, "reserved"):
-            parse_record(format1_record(tlvs=tlvs), 1)
+        parsed = parse_record(format1_record(tlvs=tlvs), 1)
+        self.assertEqual(parsed.telemetry.link_flags_638, 0x8001)
+        self.assertTrue(parsed.telemetry.link_638_stale)
 
     def test_bounded_future_trailer_skips_unknown_optional_tlv(self):
         trailer = bytearray(struct.pack("<4sBBHIHH", b"UTL1", 1, 16, 147,
@@ -104,8 +105,9 @@ class TelemetryParserTests(unittest.TestCase):
             trailer += struct.pack("<HH", kind, len(payload)) + payload
         trailer += struct.pack("<HHI", 0x7FFF, 4,
                                zlib.crc32(trailer) & 0xFFFFFFFF)
-        epoch, board638, board1550 = parse_format1_trailer(trailer)
+        epoch, board638, board1550, link638, link1550 = parse_format1_trailer(trailer)
         self.assertEqual((epoch, board638.board, board1550.board), (5, 638, 1550))
+        self.assertEqual((link638, link1550), (0, 0))
 
     def test_shared_sidecar_is_coherent_and_tracks_epoch(self):
         shm = SharedMemory(create=True, size=SIDECAR_BYTES)
@@ -119,6 +121,7 @@ class TelemetryParserTests(unittest.TestCase):
             snapshot, stats = read_sidecar(shm)
             self.assertEqual(snapshot.stream_epoch, 4)
             self.assertEqual(snapshot.record_sequence, 13)
+            self.assertEqual(snapshot.link_flags_638, 0)
             self.assertEqual(stats["records"], 2)
             self.assertEqual(stats["epoch_changes"], 1)
             self.assertEqual(stats["active_format"], 1)

@@ -30,6 +30,11 @@ TELEMETRY_FAULT = 1 << 1
 TELEMETRY_STALE = 1 << 2
 TELEMETRY_UNCALIBRATED = 1 << 3
 TELEMETRY_BACKEND_DISABLED = 1 << 4
+LINK_STALE = 1 << 0
+LINK_OVERFLOW = 1 << 1
+LINK_DECODE_ERROR = 1 << 2
+LINK_IDENTITY_ERROR = 1 << 3
+LINK_UNAVAILABLE = 1 << 15
 
 _CANONICAL = struct.Struct("<HHIIiIIHHHHIIHhHbBHH")
 assert _CANONICAL.size == CANONICAL_SNAPSHOT_BYTES
@@ -139,6 +144,8 @@ class TelemetrySnapshot:
     received_monotonic_ns: int
     board_638: BoardTelemetry
     board_1550: BoardTelemetry
+    link_flags_638: int = 0
+    link_flags_1550: int = 0
 
     @property
     def host_age_s(self) -> float:
@@ -147,6 +154,14 @@ class TelemetrySnapshot:
     @property
     def host_stale(self) -> bool:
         return time.monotonic_ns() - self.received_monotonic_ns > STALE_AFTER_NS
+
+    @property
+    def link_638_stale(self) -> bool:
+        return bool(self.link_flags_638 & (LINK_STALE | LINK_UNAVAILABLE))
+
+    @property
+    def link_1550_stale(self) -> bool:
+        return bool(self.link_flags_1550 & (LINK_STALE | LINK_UNAVAILABLE))
 
 
 @dataclass(frozen=True)
@@ -157,18 +172,19 @@ class ParsedRecord:
     telemetry: Optional[TelemetrySnapshot]
 
 
-def _parse_board_tlv(payload: bytes, expected_board: int) -> BoardTelemetry:
+def _parse_board_tlv(payload: bytes, expected_board: int) -> tuple[BoardTelemetry, int]:
     if len(payload) != 54:
         raise TelemetryFormatError("required board TLV length must be 54")
-    if payload[52:] != b"\x00\x00":
-        raise TelemetryFormatError("required board TLV reserved bytes are nonzero")
     board = BoardTelemetry.from_bytes(payload[:52])
     if board.schema != 1 or board.board != expected_board or board.reserved != 0:
         raise TelemetryFormatError("board snapshot schema, identity, or reserved byte invalid")
-    return board
+    link_flags, = struct.unpack_from("<H", payload, 52)
+    return board, link_flags
 
 
-def parse_format1_trailer(trailer) -> tuple[int, BoardTelemetry, BoardTelemetry]:
+def parse_format1_trailer(
+    trailer,
+) -> tuple[int, BoardTelemetry, BoardTelemetry, int, int]:
     """Parse a current or bounded future format-1 trailer.
 
     Unknown optional TLVs are skipped. Unknown required TLVs fail. Current
@@ -192,6 +208,8 @@ def parse_format1_trailer(trailer) -> tuple[int, BoardTelemetry, BoardTelemetry]
     offset = header_len
     board_638 = None
     board_1550 = None
+    link_flags_638 = 0
+    link_flags_1550 = 0
     for index in range(tlv_count):
         if offset + 4 > trailer_len:
             raise TelemetryFormatError("truncated TLV header")
@@ -213,16 +231,16 @@ def parse_format1_trailer(trailer) -> tuple[int, BoardTelemetry, BoardTelemetry]
         elif tlv_type == TLV_638:
             if board_638 is not None:
                 raise TelemetryFormatError("duplicate 638 TLV")
-            board_638 = _parse_board_tlv(payload, 638)
+            board_638, link_flags_638 = _parse_board_tlv(payload, 638)
         elif tlv_type == TLV_1550:
             if board_1550 is not None:
                 raise TelemetryFormatError("duplicate 1550 TLV")
-            board_1550 = _parse_board_tlv(payload, 1550)
+            board_1550, link_flags_1550 = _parse_board_tlv(payload, 1550)
         elif not (tlv_type & OPTIONAL_TLV_BIT):
             raise TelemetryFormatError(f"unknown required TLV {tlv_type:#x}")
     if offset != trailer_len or board_638 is None or board_1550 is None:
         raise TelemetryFormatError("missing required board telemetry")
-    return epoch, board_638, board_1550
+    return epoch, board_638, board_1550, link_flags_638, link_flags_1550
 
 
 def parse_record(raw, expected_format: int, *, received_monotonic_ns: Optional[int] = None) -> ParsedRecord:
@@ -246,15 +264,16 @@ def parse_record(raw, expected_format: int, *, received_monotonic_ns: Optional[i
         return ParsedRecord(sequence, drops_fw, samples, None)
 
     trailer = view[LEGACY_RECORD_BYTES:]
-    epoch, board_638, board_1550 = parse_format1_trailer(trailer)
+    epoch, board_638, board_1550, link638, link1550 = parse_format1_trailer(trailer)
     received = time.monotonic_ns() if received_monotonic_ns is None else received_monotonic_ns
-    telemetry = TelemetrySnapshot(epoch, sequence, received, board_638, board_1550)
+    telemetry = TelemetrySnapshot(epoch, sequence, received, board_638,
+                                  board_1550, link638, link1550)
     return ParsedRecord(sequence, drops_fw, samples, telemetry)
 
 
 # Seqlock sidecar: generation, epoch/record, receive time, two canonical blobs,
 # records published, parse errors, epoch changes. One subprocess writer.
-SIDECAR_BYTES = 160
+SIDECAR_BYTES = 168
 
 
 def initialise_sidecar(shm: SharedMemory) -> None:
@@ -299,6 +318,8 @@ class TelemetrySidecarWriter:
         self._last_epoch = snapshot.stream_epoch
         struct.pack_into("<QQQ", self._buf, 128, records + 1, errors, changes)
         struct.pack_into("<II", self._buf, 152, 1, 1)
+        struct.pack_into("<HH", self._buf, 160, snapshot.link_flags_638,
+                         snapshot.link_flags_1550)
         self._end()
 
     def record_error(self) -> None:
@@ -326,9 +347,11 @@ def read_sidecar(shm: SharedMemory) -> tuple[Optional[TelemetrySnapshot], dict]:
     if before == 0 or records == 0 or not valid:
         return None, stats
     epoch, sequence, received = struct.unpack_from("<IIQ", data, 8)
+    link638, link1550 = struct.unpack_from("<HH", data, 160)
     snapshot = TelemetrySnapshot(
         epoch, sequence, received,
         BoardTelemetry.from_bytes(data[24:76]),
         BoardTelemetry.from_bytes(data[76:128]),
+        link638, link1550,
     )
     return snapshot, stats
