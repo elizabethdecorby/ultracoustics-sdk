@@ -36,9 +36,9 @@ class ConfirmedCommandTests(unittest.TestCase):
         self.assertEqual(result["host_delivery_bound_ns"], 20)
 
     @mock.patch("ultracoustics._internal.comms.time.monotonic_ns", return_value=100)
-    def test_rejected_confirmed_command_is_not_retried(self, _clock):
+    def test_failed_confirmed_delivery_is_reported(self, _clock):
         stream = self.stream(ok=False)
-        with self.assertRaisesRegex(CommandRejectedError, "not retried"):
+        with self.assertRaisesRegex(CommandRejectedError, "delivery failed"):
             stream.send_command_confirmed(b"abc")
         self.assertEqual(len(stream._cmd_queue.items), 1)
 

@@ -54,7 +54,7 @@ PSSI_PACKET_WIRE_BYTES = PSSI_HEADER_BYTES + PSSI_PAYLOAD_BYTES
 # ---------------------------------------------------------------------------
 
 class CommandRejectedError(RuntimeError):
-    """Device stalled BULK OUT to reject a command; the command was not retried."""
+    """BULK OUT remained unavailable after bounded deferred-halt recovery."""
 
 
 class USBBulkConnection:
@@ -482,8 +482,9 @@ class USBStream:
         """Send once and wait for the reader's bounded bulkWrite completion.
 
         This confirms host-side OUT delivery only; it does not claim exact
-        firmware execution time. A rejected command is reported after clearing
-        the endpoint halt and is never retried.
+        firmware execution time. A deferred halt is cleared and only the
+        transfer that encountered the already-halted endpoint is submitted
+        once; the previously dispatched command is never replayed.
         """
         if not self._running or self._cmd_queue is None or self._command_ack_queue is None:
             raise RuntimeError("USBStream is not running; cannot send command")
@@ -511,7 +512,7 @@ class USBStream:
             }
             if not ok:
                 raise CommandRejectedError(
-                    f"command rejected or failed in reader ({error}); not retried"
+                    f"confirmed command delivery failed after bounded recovery ({error})"
                 )
             return result
 
