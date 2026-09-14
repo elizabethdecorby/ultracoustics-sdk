@@ -53,8 +53,18 @@ PSSI_PACKET_WIRE_BYTES = PSSI_HEADER_BYTES + PSSI_PAYLOAD_BYTES
 # USB Bulk (Master Board) Communication
 # ---------------------------------------------------------------------------
 
-class CommandRejectedError(RuntimeError):
-    """BULK OUT remained unavailable after bounded deferred-halt recovery."""
+class TransportUncertainError(RuntimeError):
+    """A nonempty OUT request may have been partly or fully delivered."""
+
+    def __init__(self, message, *, halt_cleared=False):
+        super().__init__(message)
+        self.transport_status = "uncertain"
+        self.halt_cleared = halt_cleared
+
+
+# Source-compatible name for callers importing/catching the former exception.
+# The old name was too specific: PIPE cannot identify an application rejection.
+CommandRejectedError = TransportUncertainError
 
 
 class USBBulkConnection:
@@ -155,7 +165,13 @@ class USBBulkConnection:
         if not self.connected:
             raise RuntimeError("Not connected")
         try:
-            self.dev.write(BULK_OUT_EP, payload, timeout=timeout_ms)
+            transferred = self.dev.write(BULK_OUT_EP, payload, timeout=timeout_ms)
+            if transferred != len(payload):
+                raise TransportUncertainError(
+                    f"short BULK OUT transfer ({transferred}/{len(payload)} bytes); "
+                    "request application state is uncertain"
+                )
+            return {"transport_status": "delivered", "transferred_bytes": transferred}
         except usb.core.USBError as e:
             is_pipe = e.errno == 32 or getattr(e, "backend_error_code", None) == -9
             if is_pipe:
@@ -165,21 +181,22 @@ class USBBulkConnection:
                 except Exception as exc:  # preserve original rejection context
                     clear_error = exc
                 if clear_error is not None:
-                    raise CommandRejectedError(
-                        f"deferred command rejection; halt clear failed: {clear_error}"
+                    raise TransportUncertainError(
+                        f"BULK OUT PIPE; halt clear failed ({clear_error}); "
+                        "request application state is uncertain",
+                        halt_cleared=False,
                     ) from e
-                # Firmware can only stall after its receive callback runs, so
-                # the halt reports rejection of the preceding command. This
-                # transfer moved zero bytes and is safe to submit once after
-                # CLEAR_FEATURE; the rejected prior command is never replayed.
-                try:
-                    self.dev.write(BULK_OUT_EP, payload, timeout=timeout_ms)
-                    return
-                except usb.core.USBError as retry_error:
-                    raise CommandRejectedError(
-                        f"OUT remained halted after deferred-rejection recovery: {retry_error}"
-                    ) from retry_error
-            raise RuntimeError(f"Failed to send: {e}")
+                # PIPE does not expose a trustworthy transferred-byte count.
+                # Clearing halt restores transport availability but cannot
+                # identify the rejected request or prove this payload unsent.
+                raise TransportUncertainError(
+                    "BULK OUT PIPE; halt cleared without replay; request "
+                    "application state is uncertain",
+                    halt_cleared=True,
+                ) from e
+            raise TransportUncertainError(
+                f"BULK OUT failed ({e}); request application state is uncertain"
+            ) from e
 
     def receive(self, length, timeout_ms=1000):
         """Blocking read from Bulk IN endpoint. Returns bytes or None."""
@@ -481,10 +498,9 @@ class USBStream:
     def send_command_confirmed(self, payload: bytes, timeout_s: float = 0.5) -> dict:
         """Send once and wait for the reader's bounded bulkWrite completion.
 
-        This confirms host-side OUT delivery only; it does not claim exact
-        firmware execution time. A deferred halt is cleared and only the
-        transfer that encountered the already-halted endpoint is submitted
-        once; the previously dispatched command is never replayed.
+        This reports transport-delivered/failed/uncertain only. It never claims
+        firmware receipt or application. PIPE is cleared but the payload is not
+        replayed because transferred length is unknown.
         """
         if not self._running or self._cmd_queue is None or self._command_ack_queue is None:
             raise RuntimeError("USBStream is not running; cannot send command")
@@ -498,7 +514,7 @@ class USBStream:
             if remaining <= 0:
                 raise TimeoutError("no bounded OUT completion from reader")
             try:
-                ack_id, ok, error, completed_ns = self._command_ack_queue.get(
+                ack_id, transport, completed_ns = self._command_ack_queue.get(
                     timeout=remaining
                 )
             except queue.Empty as exc:
@@ -509,10 +525,17 @@ class USBStream:
                 "enqueued_monotonic_ns": enqueued_ns,
                 "bulk_write_completed_monotonic_ns": completed_ns,
                 "host_delivery_bound_ns": completed_ns - enqueued_ns,
+                **transport,
             }
-            if not ok:
-                raise CommandRejectedError(
-                    f"confirmed command delivery failed after bounded recovery ({error})"
+            if transport["transport_status"] == "uncertain":
+                raise TransportUncertainError(
+                    f"confirmed command transport uncertain ({transport['error']}); "
+                    "payload was not replayed",
+                    halt_cleared=transport.get("halt_cleared", False),
+                )
+            if transport["transport_status"] != "delivered":
+                raise RuntimeError(
+                    f"confirmed command transport failed ({transport['error']})"
                 )
             return result
 

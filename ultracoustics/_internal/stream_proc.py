@@ -147,6 +147,33 @@ COMMAND_POLL_INTERVAL_S = 0.005
 _SMALL_FORWARD_GAP_MAX = 1000
 
 
+def _write_outbound_once(handle, payload, timeout_ms: int) -> dict:
+    """Attempt one nonempty OUT request, clearing PIPE without replay."""
+    try:
+        transferred = handle.bulkWrite(BULK_OUT_EP, payload, timeout=timeout_ms)
+        if transferred != len(payload):
+            return {"transport_status": "uncertain", "transferred_bytes": transferred,
+                    "halt_cleared": False,
+                    "error": f"short transfer {transferred}/{len(payload)}"}
+        return {"transport_status": "delivered", "transferred_bytes": transferred,
+                "halt_cleared": False, "error": None}
+    except Exception as exc:
+        # Local import preserves the small spawn-process import surface.
+        import usb1
+        if not isinstance(exc, usb1.USBErrorPipe):
+            return {"transport_status": "uncertain", "transferred_bytes": None,
+                    "halt_cleared": False, "error": repr(exc)}
+        try:
+            handle.clearHalt(BULK_OUT_EP)
+        except Exception as clear_exc:
+            return {"transport_status": "uncertain", "transferred_bytes": None,
+                    "halt_cleared": False,
+                    "error": f"{exc!r}; halt clear failed: {clear_exc!r}"}
+        return {"transport_status": "uncertain", "transferred_bytes": None,
+                "halt_cleared": True,
+                "error": f"{exc!r}; halt cleared without replay"}
+
+
 def classify_sequence_transition(last_seq: Optional[int], seq: int) -> tuple[str, int, bool]:
     """Classify one uint32 sequence transition.
 
@@ -346,25 +373,12 @@ def reader_main(
             payload = item
             if isinstance(item, tuple):
                 request_id, payload = item
-            ok = True
-            error = None
-            try:
-                handle.bulkWrite(BULK_OUT_EP, payload, timeout=timeout_ms)
-            except usb1.USBError as exc:
+            result = _write_outbound_once(handle, payload, timeout_ms)
+            if result["transport_status"] != "delivered":
                 counters[4] += 1
-                if isinstance(exc, usb1.USBErrorPipe):
-                    try:
-                        handle.clearHalt(BULK_OUT_EP)
-                        handle.bulkWrite(BULK_OUT_EP, payload, timeout=timeout_ms)
-                    except usb1.USBError as clear_exc:
-                        ok = False
-                        error = f"{exc!r}; recovery failed: {clear_exc!r}"
-                else:
-                    ok = False
-                    error = repr(exc)
             if request_id is not None and command_ack_queue is not None:
                 command_ack_queue.put(
-                    (request_id, ok, error, time.monotonic_ns())
+                    (request_id, result, time.monotonic_ns())
                 )
 
         # ------------------------------------------------------------------

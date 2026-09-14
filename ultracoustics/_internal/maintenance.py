@@ -235,11 +235,11 @@ class Programmer:
             if progress_callback:
                 progress_callback(page_num, total_pages)
 
-        # Phase 3: COMMIT
-        try:
-            self._conn.send_command(CMD_IAP, wValue=3, timeout_ms=10000)
-        except Exception:
-            pass  # device resets – USB disconnect is expected
+        # Phase 3: COMMIT.  Do not swallow a transport exception: a reset may
+        # be expected after application, but without an application ACK the
+        # caller must treat a failed/uncertain transfer as unknown state and
+        # explicitly verify device identity before deciding what to do next.
+        self._conn.send_command(CMD_IAP, wValue=3, timeout_ms=10000)
 
         if self.verbose:
             print("  COMMIT sent – device is resetting")
