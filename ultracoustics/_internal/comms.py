@@ -52,6 +52,10 @@ PSSI_PACKET_WIRE_BYTES = PSSI_HEADER_BYTES + PSSI_PAYLOAD_BYTES
 # USB Bulk (Master Board) Communication
 # ---------------------------------------------------------------------------
 
+class CommandRejectedError(RuntimeError):
+    """Device stalled BULK OUT to reject a command; the command was not retried."""
+
+
 class USBBulkConnection:
     """
     Manages the USB Bulk connection to the Master Board (STM32H7RS).
@@ -152,6 +156,17 @@ class USBBulkConnection:
         try:
             self.dev.write(BULK_OUT_EP, payload, timeout=timeout_ms)
         except usb.core.USBError as e:
+            is_pipe = e.errno == 32 or getattr(e, "backend_error_code", None) == -9
+            if is_pipe:
+                clear_error = None
+                try:
+                    self.dev.clear_halt(BULK_OUT_EP)
+                except Exception as exc:  # preserve original rejection context
+                    clear_error = exc
+                detail = "endpoint halt cleared" if clear_error is None else f"halt clear failed: {clear_error}"
+                raise CommandRejectedError(
+                    f"command rejected by device ({detail}); not retried"
+                ) from e
             raise RuntimeError(f"Failed to send: {e}")
 
     def receive(self, length, timeout_ms=1000):
