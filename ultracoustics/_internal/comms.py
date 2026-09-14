@@ -31,6 +31,7 @@ import serial
 import serial.tools.list_ports
 
 from . import stream_proc
+from . import telemetry as telemetry_wire
 from .protocol import BULK_OUT_EP, BULK_IN_EP, pack_command
 from ..config import VENDOR_ID, PRODUCT_ID, SAMPLE_RATE
 
@@ -292,6 +293,10 @@ class USBStream:
         self._counter_shm = shared_memory.SharedMemory(
             create=True, size=stream_proc._COUNTER_BYTES,
         )
+        self._telemetry_shm = shared_memory.SharedMemory(
+            create=True, size=telemetry_wire.SIDECAR_BYTES,
+        )
+        telemetry_wire.initialise_sidecar(self._telemetry_shm)
         self._buffer = np.ndarray(
             (self._capacity,), dtype=np.uint16, buffer=self._ring_shm.buf,
         )
@@ -313,6 +318,7 @@ class USBStream:
         self._running = False
         self.disconnected = False
         self.last_error: Optional[Exception] = None
+        self._selected_stream_format = 0
 
     # -- Public API -----------------------------------------------------------
 
@@ -343,6 +349,8 @@ class USBStream:
 
         # Reset counters before launch so stats are 0-based per session.
         self._counters_view[:] = 0
+        telemetry_wire.initialise_sidecar(self._telemetry_shm)
+        self._selected_stream_format = 0
         self.disconnected = False
         self.last_error = None
 
@@ -369,6 +377,7 @@ class USBStream:
                 command_ack_queue=self._command_ack_queue,
                 packet_diagnostics_path=self._packet_diagnostics_path,
                 packet_diagnostics_attach_s=self._packet_diagnostics_attach_s,
+                telemetry_shm_name=self._telemetry_shm.name,
             ),
             daemon=True,
             name='UltracousticsUSBReader',
@@ -411,7 +420,8 @@ class USBStream:
         Idempotent.  After ``close()`` the object is no longer usable.
         """
         self.stop()
-        for shm in (getattr(self, '_ring_shm', None), getattr(self, '_counter_shm', None)):
+        for shm in (getattr(self, '_ring_shm', None), getattr(self, '_counter_shm', None),
+                    getattr(self, '_telemetry_shm', None)):
             if shm is None:
                 continue
             try:
@@ -424,6 +434,7 @@ class USBStream:
                 pass
         self._ring_shm = None
         self._counter_shm = None
+        self._telemetry_shm = None
 
     def __del__(self):  # noqa: D401
         try:
@@ -481,7 +492,22 @@ class USBStream:
         """
         snap = stream_proc.read_counters(self._counter_shm)
         snap['drops_host'] = snap['drops_seq']  # legacy alias
+        _, telemetry_stats = telemetry_wire.read_sidecar(self._telemetry_shm)
+        snap['stream_format'] = telemetry_stats.get('active_format', 0)
+        snap['telemetry'] = telemetry_stats
         return snap
+
+    def get_telemetry(self):
+        """Return the latest coherent telemetry snapshot, or ``None``.
+
+        The sidecar is populated only after explicit format-1 negotiation.
+        ``host_stale`` on the returned immutable snapshot is evaluated when
+        read, independently of whether another malformed record is received.
+        """
+        if self._telemetry_shm is None:
+            return None
+        snapshot, _ = telemetry_wire.read_sidecar(self._telemetry_shm)
+        return snapshot
 
     # -- Outbound command path (subprocess owns the device) -------------------
 
@@ -538,6 +564,63 @@ class USBStream:
                     f"confirmed command transport failed ({transport['error']})"
                 )
             return result
+
+    def _request_stream_control(self, payload: bytes, response_kind: str,
+                                stream_format: Optional[int] = None,
+                                timeout_s: float = 1.0) -> dict:
+        """Send one request and wait for its validated firmware IN response."""
+        if not self._running or self._cmd_queue is None or self._command_ack_queue is None:
+            raise RuntimeError("USBStream is not running; cannot request stream control")
+        request_id = self._next_command_request_id
+        self._next_command_request_id += 1
+        enqueued_ns = time.monotonic_ns()
+        self._cmd_queue.put((request_id, payload, response_kind, stream_format))
+        deadline = time.monotonic() + timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("no validated firmware stream-control response")
+            try:
+                ack_id, transport, completed_ns = self._command_ack_queue.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise TimeoutError("no validated firmware stream-control response") from exc
+            if ack_id != request_id:
+                continue
+            if transport["transport_status"] == "uncertain":
+                raise TransportUncertainError(
+                    f"stream-control transport uncertain ({transport['error']}); "
+                    "firmware application is unknown",
+                    halt_cleared=transport.get("halt_cleared", False),
+                )
+            if transport["transport_status"] != "delivered":
+                raise RuntimeError(f"stream-control request failed ({transport['error']})")
+            return {
+                "enqueued_monotonic_ns": enqueued_ns,
+                "firmware_response_monotonic_ns": completed_ns,
+                "host_round_trip_bound_ns": completed_ns - enqueued_ns,
+                **transport,
+            }
+
+    def query_stream_capabilities(self, payload: bytes, timeout_s: float = 1.0):
+        result = self._request_stream_control(payload, "capabilities", timeout_s=timeout_s)
+        return result["firmware_response"]
+
+    def select_stream_format_confirmed(self, payload: bytes, stream_format: int,
+                                       timeout_s: float = 1.0) -> dict:
+        """Deliver a negotiated format command and atomically switch parsing.
+
+        The subprocess changes its expected record length only after receiving
+        and validating the firmware's dedicated ``UTFM`` acknowledgement.
+        The result proves format acceptance, not that any later telemetry
+        record or board measurement is valid.
+        """
+        if stream_format not in (0, 1):
+            raise ValueError("stream format must be 0 or 1")
+        result = self._request_stream_control(
+            payload, "format", stream_format=stream_format, timeout_s=timeout_s,
+        )
+        self._selected_stream_format = stream_format
+        return result
 
     # -- Internal -------------------------------------------------------------
 

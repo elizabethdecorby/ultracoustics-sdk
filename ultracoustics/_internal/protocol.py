@@ -24,6 +24,8 @@ CMD_BOOT_VERSION = ord('V')      # Query 1550nm bootloader firmware version
 CMD_BOOT_VERSION_638 = ord('v')  # Query 638nm bootloader firmware version
 CMD_FWINFO = ord('i')       # Query master board firmware version
 CMD_PROBE_CHAR = ord('Z')   # Probe characterization: stamp SPI command_id (1=start, 0=stop)
+CMD_STREAM_CAPABILITIES = ord('c')  # IDLE-only negotiated stream capability query
+CMD_STREAM_FORMAT = ord('x')        # IDLE-only exact stream format selection (0/1)
 
 # Target IDs for Manual Control
 TARGET_1550 = 1550

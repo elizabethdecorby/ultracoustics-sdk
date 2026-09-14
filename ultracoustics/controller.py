@@ -47,6 +47,7 @@ from ._internal.comms import USBBulkConnection, USBStream
 from ._internal.protocol import (
     CMD_BOOT, CMD_IDLE, CMD_WARM,
     CMD_OVERRIDE_ENTER, CMD_POWER, CMD_TRIGGER, CMD_PROBE_CHAR,
+    CMD_STREAM_CAPABILITIES, CMD_STREAM_FORMAT,
     TARGET_1550, TARGET_638,
 )
 from ._internal.maintenance import LaserSerialController
@@ -232,6 +233,71 @@ class Controller:
         if self._stream is None:
             return None
         return self._stream.get_stream_stats()
+
+    @property
+    def telemetry(self):
+        """Latest immutable diagnostic snapshot, or ``None``.
+
+        Telemetry is kept out of the ADC sample ring and remains unavailable
+        until a supported stream format has been explicitly negotiated.
+        ``host_stale`` indicates that no valid format-1 record has refreshed
+        the sidecar for 500 ms.
+        """
+        if self._stream is None:
+            return None
+        return self._stream.get_telemetry()
+
+    def telemetry_capabilities(self, timeout_s: float = 1.0):
+        """Query the IDLE master's negotiated stream capabilities.
+
+        This does not select a new format. The laser system must be stopped,
+        and the stream reader must already be running so it can receive the
+        dedicated capability response on Bulk IN.
+        """
+        if self._running:
+            raise RuntimeError("stream negotiation is IDLE-only; call stop() first")
+        if self._stream is None or not self._stream.running:
+            raise RuntimeError("call begin_stream() before querying capabilities")
+        from ._internal.protocol import pack_command
+        return self._stream.query_stream_capabilities(
+            pack_command(CMD_STREAM_CAPABILITIES, 0, 0), timeout_s=timeout_s,
+        )
+
+    def enable_telemetry(self, timeout_s: float = 1.0):
+        """Explicitly negotiate stream format 1 and return its first snapshot.
+
+        Legacy framing remains the default. A successful OUT transfer alone
+        is insufficient: this method requires a validated capability response,
+        a matching format acknowledgement, and a valid format-1 data record.
+        It never interprets command delivery as a board setpoint or actuator
+        acknowledgement.
+        """
+        capabilities = self.telemetry_capabilities(timeout_s=timeout_s)
+        if not capabilities.supports_format1:
+            raise RuntimeError("connected master does not advertise stream format 1")
+        from ._internal.protocol import pack_command
+        result = self._stream.select_stream_format_confirmed(
+            pack_command(CMD_STREAM_FORMAT, 1, 0), 1, timeout_s=timeout_s,
+        )
+        expected_epoch = result["firmware_response"]["stream_epoch"]
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            snapshot = self.telemetry
+            if snapshot is not None and snapshot.stream_epoch == expected_epoch:
+                return snapshot
+            time.sleep(0.005)
+        raise RuntimeError("format 1 was accepted but no matching valid telemetry record arrived")
+
+    def disable_telemetry(self, timeout_s: float = 1.0) -> None:
+        """Explicitly return an IDLE streaming session to legacy framing."""
+        if self._running:
+            raise RuntimeError("stream negotiation is IDLE-only; call stop() first")
+        if self._stream is None or not self._stream.running:
+            raise RuntimeError("call begin_stream() before selecting legacy format")
+        from ._internal.protocol import pack_command
+        self._stream.select_stream_format_confirmed(
+            pack_command(CMD_STREAM_FORMAT, 0, 0), 0, timeout_s=timeout_s,
+        )
 
     # -- State management -----------------------------------------------------
 

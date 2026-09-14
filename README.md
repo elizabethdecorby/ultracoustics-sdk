@@ -149,6 +149,17 @@ ctrl = Controller(verbose=True)
 | `streaming` | `bool` | `True` between `begin_stream()` and `end_stream()`. |
 | `connected` | `bool` | `True` if the USB connection is open. |
 
+**Negotiated telemetry**
+
+Legacy 16,392-byte ADC records remain the default. While the system is IDLE
+and the reader is active, `ctrl.enable_telemetry()` verifies capabilities,
+selects format 1, validates the firmware acknowledgement and returns the first
+52-byte-per-board diagnostic snapshot. `ctrl.telemetry` then returns the latest
+immutable snapshot without changing the 8,192-sample `uint16` ring. Use
+`ctrl.disable_telemetry()` to return explicitly to legacy framing. Transport
+delivery and telemetry validity do not acknowledge actuator or setpoint
+application.
+
 ---
 
 ### `load_binary(path, dtype=np.uint16) → np.ndarray`
@@ -300,4 +311,3 @@ If automatic Windows driver setup fails:
 3. In Zadig, open Options -> List All Devices.
 4. Select BROADSONIC (VID:PID 2E9D:000A).
 5. Select WinUSB and click Replace Driver.
-

@@ -64,6 +64,11 @@ from typing import Optional
 
 import numpy as np
 
+from .telemetry import (
+    TelemetryFormatError, TelemetrySidecarWriter, parse_capabilities,
+    parse_format_ack, parse_record,
+)
+
 
 # ---------------------------------------------------------------------------
 # Shared memory layout
@@ -315,6 +320,7 @@ def reader_main(
     command_ack_queue=None,
     packet_diagnostics_path: Optional[str] = None,
     packet_diagnostics_attach_s: float = 2.0,
+    telemetry_shm_name: Optional[str] = None,
 ) -> None:
     """Subprocess entry point.
 
@@ -331,6 +337,8 @@ def reader_main(
     # Attach to shared memory created by the parent.
     ring_shm = SharedMemory(name=ring_shm_name)
     counter_shm = SharedMemory(name=counter_shm_name)
+    telemetry_shm = SharedMemory(name=telemetry_shm_name) if telemetry_shm_name else None
+    telemetry_writer = TelemetrySidecarWriter(telemetry_shm) if telemetry_shm else None
     ring = np.ndarray((ring_capacity,), dtype=np.uint16, buffer=ring_shm.buf)
     counters = _counter_view(counter_shm)
 
@@ -340,6 +348,8 @@ def reader_main(
     head = 0
     total = 0
     last_seq: Optional[int] = None
+    stream_format = 0
+    pending_control = None
     diagnostics = PacketHeaderDiagnostics(
         packet_diagnostics_path, attach_duration_s=packet_diagnostics_attach_s,
     )
@@ -369,13 +379,28 @@ def reader_main(
         handle.claimInterface(0)
 
         def _send_outbound(item, timeout_ms: int) -> None:
+            nonlocal pending_control
             request_id = None
             payload = item
             if isinstance(item, tuple):
-                request_id, payload = item
+                if len(item) == 2:
+                    request_id, payload = item
+                elif len(item) == 4:
+                    request_id, payload, response_kind, requested_format = item
+                else:
+                    raise ValueError("invalid outbound queue item")
             result = _write_outbound_once(handle, payload, timeout_ms)
             if result["transport_status"] != "delivered":
                 counters[4] += 1
+            if (request_id is not None and result["transport_status"] == "delivered"
+                    and isinstance(item, tuple) and len(item) == 4):
+                if pending_control is not None:
+                    result = {**result, "transport_status": "failed",
+                              "error": "another control response is pending"}
+                else:
+                    pending_control = (request_id, response_kind, requested_format,
+                                       result, time.monotonic() + 0.75)
+                    return
             if request_id is not None and command_ack_queue is not None:
                 command_ack_queue.put(
                     (request_id, result, time.monotonic_ns())
@@ -386,22 +411,63 @@ def reader_main(
         # (here, the main subprocess thread inside handleEvents()).
         # ------------------------------------------------------------------
         def _on_complete(transfer):
-            nonlocal head, total, last_seq
+            nonlocal head, total, last_seq, stream_format, pending_control
 
             status = transfer.getStatus()
 
             if status == usb1.TRANSFER_COMPLETED:
                 length = transfer.getActualLength()
-                if length < PSSI_PACKET_WIRE_BYTES or (length - PSSI_HEADER_BYTES) % 2:
+                raw = transfer.getBuffer()[:length]
+                if pending_control is not None and length in (16, 24):
+                    request_id, response_kind, requested_format, delivery, _deadline = pending_control
+                    try:
+                        if response_kind == "capabilities":
+                            response = parse_capabilities(bytes(raw))
+                        elif response_kind == "format":
+                            epoch = parse_format_ack(bytes(raw), requested_format)
+                            response = {"accepted_format": requested_format,
+                                        "stream_epoch": epoch}
+                            stream_format = requested_format
+                            last_seq = None
+                            if telemetry_writer is not None:
+                                if requested_format == 0:
+                                    telemetry_writer.reset_to_legacy()
+                                else:
+                                    telemetry_writer.select_format(requested_format)
+                        else:
+                            raise TelemetryFormatError("unknown pending control response")
+                    except TelemetryFormatError as exc:
+                        delivery = {**delivery, "transport_status": "failed",
+                                    "error": str(exc)}
+                    else:
+                        delivery = {**delivery, "firmware_response": response}
+                    if command_ack_queue is not None:
+                        command_ack_queue.put((request_id, delivery, time.monotonic_ns()))
+                    pending_control = None
+                    if not terminate_event.is_set():
+                        transfer.submit()
+                    return
+                # A device reset returns the stream to exact legacy framing.
+                # Treat that unambiguous length transition as a new legacy
+                # epoch and invalidate the telemetry sidecar immediately.
+                if stream_format == 1 and length == PSSI_PACKET_WIRE_BYTES:
+                    stream_format = 0
+                    last_seq = None
+                    if telemetry_writer is not None:
+                        telemetry_writer.reset_to_legacy()
+                try:
+                    parsed = parse_record(raw, stream_format,
+                                          received_monotonic_ns=time.monotonic_ns())
+                except TelemetryFormatError:
                     counters[6] += 1  # malformed
+                    if telemetry_writer is not None and stream_format == 1:
+                        telemetry_writer.record_error()
                     diagnostics.record(
                         receive_monotonic_ns=time.monotonic_ns(), length=length,
                         seq=None, drops_fw=None, classification="missing_or_truncated_frame",
                     )
                 else:
-                    raw = transfer.getBuffer()[:length]
-                    # 8-byte header: <I sequence, <I drops_fw
-                    seq, drops_fw = struct.unpack_from('<II', raw, 0)
+                    seq, drops_fw = parsed.sequence, parsed.drops_fw
 
                     classification, missing_packets, starts_new_epoch = (
                         classify_sequence_transition(last_seq, seq)
@@ -427,10 +493,7 @@ def reader_main(
 
                     # Convert payload to uint16 sample view (zero-copy slice
                     # of the libusb-owned buffer).
-                    samples = np.frombuffer(
-                        raw, dtype=np.uint16, offset=PSSI_HEADER_BYTES,
-                        count=(length - PSSI_HEADER_BYTES) // 2,
-                    )
+                    samples = parsed.samples
                     n = samples.shape[0]
 
                     if head + n <= ring_capacity:
@@ -448,6 +511,8 @@ def reader_main(
                     counters[0] = head
                     counters[1] = total
                     counters[2] += 1  # packets
+                    if parsed.telemetry is not None and telemetry_writer is not None:
+                        telemetry_writer.publish(parsed.telemetry)
 
             elif status == usb1.TRANSFER_TIMED_OUT:
                 counters[5] += 1
@@ -488,6 +553,13 @@ def reader_main(
 
         # Event loop: pump libusb events and drain the outbound command queue.
         while not terminate_event.is_set():
+            if pending_control is not None and time.monotonic() > pending_control[4]:
+                request_id, _kind, _format, delivery, _deadline = pending_control
+                if command_ack_queue is not None:
+                    command_ack_queue.put((request_id, {**delivery,
+                        "transport_status": "failed",
+                        "error": "firmware control response timed out"}, time.monotonic_ns()))
+                pending_control = None
             # Handle at most one command per event-loop turn so OUT traffic
             # cannot starve IN completion processing. Accepted diagnostic
             # commands normally complete immediately; 100 ms is the hard host
@@ -560,6 +632,8 @@ def reader_main(
                 handle.close()
             except Exception:  # noqa: BLE001
                 pass
+        if telemetry_shm is not None:
+            telemetry_shm.close()
         if ctx is not None:
             try:
                 ctx.close()
