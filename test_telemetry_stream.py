@@ -1,12 +1,18 @@
 import struct
+import queue
+import sys
+import threading
 import time
 import unittest
 import zlib
 from multiprocessing.shared_memory import SharedMemory
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
 from ultracoustics.controller import Controller
+from ultracoustics._internal import stream_proc
 from ultracoustics._internal.protocol import pack_command, CMD_STREAM_CAPABILITIES, CMD_STREAM_FORMAT
 from ultracoustics._internal.telemetry import (
     BoardTelemetry, FORMAT1_RECORD_BYTES, LEGACY_RECORD_BYTES,
@@ -191,6 +197,124 @@ class ControllerTelemetryTests(unittest.TestCase):
         self.assertEqual(controller._stream.calls[-1][1],
                          pack_command(CMD_STREAM_FORMAT, 0, 0))
         self.assertEqual(controller._stream.calls[-1][2], 0)
+
+
+class ReentrantControlResponseTests(unittest.TestCase):
+    def test_capability_and_ack_arriving_inside_bulk_write_are_recognized(self):
+        class FakeUSBError(Exception):
+            pass
+
+        fake_usb = SimpleNamespace(
+            TRANSFER_COMPLETED=0, TRANSFER_TIMED_OUT=1,
+            TRANSFER_NO_DEVICE=2, TRANSFER_CANCELLED=3,
+            USBError=FakeUSBError, USBErrorPipe=type("USBErrorPipe", (FakeUSBError,), {}),
+        )
+
+        class Transfer:
+            def setBulk(self, _endpoint, _size, callback, timeout):
+                self.callback = callback
+                self.timeout = timeout
+
+            def submit(self):
+                pass
+
+            def cancel(self):
+                pass
+
+            def getStatus(self):
+                return fake_usb.TRANSFER_COMPLETED
+
+            def getActualLength(self):
+                return len(self.buffer)
+
+            def getBuffer(self):
+                return self.buffer
+
+        class Handle:
+            def __init__(self):
+                self.transfers = []
+
+            def kernelDriverActive(self, _interface):
+                return False
+
+            def claimInterface(self, _interface):
+                pass
+
+            def releaseInterface(self, _interface):
+                pass
+
+            def close(self):
+                pass
+
+            def getTransfer(self):
+                transfer = Transfer()
+                self.transfers.append(transfer)
+                return transfer
+
+            def bulkWrite(self, _endpoint, payload, timeout):
+                self.timeout = timeout
+                if payload[0] == ord("c"):
+                    response = struct.pack("<4sHHIHHHBBI", b"UTCP", 1, 24, 1,
+                                           16392, 16532, 503, 0, 0, 9)
+                else:
+                    response = struct.pack("<4sHHB3sI", b"UTFM", 1, 16, 1,
+                                           b"\0\0\0", 10)
+                # This is the regression: synchronous libusb I/O may pump a
+                # previously submitted async IN callback before returning.
+                transfer = self.transfers[0]
+                transfer.buffer = response
+                transfer.callback(transfer)
+                if payload[0] == ord("x"):
+                    raise FakeUSBError("late OUT exception after valid UTFM")
+                return len(payload)
+
+        handle = Handle()
+
+        class Context:
+            def open(self):
+                pass
+
+            def openByVendorIDAndProductID(self, *_args, **_kwargs):
+                return handle
+
+            def handleEventsTimeout(self, _timeout):
+                pass
+
+            def close(self):
+                pass
+
+        fake_usb.USBContext = Context
+        ring = SharedMemory(create=True, size=64)
+        counters = SharedMemory(create=True, size=stream_proc._COUNTER_BYTES)
+        sidecar = SharedMemory(create=True, size=SIDECAR_BYTES)
+        ring.buf[:] = b"\0" * len(ring.buf)
+        counters.buf[:] = b"\0" * len(counters.buf)
+        initialise_sidecar(sidecar)
+        commands = queue.Queue()
+        acknowledgements = queue.Queue()
+        commands.put((1, pack_command(CMD_STREAM_CAPABILITIES), "capabilities", None))
+        commands.put((2, pack_command(CMD_STREAM_FORMAT, 1), "format", 1))
+        commands.put(None)
+        try:
+            with mock.patch.dict(sys.modules, {"usb1": fake_usb}):
+                stream_proc.reader_main(
+                    0x2E9D, 0x000A, ring.name, counters.name, 32, commands,
+                    threading.Event(), threading.Event(), acknowledgements,
+                    telemetry_shm_name=sidecar.name,
+                )
+            first = acknowledgements.get_nowait()
+            second = acknowledgements.get_nowait()
+            self.assertEqual(first[1]["firmware_response"].stream_epoch, 9)
+            self.assertEqual(second[1]["firmware_response"],
+                             {"accepted_format": 1, "stream_epoch": 10})
+            self.assertEqual(read_sidecar(sidecar)[1]["active_format"], 1)
+            counter_values = stream_proc.read_counters(counters)
+            self.assertEqual(counter_values["transfer_errors"], 0)
+            self.assertTrue(acknowledgements.empty())
+        finally:
+            for shm in (ring, counters, sidecar):
+                shm.close()
+                shm.unlink()
 
 
 if __name__ == "__main__":

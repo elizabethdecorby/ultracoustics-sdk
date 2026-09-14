@@ -382,25 +382,54 @@ def reader_main(
             nonlocal pending_control
             request_id = None
             payload = item
+            is_control = False
             if isinstance(item, tuple):
                 if len(item) == 2:
                     request_id, payload = item
                 elif len(item) == 4:
                     request_id, payload, response_kind, requested_format = item
+                    is_control = True
                 else:
                     raise ValueError("invalid outbound queue item")
+
+            # libusb synchronous bulkWrite may dispatch already-submitted
+            # asynchronous IN callbacks while waiting for OUT completion. Arm
+            # response recognition first so a fast UTCP/UTFM cannot be
+            # consumed as a malformed ADC record before pending_control exists.
+            if is_control:
+                if pending_control is not None:
+                    if command_ack_queue is not None:
+                        command_ack_queue.put((request_id, {
+                            "transport_status": "failed",
+                            "transferred_bytes": None,
+                            "halt_cleared": False,
+                            "error": "another control response is pending",
+                        }, time.monotonic_ns()))
+                    return
+                pending_control = (
+                    request_id, response_kind, requested_format,
+                    {"transport_status": "delivered",
+                     "transferred_bytes": len(payload),
+                     "halt_cleared": False, "error": None},
+                    time.monotonic() + 0.75,
+                )
             result = _write_outbound_once(handle, payload, timeout_ms)
+            if is_control and pending_control is None:
+                # A validated firmware response arrived reentrantly during
+                # bulkWrite. It is stronger evidence than a late synchronous
+                # OUT exception, so do not downgrade it or count a false
+                # transport error.
+                return
             if result["transport_status"] != "delivered":
                 counters[4] += 1
-            if (request_id is not None and result["transport_status"] == "delivered"
-                    and isinstance(item, tuple) and len(item) == 4):
-                if pending_control is not None:
-                    result = {**result, "transport_status": "failed",
-                              "error": "another control response is pending"}
-                else:
-                    pending_control = (request_id, response_kind, requested_format,
-                                       result, time.monotonic() + 0.75)
+            if is_control:
+                if result["transport_status"] == "delivered":
+                    pending_control = (
+                        request_id, response_kind, requested_format, result,
+                        pending_control[4],
+                    )
                     return
+                pending_control = None
             if request_id is not None and command_ack_queue is not None:
                 command_ack_queue.put(
                     (request_id, result, time.monotonic_ns())
