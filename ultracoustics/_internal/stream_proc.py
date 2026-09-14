@@ -351,14 +351,17 @@ def reader_main(
             try:
                 handle.bulkWrite(BULK_OUT_EP, payload, timeout=timeout_ms)
             except usb1.USBError as exc:
-                ok = False
-                error = repr(exc)
                 counters[4] += 1
                 if isinstance(exc, usb1.USBErrorPipe):
                     try:
                         handle.clearHalt(BULK_OUT_EP)
+                        handle.bulkWrite(BULK_OUT_EP, payload, timeout=timeout_ms)
                     except usb1.USBError as clear_exc:
-                        error += f"; clearHalt failed: {clear_exc!r}"
+                        ok = False
+                        error = f"{exc!r}; recovery failed: {clear_exc!r}"
+                else:
+                    ok = False
+                    error = repr(exc)
             if request_id is not None and command_ack_queue is not None:
                 command_ack_queue.put(
                     (request_id, ok, error, time.monotonic_ns())

@@ -164,10 +164,21 @@ class USBBulkConnection:
                     self.dev.clear_halt(BULK_OUT_EP)
                 except Exception as exc:  # preserve original rejection context
                     clear_error = exc
-                detail = "endpoint halt cleared" if clear_error is None else f"halt clear failed: {clear_error}"
-                raise CommandRejectedError(
-                    f"command rejected by device ({detail}); not retried"
-                ) from e
+                if clear_error is not None:
+                    raise CommandRejectedError(
+                        f"deferred command rejection; halt clear failed: {clear_error}"
+                    ) from e
+                # Firmware can only stall after its receive callback runs, so
+                # the halt reports rejection of the preceding command. This
+                # transfer moved zero bytes and is safe to submit once after
+                # CLEAR_FEATURE; the rejected prior command is never replayed.
+                try:
+                    self.dev.write(BULK_OUT_EP, payload, timeout=timeout_ms)
+                    return
+                except usb.core.USBError as retry_error:
+                    raise CommandRejectedError(
+                        f"OUT remained halted after deferred-rejection recovery: {retry_error}"
+                    ) from retry_error
             raise RuntimeError(f"Failed to send: {e}")
 
     def receive(self, length, timeout_ms=1000):
