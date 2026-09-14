@@ -223,6 +223,8 @@ class USBStream:
         pid: int = PRODUCT_ID,
         ring_capacity_samples: Optional[int] = None,
         verbose: bool = False,
+        packet_diagnostics_path: Optional[str] = None,
+        packet_diagnostics_attach_s: float = 2.0,
     ):
         # Default capacity matches the previous Controller default of ~1.2 s
         # at 10 MSPS, exposed here so callers can size the shared ring.
@@ -233,6 +235,8 @@ class USBStream:
         self._pid = pid
         self._capacity = int(ring_capacity_samples)
         self.verbose = verbose
+        self._packet_diagnostics_path = packet_diagnostics_path
+        self._packet_diagnostics_attach_s = packet_diagnostics_attach_s
 
         # Allocate shared memory for the ring buffer (uint16) and counters.
         # The shared-memory blocks live for the lifetime of this object;
@@ -315,6 +319,8 @@ class USBStream:
                 cmd_queue=self._cmd_queue,
                 terminate_event=self._terminate_event,
                 ready_event=self._ready_event,
+                packet_diagnostics_path=self._packet_diagnostics_path,
+                packet_diagnostics_attach_s=self._packet_diagnostics_attach_s,
             ),
             daemon=True,
             name='UltracousticsUSBReader',
@@ -412,10 +418,9 @@ class USBStream:
                                   overflow OR host/kernel/USB-stack loss).
         - ``drops_fw``          : firmware-reported ring-full drop counter,
                                   delivered in-band in each packet's header.
-                                  Increments only when the firmware itself
-                                  dropped a packet. Compute
-                                  ``drops_seq - drops_fw`` to isolate
-                                  host/kernel-side loss.
+                                  This separately sampled lifetime counter must
+                                  not be subtracted from ``drops_seq`` to claim
+                                  host-only loss.
         - ``transfer_errors``   : libusb non-OK transfer completions.
         - ``transfer_timeouts`` : libusb timeout completions.
         - ``malformed``         : packets with invalid byte counts.

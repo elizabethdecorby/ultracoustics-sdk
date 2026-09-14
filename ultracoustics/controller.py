@@ -93,7 +93,9 @@ class Controller:
         x86-64.
     """
 
-    def __init__(self, verbose=False, ring_seconds: float = 1.2):
+    def __init__(self, verbose=False, ring_seconds: float = 1.2,
+                 packet_diagnostics_path: Optional[str] = None,
+                 packet_diagnostics_attach_s: float = 2.0):
         """Initialise the controller (no hardware interaction yet).
 
         Parameters
@@ -109,6 +111,12 @@ class Controller:
             in one piece (e.g. an ~8 s probe-characterization ramp);
             remember each second is ``SAMPLE_RATE`` uint16 samples
             (~20 MB/s at 10 MSPS).
+        packet_diagnostics_path : str or None, optional
+            Default-off bounded packet-header diagnostic output. When set, the
+            reader writes attach records and later anomalies as JSONL at stop.
+            Raw uint16 sample APIs and the wire format are unchanged.
+        packet_diagnostics_attach_s : float, optional
+            Initial reader interval to retain header records for diagnostics.
 
         Attributes
         ----------
@@ -132,6 +140,8 @@ class Controller:
         self._running = False
         self._streaming = False
         self._connected = False
+        self._packet_diagnostics_path = packet_diagnostics_path
+        self._packet_diagnostics_attach_s = packet_diagnostics_attach_s
 
         # Ring capacity in samples, sized from ring_seconds. Lives in shared
         # memory once the stream subprocess is spawned (allocated by USBStream)
@@ -159,6 +169,8 @@ class Controller:
         self._stream = USBStream(
             ring_capacity_samples=self._buf_len,
             verbose=self.verbose,
+            packet_diagnostics_path=self._packet_diagnostics_path,
+            packet_diagnostics_attach_s=self._packet_diagnostics_attach_s,
         )
         self._connected = True
 

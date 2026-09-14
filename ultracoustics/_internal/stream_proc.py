@@ -32,11 +32,11 @@ distinct failure modes.  This module separates them:
 - ``drops_seq``    : packets missing per the firmware sequence header.
                     End-to-end loss indicator — could be firmware ring
                     overflow OR host/kernel/USB-stack loss.
-- ``drops_fw``     : highest value of the firmware-side ``usb_dropped_buffers``
-                    counter ever observed in a delivered packet's header.
-                    Increments only when the firmware itself dropped a packet
-                    because its 4-deep pending ring was full.  Subtract from
-                    ``drops_seq`` to obtain host-attributable loss.
+- ``drops_fw``     : latest value of the firmware-side ``usb_dropped_buffers``
+                    counter observed in a delivered packet's header. Increments
+                    when the firmware pending ring rejects a packet. It is a
+                    separate, asynchronously sampled counter; do not subtract it
+                    from ``drops_seq`` to invent host-only loss.
 - ``transfer_errors``   : libusb reported ``TRANSFER_ERROR`` / ``STALL`` /
                           ``OVERFLOW`` / ``NO_DEVICE`` on a completed transfer.
 - ``transfer_timeouts`` : libusb reported ``TRANSFER_TIMED_OUT``.  Normal in
@@ -50,6 +50,7 @@ intermediate queue between USB and the ring buffer.
 """
 
 import ctypes
+import json
 import os
 import platform
 import struct
@@ -142,6 +143,106 @@ BULK_OUT_EP = 0x01
 
 # How aggressively to drain the command queue inside the event loop.
 COMMAND_POLL_INTERVAL_S = 0.005
+_SMALL_FORWARD_GAP_MAX = 1000
+
+
+def classify_sequence_transition(last_seq: Optional[int], seq: int) -> tuple[str, int, bool]:
+    """Classify one uint32 sequence transition.
+
+    Returns ``(classification, missing_packets, starts_new_epoch)``. A backward
+    transition starts a new attach/reset epoch and is never converted into an
+    enormous loss count. Forward gaps, including gaps larger than the old 1000
+    sanity threshold, retain their explicit missing-packet count.
+    """
+    seq &= 0xFFFFFFFF
+    if last_seq is None:
+        return "first", 0, False
+    last_seq &= 0xFFFFFFFF
+    if seq == last_seq:
+        return "duplicate", 0, False
+    if seq > last_seq:
+        missing = seq - last_seq - 1
+        if missing == 0:
+            return "next", 0, False
+        kind = "small_forward_gap" if missing <= _SMALL_FORWARD_GAP_MAX else "large_forward_gap"
+        return kind, missing, False
+    if last_seq >= 0xFFFF0000 and seq <= 0x0000FFFF:
+        delta = (seq - last_seq) & 0xFFFFFFFF
+        if delta == 1:
+            return "wrap", 0, False
+        return "wrap_gap", delta - 1, False
+    return "backwards_new_epoch", 0, True
+
+
+class PacketHeaderDiagnostics:
+    """Bounded, default-off recorder for attach headers and later anomalies."""
+
+    def __init__(self, output_path: Optional[str], *, attach_duration_s: float = 2.0,
+                 max_attach_records: int = 3000, max_anomaly_records: int = 512):
+        self.output_path = output_path
+        self.attach_duration_ns = int(attach_duration_s * 1_000_000_000)
+        self.max_attach_records = max_attach_records
+        self.max_anomaly_records = max_anomaly_records
+        self.started_ns: Optional[int] = None
+        self.attach_records: list[dict] = []
+        self.anomaly_records: list[dict] = []
+        self.omitted_attach = 0
+        self.omitted_anomalies = 0
+        self.epoch = 0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.output_path)
+
+    def record(self, *, receive_monotonic_ns: int, length: int,
+               seq: Optional[int], drops_fw: Optional[int],
+               classification: str, missing_packets: int = 0,
+               starts_new_epoch: bool = False) -> None:
+        if not self.enabled:
+            return
+        if self.started_ns is None:
+            self.started_ns = receive_monotonic_ns
+        if starts_new_epoch:
+            self.epoch += 1
+        row = {
+            "receive_monotonic_ns": receive_monotonic_ns,
+            "since_reader_first_receive_ns": receive_monotonic_ns - self.started_ns,
+            "length_bytes": length,
+            "sequence": seq,
+            "drops_fw": drops_fw,
+            "classification": classification,
+            "missing_packets": missing_packets,
+            "epoch": self.epoch,
+        }
+        in_attach = row["since_reader_first_receive_ns"] <= self.attach_duration_ns
+        if in_attach:
+            if len(self.attach_records) < self.max_attach_records:
+                self.attach_records.append(row)
+            else:
+                self.omitted_attach += 1
+        elif classification != "next":
+            if len(self.anomaly_records) < self.max_anomaly_records:
+                self.anomaly_records.append(row)
+            else:
+                self.omitted_anomalies += 1
+
+    def write(self) -> None:
+        if not self.enabled:
+            return
+        header = {
+            "type": "packet_header_diagnostics",
+            "schema_version": 1,
+            "attach_duration_s": self.attach_duration_ns / 1_000_000_000,
+            "max_attach_records": self.max_attach_records,
+            "max_anomaly_records": self.max_anomaly_records,
+            "omitted_attach_records": self.omitted_attach,
+            "omitted_anomaly_records": self.omitted_anomalies,
+            "epoch_count": self.epoch + 1,
+        }
+        with open(self.output_path, "w", encoding="utf-8") as output:
+            output.write(json.dumps(header, sort_keys=True) + "\n")
+            for row in self.attach_records + self.anomaly_records:
+                output.write(json.dumps(row, sort_keys=True) + "\n")
 
 
 def _prepare_libusb_dll() -> None:
@@ -183,6 +284,8 @@ def reader_main(
     cmd_queue: Queue,
     terminate_event,
     ready_event,
+    packet_diagnostics_path: Optional[str] = None,
+    packet_diagnostics_attach_s: float = 2.0,
 ) -> None:
     """Subprocess entry point.
 
@@ -208,10 +311,9 @@ def reader_main(
     head = 0
     total = 0
     last_seq: Optional[int] = None
-
-    # Sequence-gap sanity bound: gaps larger than this are treated as
-    # device reset / wraparound noise rather than real loss.
-    _MAX_SANE_GAP = 1000
+    diagnostics = PacketHeaderDiagnostics(
+        packet_diagnostics_path, attach_duration_s=packet_diagnostics_attach_s,
+    )
 
     def _set_flag(bit: int) -> None:
         counters[7] = int(counters[7]) | bit
@@ -250,15 +352,26 @@ def reader_main(
                 length = transfer.getActualLength()
                 if length < PSSI_PACKET_WIRE_BYTES or (length - PSSI_HEADER_BYTES) % 2:
                     counters[6] += 1  # malformed
+                    diagnostics.record(
+                        receive_monotonic_ns=time.monotonic_ns(), length=length,
+                        seq=None, drops_fw=None, classification="missing_or_truncated_frame",
+                    )
                 else:
                     raw = transfer.getBuffer()[:length]
                     # 8-byte header: <I sequence, <I drops_fw
                     seq, drops_fw = struct.unpack_from('<II', raw, 0)
 
-                    if last_seq is not None:
-                        delta = (seq - last_seq) & 0xFFFFFFFF
-                        if 1 < delta <= _MAX_SANE_GAP:
-                            counters[3] += (delta - 1)  # drops_seq
+                    classification, missing_packets, starts_new_epoch = (
+                        classify_sequence_transition(last_seq, seq)
+                    )
+                    if missing_packets:
+                        counters[3] += missing_packets
+                    diagnostics.record(
+                        receive_monotonic_ns=time.monotonic_ns(), length=length,
+                        seq=seq, drops_fw=drops_fw, classification=classification,
+                        missing_packets=missing_packets,
+                        starts_new_epoch=starts_new_epoch,
+                    )
                     last_seq = seq
 
                     # drops_fw is a snapshot of the firmware-side cumulative
@@ -363,6 +476,10 @@ def reader_main(
         if not ready_event.is_set():
             ready_event.set()
     finally:
+        try:
+            diagnostics.write()
+        except Exception:  # diagnostics must never break reader cleanup
+            pass
         # Final drain of the outbound command queue — ensures late-enqueued
         # commands (e.g. IDLE sent immediately before terminate_event) reach
         # the device before we tear down the handle. Without this, ctrl.stop()
