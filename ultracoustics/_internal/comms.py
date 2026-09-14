@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import multiprocessing as mp
+import queue
 from multiprocessing import Process, Queue, shared_memory
 from typing import Optional
 
@@ -275,6 +276,8 @@ class USBStream:
 
         # Inter-process control primitives.
         self._cmd_queue: Optional[Queue] = None
+        self._command_ack_queue: Optional[Queue] = None
+        self._next_command_request_id = 1
         self._terminate_event = None
         self._ready_event = None
         self._proc: Optional[Process] = None
@@ -320,6 +323,7 @@ class USBStream:
         # where 'fork' would copy them).
         ctx = mp.get_context('spawn')
         self._cmd_queue = ctx.Queue()
+        self._command_ack_queue = ctx.Queue()
         self._terminate_event = ctx.Event()
         self._ready_event = ctx.Event()
 
@@ -334,6 +338,7 @@ class USBStream:
                 cmd_queue=self._cmd_queue,
                 terminate_event=self._terminate_event,
                 ready_event=self._ready_event,
+                command_ack_queue=self._command_ack_queue,
                 packet_diagnostics_path=self._packet_diagnostics_path,
                 packet_diagnostics_attach_s=self._packet_diagnostics_attach_s,
             ),
@@ -462,6 +467,43 @@ class USBStream:
             raise RuntimeError("USBStream is not running; cannot send command")
         self._cmd_queue.put(payload)
 
+    def send_command_confirmed(self, payload: bytes, timeout_s: float = 0.5) -> dict:
+        """Send once and wait for the reader's bounded bulkWrite completion.
+
+        This confirms host-side OUT delivery only; it does not claim exact
+        firmware execution time. A rejected command is reported after clearing
+        the endpoint halt and is never retried.
+        """
+        if not self._running or self._cmd_queue is None or self._command_ack_queue is None:
+            raise RuntimeError("USBStream is not running; cannot send command")
+        request_id = self._next_command_request_id
+        self._next_command_request_id += 1
+        enqueued_ns = time.monotonic_ns()
+        self._cmd_queue.put((request_id, payload))
+        deadline = time.monotonic() + timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("no bounded OUT completion from reader")
+            try:
+                ack_id, ok, error, completed_ns = self._command_ack_queue.get(
+                    timeout=remaining
+                )
+            except queue.Empty as exc:
+                raise TimeoutError("no bounded OUT completion from reader") from exc
+            if ack_id != request_id:
+                continue
+            result = {
+                "enqueued_monotonic_ns": enqueued_ns,
+                "bulk_write_completed_monotonic_ns": completed_ns,
+                "host_delivery_bound_ns": completed_ns - enqueued_ns,
+            }
+            if not ok:
+                raise CommandRejectedError(
+                    f"command rejected or failed in reader ({error}); not retried"
+                )
+            return result
+
     # -- Internal -------------------------------------------------------------
 
     def _terminate_and_join(self) -> None:
@@ -482,6 +524,7 @@ class USBStream:
                 self._proc.join(timeout=1.0)
             self._proc = None
         self._cmd_queue = None
+        self._command_ack_queue = None
         self._terminate_event = None
         self._ready_event = None
         # Update local "device lost" mirror from the final counter snapshot.

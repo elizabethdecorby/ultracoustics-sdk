@@ -942,3 +942,12 @@ class Controller:
             )
         pkt = pack_command(cmd_byte, wValue, wIndex) + extra
         self._stream.send_command(pkt)
+
+    def _send_confirmed(self, cmd_byte, wValue=0, wIndex=0, extra=b"",
+                        timeout_s=0.5):
+        """Internal bounded OUT delivery primitive for diagnostic epochs."""
+        from ._internal.protocol import pack_command
+        if self._stream is None or not self._stream.running:
+            raise RuntimeError("USB stream must be running for confirmed command")
+        pkt = pack_command(cmd_byte, wValue, wIndex) + extra
+        return self._stream.send_command_confirmed(pkt, timeout_s=timeout_s)

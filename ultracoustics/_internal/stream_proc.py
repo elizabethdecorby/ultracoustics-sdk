@@ -53,6 +53,7 @@ import ctypes
 import json
 import os
 import platform
+import queue
 import struct
 import sys
 import threading
@@ -284,6 +285,7 @@ def reader_main(
     cmd_queue: Queue,
     terminate_event,
     ready_event,
+    command_ack_queue=None,
     packet_diagnostics_path: Optional[str] = None,
     packet_diagnostics_attach_s: float = 2.0,
 ) -> None:
@@ -338,6 +340,29 @@ def reader_main(
         except (usb1.USBError, NotImplementedError):
             pass
         handle.claimInterface(0)
+
+        def _send_outbound(item, timeout_ms: int) -> None:
+            request_id = None
+            payload = item
+            if isinstance(item, tuple):
+                request_id, payload = item
+            ok = True
+            error = None
+            try:
+                handle.bulkWrite(BULK_OUT_EP, payload, timeout=timeout_ms)
+            except usb1.USBError as exc:
+                ok = False
+                error = repr(exc)
+                counters[4] += 1
+                if isinstance(exc, usb1.USBErrorPipe):
+                    try:
+                        handle.clearHalt(BULK_OUT_EP)
+                    except usb1.USBError as clear_exc:
+                        error += f"; clearHalt failed: {clear_exc!r}"
+            if request_id is not None and command_ack_queue is not None:
+                command_ack_queue.put(
+                    (request_id, ok, error, time.monotonic_ns())
+                )
 
         # ------------------------------------------------------------------
         # Per-transfer completion callback — called on libusb's event thread
@@ -446,19 +471,17 @@ def reader_main(
 
         # Event loop: pump libusb events and drain the outbound command queue.
         while not terminate_event.is_set():
-            # Drain any pending outbound commands (BOOT/IDLE/WARM bytes etc).
+            # Handle at most one command per event-loop turn so OUT traffic
+            # cannot starve IN completion processing. Accepted diagnostic
+            # commands normally complete immediately; 100 ms is the hard host
+            # bound for a NAKed/stalled OUT request.
             try:
-                while True:
-                    cmd_bytes = cmd_queue.get_nowait()
-                    if cmd_bytes is None:
-                        # Sentinel — used as an alternative shutdown signal.
-                        terminate_event.set()
-                        break
-                    try:
-                        handle.bulkWrite(BULK_OUT_EP, cmd_bytes, timeout=2000)
-                    except usb1.USBError:
-                        counters[4] += 1
-            except Exception:  # noqa: BLE001 — queue.Empty path
+                cmd_item = cmd_queue.get_nowait()
+                if cmd_item is None:
+                    terminate_event.set()
+                else:
+                    _send_outbound(cmd_item, timeout_ms=100)
+            except queue.Empty:
                 pass
 
             # Pump completions for up to 50 ms, then loop.
@@ -488,14 +511,14 @@ def reader_main(
         if handle is not None and cmd_queue is not None:
             try:
                 while True:
-                    cmd_bytes = cmd_queue.get_nowait()
-                    if cmd_bytes is None:
+                    cmd_item = cmd_queue.get_nowait()
+                    if cmd_item is None:
                         continue
                     try:
-                        handle.bulkWrite(BULK_OUT_EP, cmd_bytes, timeout=2000)
+                        _send_outbound(cmd_item, timeout_ms=100)
                     except Exception:  # noqa: BLE001
                         counters[4] += 1
-            except Exception:  # noqa: BLE001 — queue.Empty / closed queue
+            except (queue.Empty, ValueError, OSError):
                 pass
 
         # Cancel pending transfers and wait briefly for callbacks to fire.
