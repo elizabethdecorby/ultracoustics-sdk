@@ -314,7 +314,21 @@ class Controller:
         from ._internal.protocol import pack_command
         result = self._stream._request_stream_control(
             pack_command(CMD_RUNTIME_METRICS), "runtime", timeout_s=timeout_s)
-        return result["firmware_response"]
+        # Firmware sends the response before its runtime-maintenance state
+        # finishes and restarts ADC.  A packet received after this baseline is
+        # the observable completion barrier; returning earlier lets a following
+        # override replace that state and strand acquisition stopped.
+        stats = self.stream_stats or {}
+        baseline_packets = int(stats.get("packets", 0))
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            stats = self.stream_stats or {}
+            if int(stats.get("packets", 0)) > baseline_packets:
+                return result["firmware_response"]
+            if stats.get("device_lost") or stats.get("fatal"):
+                raise RuntimeError("stream ended before runtime maintenance completed")
+            time.sleep(0.001)
+        raise TimeoutError("no ADC packet received after runtime metrics response")
 
     def manual_command(self, target: int, opcode: int, channel: int,
                        value: int = 0, timeout_s: float = 1.0):

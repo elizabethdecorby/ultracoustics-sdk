@@ -85,6 +85,31 @@ class FakeStream:
 
 
 class ControllerControlTests(unittest.TestCase):
+    def test_runtime_metrics_waits_for_post_response_adc_packet(self):
+        reply = SimpleNamespace(current_state=0)
+
+        class RuntimeStream:
+            running = True
+            def __init__(self):
+                self.counts = iter((12, 12, 13))
+                self.request_complete = False
+            def _request_stream_control(self, payload, kind, timeout_s=1.0):
+                self.request_complete = True
+                return {"firmware_response": reply}
+            def get_stream_stats(self):
+                self.assert_after_response()
+                return {"packets": next(self.counts)}
+            def assert_after_response(self):
+                if not self.request_complete:
+                    raise AssertionError("packet baseline read before response")
+
+        ctrl = Controller()
+        ctrl._stream = RuntimeStream()
+        ctrl._running = False
+        with mock.patch("ultracoustics.controller.time.sleep") as sleep:
+            self.assertIs(ctrl.runtime_metrics(timeout_s=.1), reply)
+        self.assertEqual(sleep.call_count, 1)
+
     def test_manual_command_checks_response_identity_and_cap(self):
         ctrl = Controller()
         reply = parse_manual_response(manual_response(txn=1))
