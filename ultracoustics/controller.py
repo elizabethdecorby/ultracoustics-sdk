@@ -372,6 +372,10 @@ class Controller:
         metrics = self.runtime_metrics(timeout_s=timeout_s)
         if metrics.current_state != 0:
             raise RuntimeError(f"master did not confirm IDLE (state={metrics.current_state})")
+        # The 1550 slave does not reliably reset across an immediate rail
+        # off/on transition.  Preserve the programmer-proven minimum physical
+        # off interval before any override or power-on command.
+        time.sleep(0.2)
         self._send_confirmed(CMD_OVERRIDE_ENTER, wValue=1, timeout_s=timeout_s)
         self._send_confirmed(CMD_TRIGGER, wValue=0, wIndex=TARGET_638,
                              timeout_s=timeout_s)

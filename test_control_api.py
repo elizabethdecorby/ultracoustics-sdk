@@ -121,17 +121,21 @@ class ControllerControlTests(unittest.TestCase):
             ctrl.manual_command(638, MANUAL_SET, CHANNEL_LASER_DAC, 33001)
 
     def test_begin_manual_legacy_settle_covers_bootloader_and_poll_gate(self):
+        events = []
         ctrl = Controller()
         ctrl._stream = FakeStream(None)
         ctrl._running = False
         metrics = SimpleNamespace(current_state=0)
         ctrl.stop_confirmed = mock.Mock()
-        ctrl.runtime_metrics = mock.Mock(return_value=metrics)
-        ctrl._send_confirmed = mock.Mock(return_value={
-            "bulk_write_completed_monotonic_ns": 1})
-        with mock.patch("ultracoustics.controller.time.sleep") as sleep:
+        ctrl.runtime_metrics = mock.Mock(
+            side_effect=lambda timeout_s: events.append("runtime") or metrics)
+        ctrl._send_confirmed = mock.Mock(side_effect=lambda *args, **kwargs: (
+            events.append("command") or {"bulk_write_completed_monotonic_ns": 1}))
+        with mock.patch("ultracoustics.controller.time.sleep",
+                        side_effect=lambda seconds: events.append(("sleep", seconds))) as sleep:
             ctrl.begin_manual(1550)
-        sleep.assert_called_once_with(1.25)
+        self.assertEqual(sleep.call_args_list, [mock.call(0.2), mock.call(1.25)])
+        self.assertEqual(events[:3], ["runtime", ("sleep", 0.2), "command"])
 
     def test_begin_manual_format1_still_observes_minimum_settle(self):
         ctrl = Controller()
@@ -160,7 +164,7 @@ class ControllerControlTests(unittest.TestCase):
              mock.patch("ultracoustics.controller.time.monotonic_ns",
                         return_value=2_000_000_000):
             ctrl.begin_manual(638)
-        self.assertEqual(sleep.call_args_list[0], mock.call(1.25))
+        self.assertEqual(sleep.call_args_list[:2], [mock.call(0.2), mock.call(1.25)])
 
     def test_pd_freshness_includes_host_age_and_faults(self):
         board = SimpleNamespace(pd_sample_tick_ms=2, pd_valid=True,
