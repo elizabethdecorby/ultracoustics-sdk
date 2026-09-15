@@ -61,7 +61,10 @@ from .characterization import bin_ramp, ProbeCharacterizationResult
 from .processing import compute_noise_metrics
 
 
-class Controller:
+from .system_control import SystemControlMixin
+
+
+class Controller(SystemControlMixin):
     """
     Top-level interface to the Ultracoustics system.
 
@@ -173,6 +176,7 @@ class Controller:
             If the Master Board is not found or the USB claim fails.
         """
         probe = USBBulkConnection(verbose=self.verbose)
+        self.device_serial = probe.dev.serial_number
         probe.close()  # release the device so the reader subprocess can claim it
         self._stream = USBStream(
             ring_capacity_samples=self._buf_len,
