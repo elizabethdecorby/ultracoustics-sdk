@@ -149,7 +149,7 @@ def wait_fresh_pd(ctrl, target, prior_tick, set_ack_at, timeout_s=2.0,
                            int(elapsed * 1000)):
                 return board, link_flags
         time.sleep(0.02)
-    raise TimeoutError("no new, bounded-age, link-healthy 4 Hz PD sample")
+    raise TimeoutError("no new, bounded-age, link-healthy PD sample")
 
 
 def run_manual_sweep(ctrl, target, points=100, max_dac=None, on_point=None,
