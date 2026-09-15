@@ -17,6 +17,7 @@ CHANNEL_KI_NEGATIVE = 5
 CHANNEL_KI_POSITIVE = 6
 GAIN_SCALE = 1_000_000
 OPTICAL_STATES = ('IDLE', 'CALIBRATING', 'ROOT_FINDING', 'LOCKED', 'ERROR', 'MEASURE_SLOPE')
+OPTICAL_ACTIONS = {'abort': 0, 'start': 1, 'reacquire': 2, 'retune': 3}
 
 
 def require_applied(reply):
@@ -182,12 +183,31 @@ class SystemControlMixin:
         self._wait_optical_idle(timeout_s)
         return self.optical_pid_638(timeout_s=timeout_s)
 
+    def control_638(self, action, timeout_s=1.0):
+        """Send one acknowledged optical action in automatic or manual mode.
+
+        Automatic RUN routing is owned by the master and therefore does not
+        acquire a slave lease.  An active manual session may use an existing
+        optical lease, but never silently replaces a manually-owned laser DAC.
+        """
+        if action not in OPTICAL_ACTIONS:
+            raise ValueError('Optical action must be abort, start, reacquire, or retune')
+        if self.system_manual_active:
+            if (638, CHANNEL_LASER_DAC) in self._system_manual_owned:
+                raise RuntimeError('Release the manually-owned 638 laser DAC before optical control')
+            if (638, CHANNEL_OPTICAL) not in self._system_manual_owned:
+                self.system_manual_command(638, MANUAL_TAKE, CHANNEL_OPTICAL, 0, timeout_s)
+            command = self.system_manual_command
+        else:
+            command = self.manual_command
+        return require_applied(command(638, MANUAL_SET, CHANNEL_OPTICAL,
+                                       OPTICAL_ACTIONS[action], timeout_s))
+
     def lock_638(self, action='start', timeout_s=1.0):
+        """Compatibility wrapper for the optical action API."""
         if action not in ('start', 'abort'):
             raise ValueError('Lock action must be start or abort')
-        self._take_optical_638(timeout_s)
-        return self.system_manual_command(638, MANUAL_SET, CHANNEL_OPTICAL,
-                                          int(action == 'start'), timeout_s)
+        return self.control_638(action, timeout_s)
 
     def read_state_638(self, timeout_s=1.0):
         reply = self.system_manual_command(638, MANUAL_GET, CHANNEL_OPTICAL, timeout_s=timeout_s)

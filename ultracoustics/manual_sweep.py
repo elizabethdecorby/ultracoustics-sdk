@@ -7,7 +7,7 @@ from ._internal.control import (
     CHANNEL_LASER_DAC, MANUAL_RENEW, MANUAL_SET, MANUAL_TAKE,
 )
 
-CAPS = {638: 33000, 1550: 43253}
+CAPS = {638: 44000, 1550: 43253}
 STATUS_NAMES = {
     1: "bad start", 2: "bad CRC", 3: "bad opcode", 4: "bad channel",
     5: "bad reserved byte", 6: "bad value or thermal not LOCKED",

@@ -446,7 +446,7 @@ class DiagnosticsManager:
 
         Stamps ``CMD_PROBE_RAMP_START`` (0x40) into byte[1] of the master's
         SPI2 packets. The 638 edge-detects the 0x33 -> 0x40 transition in its
-        EXTI handler and starts its 0 -> 33000 DAC ramp at 40 Hz. Photodetector
+        EXTI handler and starts its 0 -> 44000 DAC ramp at 40 Hz. Photodetector
         samples are read continuously over the bulk stream and time-binned by
         the host.
 

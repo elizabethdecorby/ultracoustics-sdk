@@ -50,7 +50,7 @@ class ProbeCharacterizationResult:
     Attributes
     ----------
     current : list[int]
-        DAC setpoints swept (e.g. 0, 100, ..., 33000).
+        DAC setpoints swept (e.g. 0, 100, ..., 44000).
     photodetector : list[float]
         Mean photodetector reading (ADC counts) for each setpoint, in the
         same order as ``current``.
@@ -97,7 +97,7 @@ def bin_ramp(
     sample_rate: int = SAMPLE_RATE,
     bin_seconds: float = 0.025,
     step_size: int = 100,
-    max_current: int = 33000,
+    max_current: int = 44000,
     saturated: bool = False,
     saturation_limit: Optional[int] = None,
     start_offset_samples: int = 0,
@@ -153,7 +153,7 @@ def bin_ramp(
         raise RuntimeError("PD signal is flat — ramp did not run or PD is dead.")
 
     bin_samples = int(sample_rate * bin_seconds)   # 250_000 samples / 25 ms
-    n_steps = max_current // step_size              # 330 steps (100..33000)
+    n_steps = max_current // step_size
 
     setpoints: List[int] = []
     pd_vals: List[float] = []

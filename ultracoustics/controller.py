@@ -341,7 +341,7 @@ class Controller(SystemControlMixin):
         if target not in (TARGET_638, TARGET_1550):
             raise ValueError("target must be 638 or 1550")
         if opcode in (MANUAL_TAKE, MANUAL_SET) and channel == CHANNEL_LASER_DAC:
-            cap = 33000 if target == TARGET_638 else 43253
+            cap = 44000 if target == TARGET_638 else 43253
             if not 0 <= value <= cap:
                 raise ValueError(f"laser DAC must be between 0 and {cap}")
         if self._stream is None or not self._stream.running:
@@ -574,7 +574,7 @@ class Controller(SystemControlMixin):
     def run_probe_characterization(
         self,
         *,
-        max_current: int = 33000,
+        max_current: int = 44000,
         step_size: int = 100,
         bin_seconds: float = 0.025,
         start_offset_s: float = 0.0,
@@ -612,7 +612,7 @@ class Controller(SystemControlMixin):
         ----------
         max_current : int
             DAC setpoint the ramp tops out at. Must match the 638 firmware
-            ``PROBE_RAMP_MAX`` (default 33000 = ``CALIBRATION_DAC_VALUE``).
+            ``PROBE_RAMP_MAX`` (default 44000 = ``CALIBRATION_DAC_VALUE``).
         step_size : int
             DAC increment per ``bin_seconds`` tick (default 100). Must match
             firmware; the host cannot change the firmware step.
@@ -858,7 +858,7 @@ class Controller(SystemControlMixin):
         *,
         target=TARGET_1550,
         dac_start: int = 10000,
-        dac_end: int = 33000,
+        dac_end: Optional[int] = None,
         dac_step: int = 100,
         samples_per_point: int = 32768,
         settle_delay_s: float = 0.1,
@@ -953,6 +953,13 @@ class Controller(SystemControlMixin):
             verbose = self.verbose
         if sample_rate_hz is None:
             sample_rate_hz = SAMPLE_RATE
+
+        cap = 44000 if target == TARGET_638 else 43253
+        if dac_end is None:
+            dac_end = cap
+        if (target not in (TARGET_638, TARGET_1550) or
+                not 0 <= dac_start <= dac_end <= cap or dac_step <= 0):
+            raise ValueError(f"DAC range must be ordered, positive-step, and within 0..{cap}")
 
         dac_values = list(range(dac_start, dac_end + 1, dac_step))
         total = len(dac_values)

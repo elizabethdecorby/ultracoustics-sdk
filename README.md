@@ -239,7 +239,7 @@ ctrl.connect()
 ctrl.begin_stream()
 
 result = ctrl.run_probe_characterization()
-# result.current          -> [0, 100, ..., 33000]  (DAC setpoints)
+# result.current          -> [0, 100, ..., 44000]  (DAC setpoints)
 # result.photodetector     -> mean ADC counts per setpoint
 # result.saturated         -> True if the PD saturated mid-ramp (curve trimmed)
 
@@ -249,7 +249,7 @@ ctrl.close()
 
 | Parameter | Default | Description |
 |---|---|---|
-| `max_current` | `33000` | DAC setpoint the ramp tops out at (must match firmware `PROBE_RAMP_MAX`). |
+| `max_current` | `44000` | DAC setpoint the ramp tops out at (must match firmware `PROBE_RAMP_MAX`). |
 | `step_size` | `100` | DAC increment per bin (must match firmware; host cannot change it). |
 | `bin_seconds` | `0.025` | One ramp tick in seconds (25 ms at the firmware 40 Hz rate). |
 | `start_offset_s` | `0.0` | Forward-bin offset (s) for the unknown 40 Hz tick phase; correct within ~1 bin. |

@@ -27,11 +27,20 @@ class SystemControlTests(unittest.TestCase):
   f=Fake();f.system_manual_command(638,MANUAL_SET,1,25100)
   self.assertIn((638,MANUAL_TAKE,1,25000),f.calls);self.assertIn((1550,2),f._system_manual_owned);self.assertFalse(any(c[0]==1550 for c in f.calls))
  def test_lock_and_dac_ownership_exclusive(self):
-  f=Fake();f.lock_638()
-  self.assertEqual(f.calls[:3],[(638,MANUAL_SET,2,0),(638,MANUAL_RELEASE,2,0),(638,MANUAL_TAKE,3,0)])
-  self.assertEqual(f._system_manual_owned,{(638,3),(1550,2)})
-  f.system_manual_command(638,MANUAL_SET,2,100)
-  self.assertIn((638,MANUAL_RELEASE,3,0),f.calls);self.assertEqual(f._system_manual_owned,{(638,2),(1550,2)})
+  f=Fake()
+  with self.assertRaisesRegex(RuntimeError,'manually-owned'):
+   f.lock_638()
+  self.assertFalse(f.calls)
+ def test_automatic_optical_actions_route_without_take_or_stop(self):
+  f=Fake();f._system_manual_active=False;f._system_manual_owned=set()
+  for action,value in [('abort',0),('start',1),('reacquire',2),('retune',3)]:
+   f.control_638(action)
+   self.assertEqual(f.calls[-1],(638,MANUAL_SET,3,value))
+  self.assertFalse(any(c[0]=='stop' for c in f.calls))
+ def test_manual_optical_owner_uses_existing_lease(self):
+  f=Fake();f._system_manual_owned={(638,3),(1550,2)}
+  f.control_638('reacquire')
+  self.assertEqual(f.calls,[(638,MANUAL_SET,3,2)])
  def test_gain_validation_before_writes_and_zero(self):
   f=Fake()
   with self.assertRaises(ValueError):f.optical_pid_638(kp=float('nan'))
