@@ -44,6 +44,10 @@ class SystemControlTests(unittest.TestCase):
   f.manual_command=fail
   with self.assertRaisesRegex(RuntimeError,'system stopped'):f.renew_system_manual()
   self.assertFalse(f.system_manual_active);self.assertEqual(f.calls,[('stop',)])
+ def test_read_pid_never_changes_dac_or_ownership(self):
+  f=Fake();f.optical_pid_638()
+  self.assertTrue(all(c[1]==MANUAL_GET for c in f.calls))
+  self.assertEqual(f._system_manual_owned,{(638,2),(1550,2)})
  def test_close_releases_usb_even_if_stop_is_unconfirmed(self):
   from ultracoustics import Controller
   from unittest.mock import Mock

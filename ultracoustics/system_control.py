@@ -94,7 +94,10 @@ class SystemControlMixin:
                 raise TimeoutError('Both boards did not produce fresh post-power temperatures')
             self._system_manual_active = True
             for target in (638, 1550):
-                self.system_manual_command(target, MANUAL_TAKE, CHANNEL_LASER_DAC, 0, timeout_s)
+                try:
+                    self.system_manual_command(target, MANUAL_TAKE, CHANNEL_LASER_DAC, 0, timeout_s)
+                except Exception as exc:
+                    raise RuntimeError(f'Board {target} zero-DAC takeover failed: {exc}') from exc
             return self.system_manual_readback(timeout_s)
         except Exception as original:
             try:
@@ -200,7 +203,8 @@ class SystemControlMixin:
         for _, value in requested:
             if value is not None and (not math.isfinite(value) or not 0 <= value <= .2):
                 raise ValueError('Optical PI gains must be finite and between 0 and 0.2')
-        self._take_optical_638(timeout_s)
+        if any(value is not None for _, value in requested):
+            self._take_optical_638(timeout_s)
         for channel, value in requested:
             if value is not None:
                 self.system_manual_command(638, MANUAL_SET, channel, round(value * GAIN_SCALE), timeout_s)
