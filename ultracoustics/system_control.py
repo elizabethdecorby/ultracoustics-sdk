@@ -21,7 +21,8 @@ OPTICAL_STATES = ('IDLE', 'CALIBRATING', 'ROOT_FINDING', 'LOCKED', 'ERROR', 'MEA
 
 def require_applied(reply):
     if reply.status != 0:
-        raise RuntimeError(f'Board {reply.target} rejected channel {reply.channel}: status {reply.status}')
+        reason = {6: 'value outside bounds or TEC not yet LOCKED', 7: 'channel is not owned', 8: 'channel is already owned', 10: 'optical transition busy'}.get(reply.status, 'command rejected')
+        raise RuntimeError(f'Board {reply.target}, channel {reply.channel}: {reason} (status {reply.status})')
     return reply
 
 
