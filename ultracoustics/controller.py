@@ -424,38 +424,16 @@ class Controller(SystemControlMixin):
         return metrics
 
     def finish_manual(self, target: int, timeout_s: float = 1.0):
-        """Zero/release the laser channel, power down, and confirm final IDLE."""
-        errors = []
-        for name, action in (
-            ("zero", lambda: self.manual_command(
-                target, MANUAL_SET, CHANNEL_LASER_DAC, 0, timeout_s)),
-            ("release", lambda: self.manual_command(
-                target, MANUAL_RELEASE, CHANNEL_LASER_DAC, 0, timeout_s)),
-            ("power off", lambda: self._send_confirmed(
-                CMD_POWER, wValue=0, wIndex=target, timeout_s=timeout_s)),
-            ("exit override", lambda: self._send_confirmed(
-                CMD_OVERRIDE_ENTER, wValue=0, timeout_s=timeout_s)),
-        ):
-            try:
-                reply = action()
-                if hasattr(reply, "status") and reply.status != 0:
-                    raise RuntimeError(f"slave status {reply.status}")
-                if name == "power off":
-                    self._last_manual_rail_off_ns = int(
-                        reply["bulk_write_completed_monotonic_ns"])
-            except Exception as exc:
-                errors.append(f"{name}: {exc}")
-        try:
-            self.stop_confirmed(timeout_s=timeout_s)
-            metrics = self.runtime_metrics(timeout_s=timeout_s)
-            if metrics.current_state != 0:
-                raise RuntimeError(f"state={metrics.current_state}")
-        except Exception as exc:
-            errors.append(f"IDLE confirmation: {exc}")
-            metrics = None
-        if errors:
-            raise RuntimeError("manual shutdown incomplete: " + "; ".join(errors))
-        return metrics
+        """Power down through the master and confirm IDLE, independent of SPI.
+
+        A failed slave link cannot acknowledge zero/release. Global STOP lowers
+        both START lines and disables both power rails without that link; its
+        confirmed IDLE response is the shutdown evidence. Do not turn failed
+        slave acknowledgments into a false shutdown failure after power-off.
+        """
+        if target not in (TARGET_638, TARGET_1550):
+            raise ValueError("target must be 638 or 1550")
+        return self.stop_system_confirmed(timeout_s=timeout_s)
 
     # -- State management -----------------------------------------------------
 

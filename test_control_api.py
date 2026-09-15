@@ -114,19 +114,29 @@ class ControllerControlTests(unittest.TestCase):
             ctrl.start()
         sleep.assert_not_called()
 
-    def test_finish_manual_tracks_confirmed_power_off_completion(self):
+    def test_finish_manual_uses_master_stop_when_slave_link_is_dead(self):
         ctrl = Controller()
-        ctrl.manual_command = mock.Mock(
-            return_value=SimpleNamespace(status=0))
-        ctrl._send_confirmed = mock.Mock(side_effect=(
-            {"bulk_write_completed_monotonic_ns": 7_000_000_000},
-            {"bulk_write_completed_monotonic_ns": 7_010_000_000},
-        ))
-        ctrl.stop_confirmed = mock.Mock()
+        ctrl._ensure_connected = mock.Mock()
+        ctrl.begin_stream = mock.Mock()
+        ctrl.manual_command = mock.Mock(side_effect=TimeoutError("SPI timeout"))
+        ctrl.stop_confirmed = mock.Mock(return_value={
+            "bulk_write_completed_monotonic_ns": 7_000_000_000})
         ctrl.runtime_metrics = mock.Mock(
             return_value=SimpleNamespace(current_state=0))
-        ctrl.finish_manual(1550)
+        self.assertEqual(ctrl.finish_manual(1550).current_state, 0)
+        ctrl.manual_command.assert_not_called()
+        ctrl.stop_confirmed.assert_called_once()
         self.assertEqual(ctrl._last_manual_rail_off_ns, 7_000_000_000)
+
+    def test_finish_manual_never_claims_shutdown_if_master_stop_fails(self):
+        ctrl = Controller()
+        ctrl._ensure_connected = mock.Mock()
+        ctrl.begin_stream = mock.Mock()
+        ctrl.stop_confirmed = mock.Mock(side_effect=TimeoutError("USB STOP timeout"))
+        ctrl.runtime_metrics = mock.Mock()
+        with self.assertRaisesRegex(TimeoutError, "USB STOP timeout"):
+            ctrl.finish_manual(1550)
+        ctrl.runtime_metrics.assert_not_called()
 
     def test_runtime_metrics_waits_for_post_response_adc_packet(self):
         reply = SimpleNamespace(current_state=0)
