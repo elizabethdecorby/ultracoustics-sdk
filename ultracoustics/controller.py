@@ -537,13 +537,22 @@ class Controller(SystemControlMixin):
 
     def close(self):
         """Release all hardware resources."""
-        if self._running:
-            self.stop()
-        self.end_stream()
-        if self._stream is not None:
-            self._stream.close()
-            self._stream = None
-        self._connected = False
+        shutdown_error = None
+        try:
+            if self._running or self.system_manual_active:
+                self.stop_system_confirmed(timeout_s=1.0)
+        except Exception as exc:
+            shutdown_error = exc
+        finally:
+            self.end_stream()
+            if self._stream is not None:
+                self._stream.close()
+                self._stream = None
+            self._connected = False
+            self._system_manual_active = False
+            self._system_manual_owned = set()
+        if shutdown_error is not None:
+            raise RuntimeError(f"USB closed; physical shutdown was not confirmed: {shutdown_error}") from shutdown_error
 
     # -- Data capture ---------------------------------------------------------
 

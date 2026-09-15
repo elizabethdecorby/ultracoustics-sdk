@@ -44,4 +44,12 @@ class SystemControlTests(unittest.TestCase):
   f.manual_command=fail
   with self.assertRaisesRegex(RuntimeError,'system stopped'):f.renew_system_manual()
   self.assertFalse(f.system_manual_active);self.assertEqual(f.calls,[('stop',)])
+ def test_close_releases_usb_even_if_stop_is_unconfirmed(self):
+  from ultracoustics import Controller
+  from unittest.mock import Mock
+  c=Controller();c._running=True;c._connected=True;c._stream=Mock()
+  stream=c._stream;c.stop_system_confirmed=Mock(side_effect=TimeoutError('USB'))
+  with self.assertRaisesRegex(RuntimeError,'physical shutdown was not confirmed'):c.close()
+  stream.stop.assert_called_once();stream.close.assert_called_once()
+  self.assertFalse(c.connected)
 if __name__=='__main__':unittest.main()
