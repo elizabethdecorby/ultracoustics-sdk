@@ -299,6 +299,27 @@ class Controller(SystemControlMixin):
             time.sleep(0.005)
         raise RuntimeError("format 1 was accepted but no matching valid telemetry record arrived")
 
+    def enable_optical_diagnostics(self, timeout_s: float = 1.0):
+        """Negotiate format 2 and return its first coherent cached snapshot."""
+        if self._running:
+            if (self.stream_stats or {}).get('stream_format') == 2:
+                return self.telemetry
+            raise RuntimeError('optical diagnostics must be negotiated while IDLE')
+        capabilities = self.telemetry_capabilities(timeout_s=timeout_s)
+        if not capabilities.supports_format2:
+            raise RuntimeError("connected master does not advertise optical diagnostics")
+        from ._internal.protocol import pack_command
+        result = self._stream.select_stream_format_confirmed(
+            pack_command(CMD_STREAM_FORMAT, 2, 0), 2, timeout_s=timeout_s)
+        expected_epoch = result["firmware_response"]["stream_epoch"]
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            snapshot = self.telemetry
+            if snapshot is not None and snapshot.stream_epoch == expected_epoch:
+                return snapshot
+            time.sleep(.005)
+        raise RuntimeError("format 2 was accepted but no coherent telemetry snapshot arrived")
+
     def disable_telemetry(self, timeout_s: float = 1.0) -> None:
         """Explicitly return an IDLE streaming session to legacy framing."""
         if self._running:

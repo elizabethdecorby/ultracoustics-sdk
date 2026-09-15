@@ -614,8 +614,8 @@ class USBStream:
         The result proves format acceptance, not that any later telemetry
         record or board measurement is valid.
         """
-        if stream_format not in (0, 1):
-            raise ValueError("stream format must be 0 or 1")
+        if stream_format not in (0, 1, 2):
+            raise ValueError("stream format must be 0, 1, or 2")
         result = self._request_stream_control(
             payload, "format", stream_format=stream_format, timeout_s=timeout_s,
         )

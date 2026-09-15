@@ -78,7 +78,8 @@ def parse_attached_record(raw, current_format, received_monotonic_ns):
     Reopening the host does not reset firmware negotiation. Length selects a
     candidate only; the normal strict parser must validate it before adoption.
     """
-    candidate = (1 if len(raw) == FORMAT1_RECORD_BYTES else
+    candidate = ((2 if raw[LEGACY_RECORD_BYTES + 4] == 2 else 1)
+                 if len(raw) == FORMAT1_RECORD_BYTES else
                  0 if len(raw) == LEGACY_RECORD_BYTES else current_format)
     parsed = parse_record(raw, candidate,
                           received_monotonic_ns=received_monotonic_ns)
@@ -500,7 +501,7 @@ def reader_main(
                         raw, stream_format, time.monotonic_ns())
                 except TelemetryFormatError:
                     counters[6] += 1  # malformed
-                    if telemetry_writer is not None and stream_format == 1:
+                    if telemetry_writer is not None and stream_format in (1, 2):
                         telemetry_writer.record_error()
                     diagnostics.record(
                         receive_monotonic_ns=time.monotonic_ns(), length=length,
@@ -514,7 +515,7 @@ def reader_main(
                             if stream_format == 0:
                                 telemetry_writer.reset_to_legacy()
                             else:
-                                telemetry_writer.select_format(1)
+                                telemetry_writer.select_format(stream_format)
                     seq, drops_fw = parsed.sequence, parsed.drops_fw
 
                     classification, missing_packets, starts_new_epoch = (

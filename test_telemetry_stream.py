@@ -20,6 +20,7 @@ from ultracoustics._internal.telemetry import (
     initialise_sidecar, parse_capabilities, parse_format1_trailer,
     parse_format_ack, parse_record, read_sidecar,
 )
+from ultracoustics._internal.optical_diagnostics import crc16_ccitt
 
 
 def board_blob(board, sequence=7):
@@ -40,6 +41,20 @@ def format1_record(seq=12, epoch=3, tlvs=None):
         trailer += struct.pack("<HH", kind, len(payload)) + payload
     trailer += struct.pack("<HHI", 0x7FFF, 4, zlib.crc32(trailer) & 0xFFFFFFFF)
     assert len(legacy + trailer) == FORMAT1_RECORD_BYTES
+    return legacy + trailer
+
+
+def format2_record(kind=3, page_kind=2, seq=12, epoch=3):
+    page = bytearray(52)
+    struct.pack_into('<BBH', page, 0, 1, page_kind, 52)
+    struct.pack_into('<H', page, 50, crc16_ccitt(page[:50]))
+    tlvs = [(kind, bytes(page) + b'\0\0'),
+            (2, board_blob(1550) + b'\0\0')]
+    legacy = struct.pack('<II', seq, 2) + np.arange(8192, dtype='<u2').tobytes()
+    trailer = bytearray(struct.pack('<4sBBHIHH', b'UTL1', 2, 16, 140, epoch, 0, 3))
+    for tlv_type, payload in tlvs:
+        trailer += struct.pack('<HH', tlv_type, len(payload)) + payload
+    trailer += struct.pack('<HHI', 0x7FFF, 4, zlib.crc32(trailer) & 0xFFFFFFFF)
     return legacy + trailer
 
 
@@ -161,17 +176,44 @@ class TelemetryParserTests(unittest.TestCase):
                               received_monotonic_ns=time.monotonic_ns() - 600_000_000)
         self.assertTrue(parsed.telemetry.host_stale)
 
+    def test_format2_rotating_pages_publish_independently(self):
+        shm = SharedMemory(create=True, size=SIDECAR_BYTES)
+        try:
+            initialise_sidecar(shm)
+            writer = TelemetrySidecarWriter(shm)
+            # Seed the independently rotating 638 sensor cache.
+            writer.publish(parse_record(format1_record(epoch=8), 1).telemetry)
+            writer.publish(parse_record(format2_record(3, 2, 20, 8), 2,
+                                        received_monotonic_ns=time.monotonic_ns()).telemetry)
+            writer.publish(parse_record(format2_record(4, 3, 21, 8), 2,
+                                        received_monotonic_ns=time.monotonic_ns()).telemetry)
+            snapshot, stats = read_sidecar(shm)
+            self.assertEqual(stats['active_format'], 2)
+            self.assertIsNotNone(snapshot.optical_live_638)
+            self.assertIsNotNone(snapshot.optical_acquisition_638)
+            self.assertIsNone(snapshot.optical_abba_638)
+            self.assertEqual(snapshot.board_638.board, 638)
+            writer.publish(parse_record(format1_record(seq=22, epoch=9), 1).telemetry)
+            writer.publish(parse_record(format2_record(5, 4, 23, 9), 2).telemetry)
+            snapshot, _ = read_sidecar(shm)
+            self.assertIsNone(snapshot.optical_live_638)
+            self.assertIsNone(snapshot.optical_acquisition_638)
+            self.assertIsNotNone(snapshot.optical_abba_638)
+        finally:
+            shm.close(); shm.unlink()
+
 
 class FakeNegotiatedStream:
     running = True
 
-    def __init__(self, snapshot):
+    def __init__(self, snapshot, capability_flags=1):
         self.snapshot = snapshot
         self.calls = []
+        self.capability_flags = capability_flags
 
     def query_stream_capabilities(self, payload, timeout_s):
         self.calls.append(("caps", payload, timeout_s))
-        raw = struct.pack("<4sHHIHHHBBI", b"UTCP", 1, 24, 1,
+        raw = struct.pack("<4sHHIHHHBBI", b"UTCP", 1, 24, self.capability_flags,
                           16392, 16532, 503, 0, 0, self.snapshot.stream_epoch - 1)
         return parse_capabilities(raw)
 
@@ -213,6 +255,15 @@ class ControllerTelemetryTests(unittest.TestCase):
         self.assertEqual(controller._stream.calls[-1][1],
                          pack_command(CMD_STREAM_FORMAT, 0, 0))
         self.assertEqual(controller._stream.calls[-1][2], 0)
+
+    def test_optical_diagnostics_requires_capability_bit_and_selects_two(self):
+        controller = self.controller()
+        with self.assertRaisesRegex(RuntimeError, 'does not advertise'):
+            controller.enable_optical_diagnostics(.1)
+        controller._stream = FakeNegotiatedStream(controller.telemetry,
+                                                   capability_flags=5)
+        controller.enable_optical_diagnostics(.1)
+        self.assertEqual(controller._stream.calls[-1][2], 2)
 
 
 class ReentrantControlResponseTests(unittest.TestCase):
