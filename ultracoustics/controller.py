@@ -387,7 +387,7 @@ class Controller:
         # Both slave paths may remain in their bootloader for 1 s. Never let
         # a queued pre-power telemetry snapshot shorten this hardware gate.
         time.sleep(1.25)
-        if self._stream._selected_stream_format == 1:
+        if self._stream.get_stream_stats().get('stream_format', 0) == 1:
             baseline_tick = None
             if baseline is not None:
                 baseline_board = (baseline.board_638 if target == TARGET_638

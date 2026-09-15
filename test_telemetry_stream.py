@@ -44,6 +44,22 @@ def format1_record(seq=12, epoch=3, tlvs=None):
 
 
 class TelemetryParserTests(unittest.TestCase):
+    def test_attach_to_retained_format_without_control_commands(self):
+        record, mode = stream_proc.parse_attached_record(format1_record(), 0, 99)
+        self.assertEqual(mode, 1)
+        self.assertEqual(record.samples.shape, (8192,))
+        self.assertEqual(record.telemetry.received_monotonic_ns, 99)
+        legacy, mode = stream_proc.parse_attached_record(
+            format1_record()[:LEGACY_RECORD_BYTES], mode, 100)
+        self.assertEqual(mode, 0)
+        self.assertIsNone(legacy.telemetry)
+
+    def test_attach_rejects_corrupt_format_candidate(self):
+        raw = bytearray(format1_record())
+        raw[-1] ^= 1
+        with self.assertRaises(TelemetryFormatError):
+            stream_proc.parse_attached_record(raw, 0, 99)
+
     def test_control_responses_are_exact_and_validated(self):
         caps = struct.pack("<4sHHIHHHBBI", b"UTCP", 1, 24, 1,
                            16392, 16532, 503, 0, 0, 9)

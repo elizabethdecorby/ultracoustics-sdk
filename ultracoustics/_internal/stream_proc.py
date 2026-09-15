@@ -66,10 +66,23 @@ import numpy as np
 
 from .telemetry import (
     TelemetryFormatError, TelemetrySidecarWriter, parse_capabilities,
-    parse_format_ack, parse_record,
+    parse_format_ack, parse_record, FORMAT1_RECORD_BYTES, LEGACY_RECORD_BYTES,
 )
 from .control import (ControlProtocolError, parse_manual_response,
                       parse_runtime_metrics)
+
+
+def parse_attached_record(raw, current_format, received_monotonic_ns):
+    """Attach to either existing wire format without changing the device.
+
+    Reopening the host does not reset firmware negotiation. Length selects a
+    candidate only; the normal strict parser must validate it before adoption.
+    """
+    candidate = (1 if len(raw) == FORMAT1_RECORD_BYTES else
+                 0 if len(raw) == LEGACY_RECORD_BYTES else current_format)
+    parsed = parse_record(raw, candidate,
+                          received_monotonic_ns=received_monotonic_ns)
+    return parsed, candidate
 
 
 # ---------------------------------------------------------------------------
@@ -482,17 +495,9 @@ def reader_main(
                     if not terminate_event.is_set():
                         transfer.submit()
                     return
-                # A device reset returns the stream to exact legacy framing.
-                # Treat that unambiguous length transition as a new legacy
-                # epoch and invalidate the telemetry sidecar immediately.
-                if stream_format == 1 and length == PSSI_PACKET_WIRE_BYTES:
-                    stream_format = 0
-                    last_seq = None
-                    if telemetry_writer is not None:
-                        telemetry_writer.reset_to_legacy()
                 try:
-                    parsed = parse_record(raw, stream_format,
-                                          received_monotonic_ns=time.monotonic_ns())
+                    parsed, received_format = parse_attached_record(
+                        raw, stream_format, time.monotonic_ns())
                 except TelemetryFormatError:
                     counters[6] += 1  # malformed
                     if telemetry_writer is not None and stream_format == 1:
@@ -502,6 +507,14 @@ def reader_main(
                         seq=None, drops_fw=None, classification="missing_or_truncated_frame",
                     )
                 else:
+                    if received_format != stream_format:
+                        stream_format = received_format
+                        last_seq = None
+                        if telemetry_writer is not None:
+                            if stream_format == 0:
+                                telemetry_writer.reset_to_legacy()
+                            else:
+                                telemetry_writer.select_format(1)
                     seq, drops_fw = parsed.sequence, parsed.drops_fw
 
                     classification, missing_packets, starts_new_epoch = (
