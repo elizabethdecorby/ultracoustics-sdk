@@ -89,6 +89,45 @@ class FakeStream:
 
 
 class ControllerControlTests(unittest.TestCase):
+    def test_start_waits_only_remaining_confirmed_manual_rail_off_dwell(self):
+        ctrl = Controller()
+        ctrl._ensure_connected = mock.Mock()
+        ctrl._streaming = True
+        ctrl._last_manual_rail_off_ns = 1_000_000_000
+        events = []
+        ctrl._send = lambda command: events.append("boot")
+        with mock.patch("ultracoustics.controller.time.monotonic_ns",
+                        return_value=1_125_000_000), \
+             mock.patch("ultracoustics.controller.time.sleep",
+                        side_effect=lambda seconds: events.append(("sleep", seconds))) as sleep:
+            ctrl.start()
+        sleep.assert_called_once_with(0.075)
+        self.assertEqual(events, [("sleep", 0.075), "boot"])
+        self.assertIsNone(ctrl._last_manual_rail_off_ns)
+
+    def test_ordinary_start_has_no_rail_dwell(self):
+        ctrl = Controller()
+        ctrl._ensure_connected = mock.Mock()
+        ctrl._streaming = True
+        ctrl._send = mock.Mock()
+        with mock.patch("ultracoustics.controller.time.sleep") as sleep:
+            ctrl.start()
+        sleep.assert_not_called()
+
+    def test_finish_manual_tracks_confirmed_power_off_completion(self):
+        ctrl = Controller()
+        ctrl.manual_command = mock.Mock(
+            return_value=SimpleNamespace(status=0))
+        ctrl._send_confirmed = mock.Mock(side_effect=(
+            {"bulk_write_completed_monotonic_ns": 7_000_000_000},
+            {"bulk_write_completed_monotonic_ns": 7_010_000_000},
+        ))
+        ctrl.stop_confirmed = mock.Mock()
+        ctrl.runtime_metrics = mock.Mock(
+            return_value=SimpleNamespace(current_state=0))
+        ctrl.finish_manual(1550)
+        self.assertEqual(ctrl._last_manual_rail_off_ns, 7_000_000_000)
+
     def test_runtime_metrics_waits_for_post_response_adc_packet(self):
         reply = SimpleNamespace(current_state=0)
 

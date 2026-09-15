@@ -149,6 +149,7 @@ class Controller:
         self._packet_diagnostics_path = packet_diagnostics_path
         self._packet_diagnostics_attach_s = packet_diagnostics_attach_s
         self._manual_transaction = 0
+        self._last_manual_rail_off_ns = None
 
         # Ring capacity in samples, sized from ring_seconds. Lives in shared
         # memory once the stream subprocess is spawned (allocated by USBStream)
@@ -435,6 +436,9 @@ class Controller:
                 reply = action()
                 if hasattr(reply, "status") and reply.status != 0:
                     raise RuntimeError(f"slave status {reply.status}")
+                if name == "power off":
+                    self._last_manual_rail_off_ns = int(
+                        reply["bulk_write_completed_monotonic_ns"])
             except Exception as exc:
                 errors.append(f"{name}: {exc}")
         try:
@@ -481,7 +485,14 @@ class Controller:
         self._ensure_connected()
         if not self._streaming:
             self.begin_stream()
+        if self._last_manual_rail_off_ns is not None:
+            elapsed_ns = max(
+                0, time.monotonic_ns() - self._last_manual_rail_off_ns)
+            remaining_ns = 200_000_000 - elapsed_ns
+            if remaining_ns > 0:
+                time.sleep(remaining_ns / 1_000_000_000.0)
         self._send(CMD_BOOT)
+        self._last_manual_rail_off_ns = None
         self._running = True
 
     def stop(self):
