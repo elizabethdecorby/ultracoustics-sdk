@@ -63,6 +63,8 @@ class CachedOpticalPage:
     page:OpticalPage; stream_epoch:int; record_sequence:int; received_monotonic_ns:int
     @property
     def host_age_s(self)->float: return max(0,time.monotonic_ns()-self.received_monotonic_ns)/1e9
+    @property
+    def host_stale(self)->bool: return time.monotonic_ns()-self.received_monotonic_ns > 500_000_000
 
 class OpticalDiagnosticCache:
     """Keeps the newest page of each type; an arriving page never clears peers."""
