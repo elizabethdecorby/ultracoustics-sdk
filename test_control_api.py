@@ -84,6 +84,9 @@ class FakeStream:
     def get_telemetry(self):
         return None
 
+    def get_stream_stats(self):
+        return {'stream_format': self._selected_stream_format}
+
 
 class ControllerControlTests(unittest.TestCase):
     def test_runtime_metrics_waits_for_post_response_adc_packet(self):
