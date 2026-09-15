@@ -75,7 +75,7 @@ def parse_capabilities(raw) -> StreamCapabilities:
         struct.unpack("<4sHHIHHHBBI", raw)
     )
     if magic != b"UTCP" or schema != 1 or size != 24 or reserved != 0:
-        raise TelemetryFormatError("invalid capability response header")
+        raise TelemetryFormatError(f"invalid capability response header: {bytes(raw).hex()}")
     if legacy != LEGACY_RECORD_BYTES or format1 != FORMAT1_RECORD_BYTES:
         raise TelemetryFormatError("firmware record lengths do not match SDK")
     if max_trailer != FORMAT1_MAX_TRAILER_BYTES or current not in (0, 1, 2):
