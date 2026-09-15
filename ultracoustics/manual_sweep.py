@@ -35,15 +35,21 @@ def require_ok(reply, operation):
     return reply
 
 
+def check_cancel(cancel):
+    if cancel is not None and cancel():
+        raise RuntimeError("manual sweep canceled")
+
+
 def selected_board(snapshot, target):
     if target == 638:
         return snapshot.board_638, snapshot.link_flags_638
     return snapshot.board_1550, snapshot.link_flags_1550
 
 
-def wait_telemetry_ready(ctrl, target, timeout_s=5.0):
+def wait_telemetry_ready(ctrl, target, timeout_s=5.0, cancel=None):
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        check_cancel(cancel)
         snapshot = ctrl.telemetry
         if snapshot is not None:
             board, link = selected_board(snapshot, target)
@@ -61,7 +67,7 @@ def take_laser_zero(ctrl, target):
         target, MANUAL_TAKE, CHANNEL_LASER_DAC, 0), "TAKE zero")
 
 
-def wait_thermal_locked(ctrl, target, target_c, timeout_s=30.0):
+def wait_thermal_locked(ctrl, target, target_c, timeout_s=30.0, cancel=None):
     deadline = time.monotonic() + timeout_s
     started = time.monotonic()
     next_renew_s = 0.7
@@ -70,6 +76,7 @@ def wait_thermal_locked(ctrl, target, target_c, timeout_s=30.0):
     last_good_at = None
     stable_samples = 0
     while time.monotonic() < deadline:
+        check_cancel(cancel)
         elapsed = time.monotonic() - started
         if elapsed >= next_renew_s:
             require_ok(ctrl.manual_command(target, MANUAL_RENEW,
@@ -121,10 +128,12 @@ def pd_is_fresh(snapshot, board, link_flags, prior_tick, elapsed_ms):
             physical_age_ms < elapsed_ms and not snapshot.host_stale)
 
 
-def wait_fresh_pd(ctrl, target, prior_tick, set_ack_at, timeout_s=2.0):
+def wait_fresh_pd(ctrl, target, prior_tick, set_ack_at, timeout_s=2.0,
+                  cancel=None):
     deadline = time.monotonic() + timeout_s
     next_renew_s = 0.7
     while time.monotonic() < deadline:
+        check_cancel(cancel)
         elapsed = time.monotonic() - set_ack_at
         if elapsed >= next_renew_s:
             require_ok(ctrl.manual_command(target, MANUAL_RENEW,
@@ -140,7 +149,7 @@ def wait_fresh_pd(ctrl, target, prior_tick, set_ack_at, timeout_s=2.0):
     raise TimeoutError("no new, bounded-age, link-healthy 4 Hz PD sample")
 
 
-def run_manual_sweep(ctrl, target, points=6, on_point=None):
+def run_manual_sweep(ctrl, target, points=6, on_point=None, cancel=None):
     """Run one bounded sweep and return accepted raw-count row dictionaries."""
     if target not in CAPS:
         raise ValueError("target must be 638 or 1550")
@@ -159,17 +168,18 @@ def run_manual_sweep(ctrl, target, points=6, on_point=None):
         ctrl.stop_confirmed()
         ctrl.enable_telemetry()
         ctrl.begin_manual(target)
-        wait_telemetry_ready(ctrl, target)
+        wait_telemetry_ready(ctrl, target, cancel=cancel)
         take_laser_zero(ctrl, target)
         target_c = ctrl.temperature_target_c(target)
-        wait_thermal_locked(ctrl, target, target_c)
+        wait_thermal_locked(ctrl, target, target_c, cancel=cancel)
         prior_tick = None
         for dac in values:
+            check_cancel(cancel)
             reply = require_ok(ctrl.manual_command(
                 target, MANUAL_SET, CHANNEL_LASER_DAC, dac), "SET")
             set_ack_at = time.monotonic()
             board, link_flags = wait_fresh_pd(
-                ctrl, target, prior_tick, set_ack_at)
+                ctrl, target, prior_tick, set_ack_at, cancel=cancel)
             prior_tick = board.pd_sample_tick_ms
             row = {
                 "target": target, "dac_requested": dac,

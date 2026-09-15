@@ -11,8 +11,8 @@ from ultracoustics._internal.control import (
     parse_manual_response, parse_runtime_metrics,
 )
 from examples.manual_laser_sweep import write_results
-from ultracoustics.manual_sweep import (pd_is_fresh, run_manual_sweep,
-                                        take_laser_zero)
+from ultracoustics.manual_sweep import (ManualSweepError, pd_is_fresh,
+                                        run_manual_sweep, take_laser_zero)
 
 
 def manual_response(transport=0, target=638, txn=7, opcode=MANUAL_SET,
@@ -70,6 +70,7 @@ class ControlParserTests(unittest.TestCase):
 
 class FakeStream:
     running = True
+    _selected_stream_format = 0
 
     def __init__(self, reply):
         self.reply = reply
@@ -78,6 +79,9 @@ class FakeStream:
     def _request_stream_control(self, payload, kind, timeout_s=1.0):
         self.request = (payload, kind, timeout_s)
         return {"firmware_response": self.reply}
+
+    def get_telemetry(self):
+        return None
 
 
 class ControllerControlTests(unittest.TestCase):
@@ -90,6 +94,19 @@ class ControllerControlTests(unittest.TestCase):
         self.assertEqual(ctrl._stream.request[1], "manual")
         with self.assertRaises(ValueError):
             ctrl.manual_command(638, MANUAL_SET, CHANNEL_LASER_DAC, 33001)
+
+    def test_begin_manual_legacy_settle_covers_bootloader_and_poll_gate(self):
+        ctrl = Controller()
+        ctrl._stream = FakeStream(None)
+        ctrl._running = False
+        metrics = SimpleNamespace(current_state=0)
+        ctrl.stop_confirmed = mock.Mock()
+        ctrl.runtime_metrics = mock.Mock(return_value=metrics)
+        ctrl._send_confirmed = mock.Mock(return_value={
+            "bulk_write_completed_monotonic_ns": 1})
+        with mock.patch("ultracoustics.controller.time.sleep") as sleep:
+            ctrl.begin_manual(1550)
+        sleep.assert_called_once_with(1.25)
 
     def test_pd_freshness_includes_host_age_and_faults(self):
         board = SimpleNamespace(pd_sample_tick_ms=2, pd_valid=True,
@@ -155,6 +172,22 @@ class ControllerControlTests(unittest.TestCase):
                                     on_point=emitted.append)
         self.assertEqual(rows, emitted)
         self.assertEqual([row["dac_requested"] for row in rows], [0, 33000])
+        self.assertTrue(ctrl.finished)
+
+    def test_public_sweep_cancel_still_finishes_manual(self):
+        class SweepController:
+            connected = True
+            streaming = True
+            finished = False
+            def stop_confirmed(self): pass
+            def enable_telemetry(self): pass
+            def begin_manual(self, target): pass
+            def finish_manual(self, target): self.finished = True
+
+        ctrl = SweepController()
+        with self.assertRaises(ManualSweepError) as caught:
+            run_manual_sweep(ctrl, 638, cancel=lambda: True)
+        self.assertIn("canceled", str(caught.exception))
         self.assertTrue(ctrl.finished)
 
 

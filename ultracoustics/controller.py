@@ -363,12 +363,38 @@ class Controller:
                              timeout_s=timeout_s)
         self._send_confirmed(CMD_TRIGGER, wValue=0, wIndex=TARGET_1550,
                              timeout_s=timeout_s)
-        self._send_confirmed(CMD_POWER, wValue=1, wIndex=target,
-                             timeout_s=timeout_s)
-        # The GUI calls TAKE(0) immediately after this method. Keep this
-        # minimum boot/poll settle here; telemetry-gated clients may add a
-        # stronger readiness check before any nonzero output.
-        time.sleep(0.5)
+        baseline = self.telemetry
+        power_result = self._send_confirmed(
+            CMD_POWER, wValue=1, wIndex=target, timeout_s=timeout_s)
+        if self._stream._selected_stream_format == 1:
+            baseline_tick = None
+            if baseline is not None:
+                baseline_board = (baseline.board_638 if target == TARGET_638
+                                  else baseline.board_1550)
+                baseline_tick = baseline_board.temperature_sample_tick_ms
+            power_ack_ns = power_result["bulk_write_completed_monotonic_ns"]
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                snapshot = self.telemetry
+                if snapshot is not None and snapshot.received_monotonic_ns > power_ack_ns:
+                    board = (snapshot.board_638 if target == TARGET_638
+                             else snapshot.board_1550)
+                    link = (snapshot.link_flags_638 if target == TARGET_638
+                            else snapshot.link_flags_1550)
+                    physical_age = (board.temperature_age_ms +
+                                    snapshot.host_age_s * 1000.0)
+                    if (link == 0 and board.temperature_valid and
+                            not board.temperature_stale and
+                            board.temperature_fault == 0 and
+                            physical_age < 500.0 and
+                            board.temperature_sample_tick_ms != baseline_tick):
+                        break
+                time.sleep(0.01)
+            else:
+                raise TimeoutError("no fresh target telemetry after manual power-on")
+        else:
+            # 1550 bootloader waits 1 s; retain another 250 ms for master poll.
+            time.sleep(1.25)
         return metrics
 
     def finish_manual(self, target: int, timeout_s: float = 1.0):
