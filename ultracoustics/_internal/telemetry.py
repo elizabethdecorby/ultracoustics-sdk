@@ -156,6 +156,7 @@ class TelemetrySnapshot:
     board_1550: Optional[BoardTelemetry]
     link_flags_638: int = 0
     link_flags_1550: int = 0
+    wire_format: int = 1
     optical_live_638: Optional[CachedOpticalPage] = None
     optical_acquisition_638: Optional[CachedOpticalPage] = None
     optical_abba_638: Optional[CachedOpticalPage] = None
@@ -267,7 +268,7 @@ def parse_format1_trailer(trailer, *, include_optical=False):
     if offset != trailer_len or board_1550 is None or (board_638 is None and 'optical_raw' not in locals()):
         raise TelemetryFormatError("missing required board telemetry")
     result = (epoch, board_638, board_1550, link_flags_638, link_flags_1550)
-    return result + (locals().get('optical_raw'),) if include_optical else result
+    return result + (locals().get('optical_raw'), version) if include_optical else result
 
 
 def parse_record(raw, expected_format: int, *, received_monotonic_ns: Optional[int] = None) -> ParsedRecord:
@@ -291,11 +292,15 @@ def parse_record(raw, expected_format: int, *, received_monotonic_ns: Optional[i
         return ParsedRecord(sequence, drops_fw, samples, None)
 
     trailer = view[LEGACY_RECORD_BYTES:]
-    epoch, board_638, board_1550, link638, link1550, optical_raw = parse_format1_trailer(
+    epoch, board_638, board_1550, link638, link1550, optical_raw, trailer_version = parse_format1_trailer(
         trailer, include_optical=True)
+    if trailer_version != expected_format:
+        raise TelemetryFormatError(
+            f'format {expected_format} requires trailer version {expected_format}')
     received = time.monotonic_ns() if received_monotonic_ns is None else received_monotonic_ns
     telemetry = TelemetrySnapshot(epoch, sequence, received, board_638,
                                   board_1550, link638, link1550,
+                                  wire_format=expected_format,
                                   optical_page_raw=optical_raw)
     return ParsedRecord(sequence, drops_fw, samples, telemetry)
 
@@ -368,7 +373,7 @@ class TelemetrySidecarWriter:
         self._last_epoch = snapshot.stream_epoch
         struct.pack_into("<QQQ", self._buf, 128, records + 1, errors, changes)
         valid = int(638 in self._boards and 1550 in self._boards)
-        struct.pack_into("<II", self._buf, 152, 2 if snapshot.optical_page_raw else 1, valid)
+        struct.pack_into("<II", self._buf, 152, snapshot.wire_format, valid)
         struct.pack_into("<HH", self._buf, 160,
                          self._boards.get(638, (None, 0))[1],
                          self._boards.get(1550, (None, 0))[1])
@@ -412,6 +417,6 @@ def read_sidecar(shm: SharedMemory) -> tuple[Optional[TelemetrySnapshot], dict]:
         epoch, sequence, received,
         BoardTelemetry.from_bytes(data[24:76]),
         BoardTelemetry.from_bytes(data[76:128]),
-        link638, link1550, *optical,
+        link638, link1550, active_format, *optical,
     )
     return snapshot, stats

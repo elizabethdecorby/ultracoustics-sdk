@@ -45,10 +45,14 @@ def format1_record(seq=12, epoch=3, tlvs=None):
 
 
 def format2_record(kind=3, page_kind=2, seq=12, epoch=3):
-    page = bytearray(52)
-    struct.pack_into('<BBH', page, 0, 1, page_kind, 52)
-    struct.pack_into('<H', page, 50, crc16_ccitt(page[:50]))
-    tlvs = [(kind, bytes(page) + b'\0\0'),
+    if kind == 1:
+        rotating_payload = board_blob(638) + b'\0\0'
+    else:
+        page = bytearray(52)
+        struct.pack_into('<BBH', page, 0, 1, page_kind, 52)
+        struct.pack_into('<H', page, 50, crc16_ccitt(page[:50]))
+        rotating_payload = bytes(page) + b'\0\0'
+    tlvs = [(kind, rotating_payload),
             (2, board_blob(1550) + b'\0\0')]
     legacy = struct.pack('<II', seq, 2) + np.arange(8192, dtype='<u2').tobytes()
     trailer = bytearray(struct.pack('<4sBBHIHH', b'UTL1', 2, 16, 140, epoch, 0, 3))
@@ -199,6 +203,19 @@ class TelemetryParserTests(unittest.TestCase):
             self.assertIsNone(snapshot.optical_live_638)
             self.assertIsNone(snapshot.optical_acquisition_638)
             self.assertIsNotNone(snapshot.optical_abba_638)
+        finally:
+            shm.close(); shm.unlink()
+
+    def test_format2_sensor_records_keep_selected_format(self):
+        shm = SharedMemory(create=True, size=SIDECAR_BYTES)
+        try:
+            initialise_sidecar(shm); writer = TelemetrySidecarWriter(shm)
+            writer.publish(parse_record(format2_record(1, seq=30), 2).telemetry)
+            self.assertEqual(read_sidecar(shm)[1]['active_format'], 2)
+            writer.publish(parse_record(format2_record(3, 2, 31), 2).telemetry)
+            self.assertEqual(read_sidecar(shm)[1]['active_format'], 2)
+            with self.assertRaisesRegex(TelemetryFormatError, 'trailer version'):
+                parse_record(format2_record(1), 1)
         finally:
             shm.close(); shm.unlink()
 
