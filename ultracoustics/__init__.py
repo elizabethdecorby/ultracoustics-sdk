@@ -27,6 +27,7 @@ from .characterization import (
     detect_resonance_dips,
     analyze_dips,
 )
+from .manual_sweep import ManualSweepError, run_manual_sweep
 
 __all__ = [
     "__version__",
@@ -55,4 +56,6 @@ __all__ = [
     "apply_laser_calibration",
     "detect_resonance_dips",
     "analyze_dips",
+    "ManualSweepError",
+    "run_manual_sweep",
 ]

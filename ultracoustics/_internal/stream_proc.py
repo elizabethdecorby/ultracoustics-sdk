@@ -68,6 +68,8 @@ from .telemetry import (
     TelemetryFormatError, TelemetrySidecarWriter, parse_capabilities,
     parse_format_ack, parse_record,
 )
+from .control import (ControlProtocolError, parse_manual_response,
+                      parse_runtime_metrics)
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +449,7 @@ def reader_main(
             if status == usb1.TRANSFER_COMPLETED:
                 length = transfer.getActualLength()
                 raw = transfer.getBuffer()[:length]
-                if pending_control is not None and length in (16, 24):
+                if pending_control is not None and length in (16, 24, 32, 72):
                     request_id, response_kind, requested_format, delivery, _deadline = pending_control
                     try:
                         if response_kind == "capabilities":
@@ -463,9 +465,13 @@ def reader_main(
                                     telemetry_writer.reset_to_legacy()
                                 else:
                                     telemetry_writer.select_format(requested_format)
+                        elif response_kind == "manual":
+                            response = parse_manual_response(bytes(raw))
+                        elif response_kind == "runtime":
+                            response = parse_runtime_metrics(bytes(raw))
                         else:
                             raise TelemetryFormatError("unknown pending control response")
-                    except TelemetryFormatError as exc:
+                    except (TelemetryFormatError, ControlProtocolError) as exc:
                         delivery = {**delivery, "transport_status": "failed",
                                     "error": str(exc)}
                     else:

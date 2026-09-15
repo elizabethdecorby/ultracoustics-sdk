@@ -48,9 +48,14 @@ from ._internal.protocol import (
     CMD_BOOT, CMD_IDLE, CMD_WARM,
     CMD_OVERRIDE_ENTER, CMD_POWER, CMD_TRIGGER, CMD_PROBE_CHAR,
     CMD_STREAM_CAPABILITIES, CMD_STREAM_FORMAT,
+    CMD_RUNTIME_METRICS, CMD_MANUAL_CONTROL,
     TARGET_1550, TARGET_638,
 )
 from ._internal.maintenance import LaserSerialController
+from ._internal.control import (
+    CHANNEL_LASER_DAC, CHANNEL_TEMPERATURE, MANUAL_GET, MANUAL_RELEASE,
+    MANUAL_SET, MANUAL_TAKE, pack_manual_request,
+)
 from .config import SAMPLE_RATE, ADC_MAX_VALUE
 from .characterization import bin_ramp, ProbeCharacterizationResult
 from .processing import compute_noise_metrics
@@ -143,6 +148,7 @@ class Controller:
         self._connected = False
         self._packet_diagnostics_path = packet_diagnostics_path
         self._packet_diagnostics_attach_s = packet_diagnostics_attach_s
+        self._manual_transaction = 0
 
         # Ring capacity in samples, sized from ring_seconds. Lives in shared
         # memory once the stream subprocess is spawned (allocated by USBStream)
@@ -298,6 +304,103 @@ class Controller:
         self._stream.select_stream_format_confirmed(
             pack_command(CMD_STREAM_FORMAT, 0, 0), 0, timeout_s=timeout_s,
         )
+
+    def runtime_metrics(self, timeout_s: float = 1.0):
+        """Return the retained runtime window after an explicit STOP/IDLE."""
+        if self._running:
+            raise RuntimeError("runtime metrics require an explicit stop() first")
+        if self._stream is None or not self._stream.running:
+            raise RuntimeError("call begin_stream() before requesting runtime metrics")
+        from ._internal.protocol import pack_command
+        result = self._stream._request_stream_control(
+            pack_command(CMD_RUNTIME_METRICS), "runtime", timeout_s=timeout_s)
+        return result["firmware_response"]
+
+    def manual_command(self, target: int, opcode: int, channel: int,
+                       value: int = 0, timeout_s: float = 1.0):
+        """Execute one manual slave transaction and validate its full identity."""
+        if target not in (TARGET_638, TARGET_1550):
+            raise ValueError("target must be 638 or 1550")
+        if opcode in (MANUAL_TAKE, MANUAL_SET) and channel == CHANNEL_LASER_DAC:
+            cap = 33000 if target == TARGET_638 else 43253
+            if not 0 <= value <= cap:
+                raise ValueError(f"laser DAC must be between 0 and {cap}")
+        if self._stream is None or not self._stream.running:
+            raise RuntimeError("call begin_stream() before manual control")
+        self._manual_transaction = (self._manual_transaction + 1) & 0xFF
+        txn = self._manual_transaction
+        request = pack_manual_request(opcode, channel, value, txn)
+        from ._internal.protocol import pack_command
+        result = self._stream._request_stream_control(
+            pack_command(CMD_MANUAL_CONTROL, 0, target) + request,
+            "manual", timeout_s=timeout_s)
+        reply = result["firmware_response"]
+        if (reply.target, reply.transaction, reply.opcode, reply.channel) != (
+                target, txn, opcode, channel):
+            raise RuntimeError("manual response does not match the request identity")
+        reply.require_transport()
+        return reply
+
+    def temperature_target_c(self, target: int, timeout_s: float = 1.0) -> float:
+        """Read temperature and enforce the current 24–26 C bench contract."""
+        reply = self.manual_command(target, MANUAL_GET, CHANNEL_TEMPERATURE,
+                                    timeout_s=timeout_s)
+        if reply.status != 0:
+            raise RuntimeError(f"temperature GET rejected with status {reply.status}")
+        value = reply.applied_value / 1000.0
+        if not 24.0 <= value <= 26.0:
+            raise RuntimeError(f"bench temperature {value:.3f} C is outside 24-26 C")
+        return value
+
+    def begin_manual(self, target: int, timeout_s: float = 1.0):
+        """Confirm IDLE, enter override, lower triggers, and power one target."""
+        self.stop_confirmed(timeout_s=timeout_s)
+        metrics = self.runtime_metrics(timeout_s=timeout_s)
+        if metrics.current_state != 0:
+            raise RuntimeError(f"master did not confirm IDLE (state={metrics.current_state})")
+        self._send_confirmed(CMD_OVERRIDE_ENTER, wValue=1, timeout_s=timeout_s)
+        self._send_confirmed(CMD_TRIGGER, wValue=0, wIndex=TARGET_638,
+                             timeout_s=timeout_s)
+        self._send_confirmed(CMD_TRIGGER, wValue=0, wIndex=TARGET_1550,
+                             timeout_s=timeout_s)
+        self._send_confirmed(CMD_POWER, wValue=1, wIndex=target,
+                             timeout_s=timeout_s)
+        # The GUI calls TAKE(0) immediately after this method. Keep this
+        # minimum boot/poll settle here; telemetry-gated clients may add a
+        # stronger readiness check before any nonzero output.
+        time.sleep(0.5)
+        return metrics
+
+    def finish_manual(self, target: int, timeout_s: float = 1.0):
+        """Zero/release the laser channel, power down, and confirm final IDLE."""
+        errors = []
+        for name, action in (
+            ("zero", lambda: self.manual_command(
+                target, MANUAL_SET, CHANNEL_LASER_DAC, 0, timeout_s)),
+            ("release", lambda: self.manual_command(
+                target, MANUAL_RELEASE, CHANNEL_LASER_DAC, 0, timeout_s)),
+            ("power off", lambda: self._send_confirmed(
+                CMD_POWER, wValue=0, wIndex=target, timeout_s=timeout_s)),
+            ("exit override", lambda: self._send_confirmed(
+                CMD_OVERRIDE_ENTER, wValue=0, timeout_s=timeout_s)),
+        ):
+            try:
+                reply = action()
+                if hasattr(reply, "status") and reply.status != 0:
+                    raise RuntimeError(f"slave status {reply.status}")
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+        try:
+            self.stop_confirmed(timeout_s=timeout_s)
+            metrics = self.runtime_metrics(timeout_s=timeout_s)
+            if metrics.current_state != 0:
+                raise RuntimeError(f"state={metrics.current_state}")
+        except Exception as exc:
+            errors.append(f"IDLE confirmation: {exc}")
+            metrics = None
+        if errors:
+            raise RuntimeError("manual shutdown incomplete: " + "; ".join(errors))
+        return metrics
 
     # -- State management -----------------------------------------------------
 

@@ -26,6 +26,8 @@ CMD_FWINFO = ord('i')       # Query master board firmware version
 CMD_PROBE_CHAR = ord('Z')   # Probe characterization: stamp SPI command_id (1=start, 0=stop)
 CMD_STREAM_CAPABILITIES = ord('c')  # IDLE-only negotiated stream capability query
 CMD_STREAM_FORMAT = ord('x')        # IDLE-only exact stream format selection (0/1)
+CMD_RUNTIME_METRICS = ord('r')      # IDLE-only fixed runtime snapshot
+CMD_MANUAL_CONTROL = ord('j')       # Leased manual command relay
 
 # Target IDs for Manual Control
 TARGET_1550 = 1550
