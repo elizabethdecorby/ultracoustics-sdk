@@ -347,6 +347,24 @@ class Controller:
         except Exception:
             pass
 
+    def stop_confirmed(self, timeout_s: float = 1.0) -> dict:
+        """Request IDLE and require bounded confirmation of USB delivery.
+
+        A successful result proves only that the complete command packet was
+        delivered by the host USB transport.  It is not an acknowledgement
+        that firmware received or applied IDLE, and it does not measure the
+        actuator or laser state.
+
+        ``running`` is cleared only after confirmed transport delivery.  A
+        failed or uncertain delivery raises and preserves the prior state.
+        The full transport result is returned for diagnostic provenance.
+        """
+        result = self._send_confirmed(CMD_IDLE, timeout_s=timeout_s)
+        if result.get("transport_status") != "delivered":
+            raise RuntimeError("IDLE command transport was not confirmed delivered")
+        self._running = False
+        return result
+
     def warm(self):
         """Enter the WARM / standby state. Lasers off but system still powered, allowing faster startup than BOOT."""
         self._ensure_connected()
