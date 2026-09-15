@@ -199,6 +199,10 @@ class SystemControlMixin:
                 self.system_manual_command(638, MANUAL_TAKE, CHANNEL_OPTICAL, 0, timeout_s)
             command = self.system_manual_command
         else:
+            if action not in ('reacquire', 'retune'):
+                raise RuntimeError(
+                    'Automatic RUN accepts only reacquire or retune; '
+                    'start and abort require a manual optical lease')
             command = self.manual_command
         return require_applied(command(638, MANUAL_SET, CHANNEL_OPTICAL,
                                        OPTICAL_ACTIONS[action], timeout_s))
@@ -208,6 +212,31 @@ class SystemControlMixin:
         if action not in ('start', 'abort'):
             raise ValueError('Lock action must be start or abort')
         return self.control_638(action, timeout_s)
+
+    def capture_638_action(self, action, pre_s=.5, post_s=.5, timeout_s=1.0):
+        """Capture bounded ring-buffer windows around one automatic lock action.
+
+        This reuses the controller's existing stream and USB owner. It creates
+        no reader, background queue, or unbounded recording.
+        """
+        if action not in ('reacquire', 'retune'):
+            raise ValueError('Captured automatic action must be reacquire or retune')
+        if not 0 < pre_s <= 2 or not 0 < post_s <= 2:
+            raise ValueError('pre_s and post_s must each be within 0..2 seconds')
+        if not getattr(self, 'streaming', False):
+            raise RuntimeError('An active stream is required for action capture')
+        before = self.save(pre_s)
+        acknowledgement = self.control_638(action, timeout_s)
+        time.sleep(post_s)
+        after = self.save(post_s)
+        snapshot = self.telemetry
+        return {
+            'action': action, 'acknowledgement': acknowledgement,
+            'pre_samples': before, 'post_samples': after,
+            'live': getattr(snapshot, 'optical_live_638', None),
+            'acquisition': getattr(snapshot, 'optical_acquisition_638', None),
+            'abba': getattr(snapshot, 'optical_abba_638', None),
+        }
 
     def read_state_638(self, timeout_s=1.0):
         reply = self.system_manual_command(638, MANUAL_GET, CHANNEL_OPTICAL, timeout_s=timeout_s)

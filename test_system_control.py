@@ -33,13 +33,29 @@ class SystemControlTests(unittest.TestCase):
   self.assertFalse(f.calls)
  def test_automatic_optical_actions_route_without_take_or_stop(self):
   f=Fake();f._system_manual_active=False;f._system_manual_owned=set()
-  for action,value in [('abort',0),('start',1),('reacquire',2),('retune',3)]:
+  for action,value in [('reacquire',2),('retune',3)]:
    f.control_638(action)
    self.assertEqual(f.calls[-1],(638,MANUAL_SET,3,value))
   self.assertFalse(any(c[0]=='stop' for c in f.calls))
+  for action in ('start','abort'):
+   with self.assertRaisesRegex(RuntimeError,'only reacquire or retune'):
+    f.control_638(action)
+ def test_manual_start_abort_compatibility(self):
+  f=Fake();f._system_manual_owned={(638,3),(1550,2)}
+  f.lock_638('start');f.lock_638('abort')
+  self.assertEqual(f.calls,[(638,MANUAL_SET,3,1),(638,MANUAL_SET,3,0)])
  def test_manual_optical_owner_uses_existing_lease(self):
   f=Fake();f._system_manual_owned={(638,3),(1550,2)}
   f.control_638('reacquire')
+  self.assertEqual(f.calls,[(638,MANUAL_SET,3,2)])
+ def test_action_capture_reuses_stream_and_bounds_windows(self):
+  f=Fake();f._system_manual_active=False;f._system_manual_owned=set();f.streaming=True
+  f.save=lambda duration: ('samples',duration)
+  f.telemetry=SimpleNamespace(optical_live_638='live',optical_acquisition_638='acq',optical_abba_638='abba')
+  with patch('ultracoustics.system_control.time.sleep') as sleep:
+   result=f.capture_638_action('reacquire')
+  self.assertEqual(result['pre_samples'],('samples',.5));self.assertEqual(result['post_samples'],('samples',.5))
+  self.assertEqual(result['acquisition'],'acq');sleep.assert_called_once_with(.5)
   self.assertEqual(f.calls,[(638,MANUAL_SET,3,2)])
  def test_gain_validation_before_writes_and_zero(self):
   f=Fake()
