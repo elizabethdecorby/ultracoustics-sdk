@@ -143,23 +143,31 @@ def wait_fresh_pd(ctrl, target, prior_tick, set_ack_at, timeout_s=2.0,
         snapshot = ctrl.telemetry
         if snapshot is not None:
             board, link_flags = selected_board(snapshot, target)
-            if elapsed >= 0.6 and pd_is_fresh(
-                    snapshot, board, link_flags, prior_tick, int(elapsed * 1000)):
+            # A changed sensor tick plus physical age below time since SET is
+            # direct causality evidence; do not impose extra host-side delay.
+            if pd_is_fresh(snapshot, board, link_flags, prior_tick,
+                           int(elapsed * 1000)):
                 return board, link_flags
         time.sleep(0.02)
     raise TimeoutError("no new, bounded-age, link-healthy 4 Hz PD sample")
 
 
-def run_manual_sweep(ctrl, target, points=6, on_point=None, cancel=None):
+def run_manual_sweep(ctrl, target, points=100, max_dac=None, on_point=None,
+                     cancel=None):
     """Run one bounded sweep and return accepted raw-count row dictionaries."""
     if target not in CAPS:
         raise ValueError("target must be 638 or 1550")
-    if not 2 <= points <= 8:
-        raise ValueError("points must be between 2 and 8")
+    if not isinstance(points, int) or isinstance(points, bool) or not 2 <= points <= 1000:
+        raise ValueError("points must be an integer between 2 and 1000")
     if not ctrl.connected:
         raise RuntimeError("Controller must be connected")
     cap = CAPS[target]
-    values = [round(cap * index / (points - 1)) for index in range(points)]
+    if max_dac is None:
+        max_dac = cap
+    if (not isinstance(max_dac, int) or isinstance(max_dac, bool) or
+            not 0 <= max_dac <= cap):
+        raise ValueError(f"max_dac must be an integer between 0 and {cap}")
+    values = [round(max_dac * index / (points - 1)) for index in range(points)]
     rows = []
     primary = None
     cleanup = None

@@ -37,7 +37,8 @@ def write_results(output, target, rows, error=None, cleanup_error=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", type=int, required=True, choices=(638, 1550))
-    parser.add_argument("--points", type=int, default=8, choices=range(2, 9))
+    parser.add_argument("--points", type=int, default=100, choices=range(2, 1001))
+    parser.add_argument("--max-dac", type=int)
     parser.add_argument("--output", type=Path, default=Path("manual_sweeps"))
     args = parser.parse_args()
     ctrl = Controller()
@@ -46,7 +47,8 @@ def main():
     cleanup_error = None
     try:
         ctrl.connect()
-        rows = run_manual_sweep(ctrl, args.target, args.points)
+        rows = run_manual_sweep(ctrl, args.target, args.points,
+                                max_dac=args.max_dac)
     except ManualSweepError as exc:
         rows = exc.rows
         error = exc.primary_error

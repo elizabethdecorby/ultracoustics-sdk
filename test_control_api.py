@@ -12,7 +12,8 @@ from ultracoustics._internal.control import (
 )
 from examples.manual_laser_sweep import write_results
 from ultracoustics.manual_sweep import (ManualSweepError, pd_is_fresh,
-                                        run_manual_sweep, take_laser_zero)
+                                        run_manual_sweep, take_laser_zero,
+                                        wait_fresh_pd)
 
 
 def manual_response(transport=0, target=638, txn=7, opcode=MANUAL_SET,
@@ -235,6 +236,53 @@ class ControllerControlTests(unittest.TestCase):
         self.assertEqual(rows[0]["sample_tick_ms"], 1)
         self.assertRegex(rows[0]["captured_at_utc"], r"\+00:00$")
         self.assertTrue(ctrl.finished)
+
+    def test_public_sweep_supports_1000_points_and_bounded_max_dac(self):
+        board = SimpleNamespace(pd_sample_tick_ms=1, pd_raw_average=100,
+                                pd_age_ms=10, pd_flags=1, pd_fault=0,
+                                pd_full_scale=4095, temperature_mdegc=25000)
+
+        class SweepController:
+            connected = True
+            streaming = True
+            def stop_confirmed(self): pass
+            def enable_telemetry(self): pass
+            def begin_manual(self, target): pass
+            def temperature_target_c(self, target): return 25.0
+            def finish_manual(self, target): pass
+            def manual_command(self, target, opcode, channel, value=0):
+                return SimpleNamespace(status=0, applied_value=value)
+
+        with mock.patch("ultracoustics.manual_sweep.wait_telemetry_ready"), \
+             mock.patch("ultracoustics.manual_sweep.take_laser_zero"), \
+             mock.patch("ultracoustics.manual_sweep.wait_thermal_locked"), \
+             mock.patch("ultracoustics.manual_sweep.wait_fresh_pd",
+                        return_value=(board, 0)):
+            rows = run_manual_sweep(SweepController(), 638, points=1000,
+                                    max_dac=12000)
+        self.assertEqual(len(rows), 1000)
+        self.assertEqual((rows[0]["dac_requested"], rows[-1]["dac_requested"]),
+                         (0, 12000))
+        with self.assertRaises(ValueError):
+            run_manual_sweep(SweepController(), 638, max_dac=33001)
+
+    def test_fresh_pd_returns_as_soon_as_causality_is_proven(self):
+        board = SimpleNamespace(pd_sample_tick_ms=2, pd_valid=True,
+                                pd_stale=False, pd_backend_disabled=False,
+                                pd_fault=0, pd_age_ms=100,
+                                temperature_valid=True,
+                                temperature_stale=False, temperature_fault=0)
+        snapshot = SimpleNamespace(board_638=board, link_flags_638=0,
+                                   host_age_s=0.01, host_stale=False)
+        ctrl = SimpleNamespace(telemetry=snapshot)
+        with mock.patch("ultracoustics.manual_sweep.time.monotonic",
+                        side_effect=(0.0, 0.1, 0.3)), \
+             mock.patch("ultracoustics.manual_sweep.time.sleep") as sleep:
+            result, link = wait_fresh_pd(ctrl, 638, prior_tick=1,
+                                         set_ack_at=0.0)
+        self.assertIs(result, board)
+        self.assertEqual(link, 0)
+        sleep.assert_not_called()
 
     def test_public_sweep_reports_board_specific_saturation_before_raising(self):
         board = SimpleNamespace(pd_sample_tick_ms=7, pd_raw_average=2042,
