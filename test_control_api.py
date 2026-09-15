@@ -201,7 +201,40 @@ class ControllerControlTests(unittest.TestCase):
                                     on_point=emitted.append)
         self.assertEqual(rows, emitted)
         self.assertEqual([row["dac_requested"] for row in rows], [0, 33000])
+        self.assertEqual(rows[0]["pd_full_scale_counts"], 4095)
+        self.assertFalse(rows[0]["saturated"])
+        self.assertEqual(rows[0]["sample_tick_ms"], 1)
+        self.assertRegex(rows[0]["captured_at_utc"], r"\+00:00$")
         self.assertTrue(ctrl.finished)
+
+    def test_public_sweep_reports_board_specific_saturation_before_raising(self):
+        board = SimpleNamespace(pd_sample_tick_ms=7, pd_raw_average=2042,
+                                pd_age_ms=10, pd_flags=1, pd_fault=0,
+                                pd_full_scale=2047, temperature_mdegc=25000)
+
+        class SweepController:
+            connected = True
+            streaming = True
+            def stop_confirmed(self): pass
+            def enable_telemetry(self): pass
+            def begin_manual(self, target): pass
+            def temperature_target_c(self, target): return 25.0
+            def finish_manual(self, target): pass
+            def manual_command(self, target, opcode, channel, value=0):
+                return SimpleNamespace(status=0, applied_value=value)
+
+        emitted = []
+        with mock.patch("ultracoustics.manual_sweep.wait_telemetry_ready"), \
+             mock.patch("ultracoustics.manual_sweep.take_laser_zero"), \
+             mock.patch("ultracoustics.manual_sweep.wait_thermal_locked"), \
+             mock.patch("ultracoustics.manual_sweep.wait_fresh_pd",
+                        return_value=(board, 0)):
+            with self.assertRaises(ManualSweepError) as caught:
+                run_manual_sweep(SweepController(), 638, points=2,
+                                 on_point=emitted.append)
+        self.assertTrue(caught.exception.rows[0]["saturated"])
+        self.assertEqual(caught.exception.rows[0]["pd_full_scale_counts"], 2047)
+        self.assertEqual(emitted, caught.exception.rows)
 
     def test_public_sweep_cancel_still_finishes_manual(self):
         class SweepController:

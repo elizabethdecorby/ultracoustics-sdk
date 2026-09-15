@@ -11,6 +11,7 @@ from ultracoustics import Controller
 from ultracoustics.manual_sweep import ManualSweepError, run_manual_sweep
 
 FIELDS = ("target", "dac_requested", "dac_applied", "pd_raw_counts",
+          "pd_full_scale_counts", "saturated", "sample_tick_ms", "captured_at_utc",
           "pd_age_ms", "pd_flags", "pd_fault", "link_flags",
           "temperature_target_c", "temperature_measured_c")
 

@@ -1,5 +1,6 @@
 """Reusable, safety-bounded master-USB laser sweep policy."""
 
+from datetime import datetime, timezone
 import time
 
 from ._internal.control import (
@@ -180,11 +181,17 @@ def run_manual_sweep(ctrl, target, points=6, on_point=None, cancel=None):
             set_ack_at = time.monotonic()
             board, link_flags = wait_fresh_pd(
                 ctrl, target, prior_tick, set_ack_at, cancel=cancel)
+            captured_at_utc = datetime.now(timezone.utc).isoformat()
             prior_tick = board.pd_sample_tick_ms
+            saturation_limit = min(4090, max(0, board.pd_full_scale - 5))
             row = {
                 "target": target, "dac_requested": dac,
                 "dac_applied": reply.applied_value,
                 "pd_raw_counts": board.pd_raw_average,
+                "pd_full_scale_counts": board.pd_full_scale,
+                "saturated": board.pd_raw_average >= saturation_limit,
+                "sample_tick_ms": board.pd_sample_tick_ms,
+                "captured_at_utc": captured_at_utc,
                 "pd_age_ms": board.pd_age_ms, "pd_flags": board.pd_flags,
                 "pd_fault": board.pd_fault, "link_flags": link_flags,
                 "temperature_target_c": target_c,
@@ -193,8 +200,7 @@ def run_manual_sweep(ctrl, target, points=6, on_point=None, cancel=None):
             rows.append(row)
             if on_point is not None:
                 on_point(dict(row))
-            saturation_limit = min(4090, max(0, board.pd_full_scale - 5))
-            if board.pd_raw_average >= saturation_limit:
+            if row["saturated"]:
                 raise RuntimeError(
                     f"photodiode saturated at {board.pd_raw_average} counts")
     except Exception as exc:
