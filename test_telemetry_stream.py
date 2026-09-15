@@ -44,14 +44,14 @@ def format1_record(seq=12, epoch=3, tlvs=None):
     return legacy + trailer
 
 
-def format2_record(kind=3, page_kind=2, seq=12, epoch=3):
+def format2_record(kind=3, page_kind=2, seq=12, epoch=3, page_age_ms=0):
     if kind == 1:
         rotating_payload = board_blob(638) + b'\0\0'
     else:
         page = bytearray(52)
         struct.pack_into('<BBH', page, 0, 1, page_kind, 52)
         struct.pack_into('<H', page, 50, crc16_ccitt(page[:50]))
-        rotating_payload = bytes(page) + b'\0\0'
+        rotating_payload = bytes(page) + struct.pack('<H', page_age_ms)
     tlvs = [(kind, rotating_payload),
             (2, board_blob(1550) + b'\0\0')]
     legacy = struct.pack('<II', seq, 2) + np.arange(8192, dtype='<u2').tobytes()
@@ -216,6 +216,22 @@ class TelemetryParserTests(unittest.TestCase):
             self.assertEqual(read_sidecar(shm)[1]['active_format'], 2)
             with self.assertRaisesRegex(TelemetryFormatError, 'trailer version'):
                 parse_record(format2_record(1), 1)
+        finally:
+            shm.close(); shm.unlink()
+
+    def test_optical_master_age_is_included_in_host_staleness(self):
+        shm = SharedMemory(create=True, size=SIDECAR_BYTES)
+        try:
+            initialise_sidecar(shm); writer = TelemetrySidecarWriter(shm)
+            now = time.monotonic_ns()
+            writer.publish(parse_record(format2_record(1, epoch=7), 2,
+                                        received_monotonic_ns=now).telemetry)
+            writer.publish(parse_record(format2_record(3, 2, epoch=7,
+                                                       page_age_ms=600), 2,
+                                        received_monotonic_ns=now).telemetry)
+            snapshot, _ = read_sidecar(shm)
+            self.assertTrue(snapshot.optical_live_638.host_stale)
+            self.assertEqual(snapshot.link_flags_638, 0)
         finally:
             shm.close(); shm.unlink()
 

@@ -161,6 +161,7 @@ class TelemetrySnapshot:
     optical_acquisition_638: Optional[CachedOpticalPage] = None
     optical_abba_638: Optional[CachedOpticalPage] = None
     optical_page_raw: Optional[bytes] = None
+    optical_page_age_ms: int = 0
 
     @property
     def host_age_s(self) -> float:
@@ -262,13 +263,14 @@ def parse_format1_trailer(trailer, *, include_optical=False):
             if not isinstance(page, expected):
                 raise TelemetryFormatError('optical TLV type does not match page type')
             optical_raw = payload[:52]
-            link_flags_638, = struct.unpack_from('<H', payload, 52)
+            optical_age_ms, = struct.unpack_from('<H', payload, 52)
         elif not (tlv_type & OPTIONAL_TLV_BIT):
             raise TelemetryFormatError(f"unknown required TLV {tlv_type:#x}")
     if offset != trailer_len or board_1550 is None or (board_638 is None and 'optical_raw' not in locals()):
         raise TelemetryFormatError("missing required board telemetry")
     result = (epoch, board_638, board_1550, link_flags_638, link_flags_1550)
-    return result + (locals().get('optical_raw'), version) if include_optical else result
+    return result + (locals().get('optical_raw'),
+                     locals().get('optical_age_ms', 0), version) if include_optical else result
 
 
 def parse_record(raw, expected_format: int, *, received_monotonic_ns: Optional[int] = None) -> ParsedRecord:
@@ -292,7 +294,7 @@ def parse_record(raw, expected_format: int, *, received_monotonic_ns: Optional[i
         return ParsedRecord(sequence, drops_fw, samples, None)
 
     trailer = view[LEGACY_RECORD_BYTES:]
-    epoch, board_638, board_1550, link638, link1550, optical_raw, trailer_version = parse_format1_trailer(
+    epoch, board_638, board_1550, link638, link1550, optical_raw, optical_age_ms, trailer_version = parse_format1_trailer(
         trailer, include_optical=True)
     if trailer_version != expected_format:
         raise TelemetryFormatError(
@@ -301,7 +303,8 @@ def parse_record(raw, expected_format: int, *, received_monotonic_ns: Optional[i
     telemetry = TelemetrySnapshot(epoch, sequence, received, board_638,
                                   board_1550, link638, link1550,
                                   wire_format=expected_format,
-                                  optical_page_raw=optical_raw)
+                                  optical_page_raw=optical_raw,
+                                  optical_page_age_ms=optical_age_ms)
     return ParsedRecord(sequence, drops_fw, samples, telemetry)
 
 
@@ -364,8 +367,10 @@ class TelemetrySidecarWriter:
             slot = (0 if isinstance(page, OpticalLive) else
                     1 if isinstance(page, OpticalAcquisition) else 2)
             offset = _OPTICAL_SLOT_OFFSETS[slot]
+            source_received = max(
+                0, snapshot.received_monotonic_ns - snapshot.optical_page_age_ms * 1_000_000)
             struct.pack_into('<IIIQ', self._buf, offset, 1, snapshot.stream_epoch,
-                             snapshot.record_sequence, snapshot.received_monotonic_ns)
+                             snapshot.record_sequence, source_received)
             self._buf[offset + 20:offset + 72] = snapshot.optical_page_raw
         records, errors, changes = struct.unpack_from("<QQQ", self._buf, 128)
         if self._last_epoch is not None and self._last_epoch != snapshot.stream_epoch:
