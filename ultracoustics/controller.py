@@ -366,6 +366,9 @@ class Controller:
         baseline = self.telemetry
         power_result = self._send_confirmed(
             CMD_POWER, wValue=1, wIndex=target, timeout_s=timeout_s)
+        # Both slave paths may remain in their bootloader for 1 s. Never let
+        # a queued pre-power telemetry snapshot shorten this hardware gate.
+        time.sleep(1.25)
         if self._stream._selected_stream_format == 1:
             baseline_tick = None
             if baseline is not None:
@@ -383,18 +386,18 @@ class Controller:
                             else snapshot.link_flags_1550)
                     physical_age = (board.temperature_age_ms +
                                     snapshot.host_age_s * 1000.0)
+                    elapsed_since_power_ms = max(
+                        0, time.monotonic_ns() - power_ack_ns) / 1_000_000.0
                     if (link == 0 and board.temperature_valid and
                             not board.temperature_stale and
                             board.temperature_fault == 0 and
                             physical_age < 500.0 and
+                            physical_age < elapsed_since_power_ms and
                             board.temperature_sample_tick_ms != baseline_tick):
                         break
                 time.sleep(0.01)
             else:
                 raise TimeoutError("no fresh target telemetry after manual power-on")
-        else:
-            # 1550 bootloader waits 1 s; retain another 250 ms for master poll.
-            time.sleep(1.25)
         return metrics
 
     def finish_manual(self, target: int, timeout_s: float = 1.0):

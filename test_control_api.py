@@ -108,6 +108,35 @@ class ControllerControlTests(unittest.TestCase):
             ctrl.begin_manual(1550)
         sleep.assert_called_once_with(1.25)
 
+    def test_begin_manual_format1_still_observes_minimum_settle(self):
+        ctrl = Controller()
+        stream = FakeStream(None)
+        stream._selected_stream_format = 1
+        ctrl._stream = stream
+        ctrl._running = False
+        baseline = SimpleNamespace(
+            board_638=SimpleNamespace(temperature_sample_tick_ms=10))
+        fresh_board = SimpleNamespace(
+            temperature_sample_tick_ms=11, temperature_age_ms=20,
+            temperature_valid=True, temperature_stale=False,
+            temperature_fault=0)
+        fresh = SimpleNamespace(
+            board_638=fresh_board, link_flags_638=0,
+            received_monotonic_ns=2_000_000_000, host_age_s=0.01)
+        ctrl.stop_confirmed = mock.Mock()
+        ctrl.runtime_metrics = mock.Mock(
+            return_value=SimpleNamespace(current_state=0))
+        ctrl._send_confirmed = mock.Mock(return_value={
+            "bulk_write_completed_monotonic_ns": 1_000_000_000})
+        with mock.patch.object(type(ctrl), "telemetry",
+                               new_callable=mock.PropertyMock,
+                               side_effect=[baseline, fresh]), \
+             mock.patch("ultracoustics.controller.time.sleep") as sleep, \
+             mock.patch("ultracoustics.controller.time.monotonic_ns",
+                        return_value=2_000_000_000):
+            ctrl.begin_manual(638)
+        self.assertEqual(sleep.call_args_list[0], mock.call(1.25))
+
     def test_pd_freshness_includes_host_age_and_faults(self):
         board = SimpleNamespace(pd_sample_tick_ms=2, pd_valid=True,
                                 pd_stale=False, pd_backend_disabled=False,
