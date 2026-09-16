@@ -50,6 +50,12 @@ def format2_record(kind=3, page_kind=2, seq=12, epoch=3, page_age_ms=0):
     else:
         page = bytearray(52)
         struct.pack_into('<BBH', page, 0, 1, page_kind, 52)
+        if page_kind == 5:
+            struct.pack_into('<IHHIHBB', page, 4, 9, 0, 4096,
+                             144_000_000, 1, 2, 12)
+            struct.pack_into('<IHHhH', page, 20, 100, 6000, 20000, 0, 1)
+            struct.pack_into('<IHHhH', page, 32, 200, 6001, 20001, 0, 1)
+            struct.pack_into('<I', page, 44, 1234)
         struct.pack_into('<H', page, 50, crc16_ccitt(page[:50]))
         rotating_payload = bytes(page) + struct.pack('<H', page_age_ms)
     tlvs = [(kind, rotating_payload),
@@ -203,6 +209,10 @@ class TelemetryParserTests(unittest.TestCase):
             self.assertIsNone(snapshot.optical_live_638)
             self.assertIsNone(snapshot.optical_acquisition_638)
             self.assertIsNotNone(snapshot.optical_abba_638)
+            writer.publish(parse_record(format2_record(6, 5, 24, 9), 2).telemetry)
+            snapshot, _ = read_sidecar(shm)
+            self.assertIsNotNone(snapshot.optical_trace_638)
+            self.assertEqual(snapshot.optical_trace_638.page.samples[1].feedback, 6001)
         finally:
             shm.close(); shm.unlink()
 

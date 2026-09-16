@@ -17,7 +17,8 @@ CHANNEL_KI_NEGATIVE = 5
 CHANNEL_KI_POSITIVE = 6
 GAIN_SCALE = 1_000_000
 OPTICAL_STATES = ('IDLE', 'CALIBRATING', 'ROOT_FINDING', 'LOCKED', 'ERROR', 'MEASURE_SLOPE')
-OPTICAL_ACTIONS = {'abort': 0, 'start': 1, 'reacquire': 2, 'retune': 3}
+OPTICAL_ACTIONS = {'abort': 0, 'start': 1, 'reacquire': 2, 'retune': 3,
+                   'trace': 4, 'identify': 5}
 
 
 def require_applied(reply):
@@ -191,7 +192,7 @@ class SystemControlMixin:
         optical lease, but never silently replaces a manually-owned laser DAC.
         """
         if action not in OPTICAL_ACTIONS:
-            raise ValueError('Optical action must be abort, start, reacquire, or retune')
+            raise ValueError('Unknown optical action')
         if self.system_manual_active:
             if (638, CHANNEL_LASER_DAC) in self._system_manual_owned:
                 raise RuntimeError('Release the manually-owned 638 laser DAC before optical control')
@@ -199,9 +200,9 @@ class SystemControlMixin:
                 self.system_manual_command(638, MANUAL_TAKE, CHANNEL_OPTICAL, 0, timeout_s)
             command = self.system_manual_command
         else:
-            if action not in ('reacquire', 'retune'):
+            if action not in ('reacquire', 'retune', 'trace', 'identify'):
                 raise RuntimeError(
-                    'Automatic RUN accepts only reacquire or retune; '
+                    'Automatic RUN accepts only reacquire, retune, trace, or identify; '
                     'start and abort require a manual optical lease')
             command = self.manual_command
         return require_applied(command(638, MANUAL_SET, CHANNEL_OPTICAL,

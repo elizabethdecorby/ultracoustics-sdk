@@ -31,3 +31,21 @@ def test_live_timing_extension_is_optional_and_decodes_when_flagged():
     assert new.dac_busy_completions==2
     assert new.control_exec_max_us==37
     assert new.frame_interval_max_us==401
+def test_trace_page_decodes_records_and_checks_bounds():
+    b=page(PAGE_TRACE)
+    struct.pack_into("<IHHIHBB",b,4,7,4094,4096,144_000_000,5,2,12)
+    struct.pack_into("<IHHhH",b,20,100,6000,20000,-2,1)
+    struct.pack_into("<IHHhH",b,32,200,6001,20002,2,1)
+    struct.pack_into("<I",b,44,1234)
+    struct.pack_into("<H",b,50,crc16_ccitt(b[:50]))
+    trace=parse_page(b)
+    assert trace.capture_id==7 and trace.start_index==4094
+    assert trace.samples[0].injection_dac==-2 and trace.samples[1].actual_dac==20002
+    bad=bytearray(b);struct.pack_into("<H",bad,10,4095);struct.pack_into("<H",bad,50,crc16_ccitt(bad[:50]))
+    with pytest.raises(OpticalDiagnosticError):parse_page(bad)
+    cache=OpticalDiagnosticCache()
+    cache.publish(page(PAGE_ABBA),1,1,100)
+    cache.publish(b,1,2,101)
+    assert cache.abba is not None and cache.trace.page.capture_id==7
+    cache.publish(page(PAGE_LIVE),2,3,102)
+    assert cache.trace is None and cache.abba is None

@@ -33,12 +33,12 @@ class SystemControlTests(unittest.TestCase):
   self.assertFalse(f.calls)
  def test_automatic_optical_actions_route_without_take_or_stop(self):
   f=Fake();f._system_manual_active=False;f._system_manual_owned=set()
-  for action,value in [('reacquire',2),('retune',3)]:
+  for action,value in [('reacquire',2),('retune',3),('trace',4),('identify',5)]:
    f.control_638(action)
    self.assertEqual(f.calls[-1],(638,MANUAL_SET,3,value))
   self.assertFalse(any(c[0]=='stop' for c in f.calls))
   for action in ('start','abort'):
-   with self.assertRaisesRegex(RuntimeError,'only reacquire or retune'):
+   with self.assertRaisesRegex(RuntimeError,'only reacquire, retune, trace, or identify'):
     f.control_638(action)
  def test_manual_start_abort_compatibility(self):
   f=Fake();f._system_manual_owned={(638,3),(1550,2)}

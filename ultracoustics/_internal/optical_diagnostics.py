@@ -10,6 +10,7 @@ VERSION=1
 PAGE_LIVE=2
 PAGE_ACQUISITION=3
 PAGE_ABBA=4
+PAGE_TRACE=5
 
 class OpticalDiagnosticError(ValueError): pass
 
@@ -40,7 +41,14 @@ class OpticalABBA:
     offset_dac:int; settle_ms:int; average_ms:int; slope:float; residual:float
     result:int; old_gain_law:int; new_gain_law:int
     old_kp:float; old_ki:float; new_kp:float; new_ki:float
-OpticalPage=Union[OpticalLive,OpticalAcquisition,OpticalABBA]
+@dataclass(frozen=True)
+class OpticalTraceSample:
+    cycles:int; feedback:int; actual_dac:int; injection_dac:int; flags:int
+@dataclass(frozen=True)
+class OpticalTrace:
+    capture_id:int; start_index:int; total_samples:int; clock_hz:int; flags:int
+    samples:tuple[OpticalTraceSample,...]; start_tick_ms:int
+OpticalPage=Union[OpticalLive,OpticalAcquisition,OpticalABBA,OpticalTrace]
 
 def parse_page(raw:bytes)->OpticalPage:
     if len(raw)!=PAGE_BYTES: raise OpticalDiagnosticError("optical page must be exactly 52 bytes")
@@ -61,6 +69,25 @@ def parse_page(raw:bytes)->OpticalPage:
         offset,settle,average=struct.unpack_from("<hHH",raw,24); slope,residual=struct.unpack_from("<ii",raw,30)
         result,oldlaw,newlaw=struct.unpack_from("<BBB",raw,38); gains=struct.unpack_from("<hhhh",raw,42)
         return OpticalABBA(event,start,end,tuple(readings),offset,settle,average,slope/65536,residual/65536,result,oldlaw,newlaw,*(v/4096 for v in gains))
+    if page_type==PAGE_TRACE:
+        capture,start,total,clock,flags,count,record_bytes=struct.unpack_from("<IHHIHBB",raw,4)
+        if (not 0<total<=4096 or count not in (1,2) or start>=total or
+                start+count>total or not clock or flags&~7 or flags&3 not in (1,2) or
+                record_bytes!=12 or raw[48:50]!=b'\0\0'):
+            raise OpticalDiagnosticError("invalid optical trace header")
+        samples=[]
+        for index in range(count):
+            values=struct.unpack_from("<IHHhH",raw,20+12*index)
+            if ((not flags&4 and values[3]!=0) or
+                    (flags&4 and values[3] not in (-2,2))):
+                raise OpticalDiagnosticError("invalid optical trace injection")
+            if values[4]!=1:
+                raise OpticalDiagnosticError("invalid optical trace sample flags")
+            samples.append(OpticalTraceSample(*values))
+        if count==1 and any(raw[32:44]):
+            raise OpticalDiagnosticError("nonzero unused optical trace record")
+        start_tick,=struct.unpack_from("<I",raw,44)
+        return OpticalTrace(capture,start,total,clock,flags,tuple(samples),start_tick)
     raise OpticalDiagnosticError(f"unknown optical page type {page_type}")
 
 @dataclass(frozen=True)
@@ -73,12 +100,13 @@ class CachedOpticalPage:
 
 class OpticalDiagnosticCache:
     """Keeps the newest page of each type; an arriving page never clears peers."""
-    def __init__(self): self.live=None; self.acquisition=None; self.abba=None; self._epoch=None
+    def __init__(self): self.live=None; self.acquisition=None; self.abba=None; self.trace=None; self._epoch=None
     def publish(self,raw:bytes,stream_epoch:int,record_sequence:int,received_monotonic_ns:Optional[int]=None):
         page=parse_page(raw); received=time.monotonic_ns() if received_monotonic_ns is None else received_monotonic_ns
-        if self._epoch is not None and stream_epoch!=self._epoch: self.live=self.acquisition=self.abba=None
+        if self._epoch is not None and stream_epoch!=self._epoch: self.live=self.acquisition=self.abba=self.trace=None
         self._epoch=stream_epoch; cached=CachedOpticalPage(page,stream_epoch,record_sequence,received)
         if isinstance(page,OpticalLive): self.live=cached
         elif isinstance(page,OpticalAcquisition): self.acquisition=cached
-        else: self.abba=cached
+        elif isinstance(page,OpticalABBA): self.abba=cached
+        else: self.trace=cached
         return cached

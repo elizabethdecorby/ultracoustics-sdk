@@ -12,7 +12,7 @@ from typing import Optional
 import numpy as np
 from .optical_diagnostics import (CachedOpticalPage, OpticalABBA,
                                   OpticalAcquisition, OpticalDiagnosticError,
-                                  OpticalLive, parse_page)
+                                  OpticalLive, OpticalTrace, parse_page)
 
 
 LEGACY_RECORD_BYTES = 16_392
@@ -27,6 +27,7 @@ TLV_1550 = 2
 TLV_OPTICAL_LIVE = 3
 TLV_OPTICAL_ACQUISITION = 4
 TLV_OPTICAL_ABBA = 5
+TLV_OPTICAL_TRACE = 6
 TLV_INTEGRITY = 0x7FFF
 OPTIONAL_TLV_BIT = 0x8000
 CANONICAL_SNAPSHOT_BYTES = 52
@@ -160,6 +161,7 @@ class TelemetrySnapshot:
     optical_live_638: Optional[CachedOpticalPage] = None
     optical_acquisition_638: Optional[CachedOpticalPage] = None
     optical_abba_638: Optional[CachedOpticalPage] = None
+    optical_trace_638: Optional[CachedOpticalPage] = None
     optical_page_raw: Optional[bytes] = None
     optical_page_age_ms: int = 0
 
@@ -250,7 +252,7 @@ def parse_format1_trailer(trailer, *, include_optical=False):
             if board_1550 is not None:
                 raise TelemetryFormatError("duplicate 1550 TLV")
             board_1550, link_flags_1550 = _parse_board_tlv(payload, 1550)
-        elif version == 2 and tlv_type in (TLV_OPTICAL_LIVE, TLV_OPTICAL_ACQUISITION, TLV_OPTICAL_ABBA):
+        elif version == 2 and tlv_type in (TLV_OPTICAL_LIVE, TLV_OPTICAL_ACQUISITION, TLV_OPTICAL_ABBA, TLV_OPTICAL_TRACE):
             if len(payload) != 54:
                 raise TelemetryFormatError('optical diagnostic TLV must be 54 bytes in format 2')
             try:
@@ -259,7 +261,8 @@ def parse_format1_trailer(trailer, *, include_optical=False):
                 raise TelemetryFormatError(str(exc)) from exc
             expected = {TLV_OPTICAL_LIVE: OpticalLive,
                         TLV_OPTICAL_ACQUISITION: OpticalAcquisition,
-                        TLV_OPTICAL_ABBA: OpticalABBA}[tlv_type]
+                        TLV_OPTICAL_ABBA: OpticalABBA,
+                        TLV_OPTICAL_TRACE: OpticalTrace}[tlv_type]
             if not isinstance(page, expected):
                 raise TelemetryFormatError('optical TLV type does not match page type')
             optical_raw = payload[:52]
@@ -310,8 +313,8 @@ def parse_record(raw, expected_format: int, *, received_monotonic_ns: Optional[i
 
 # Seqlock sidecar: generation, epoch/record, receive time, two canonical blobs,
 # records published, parse errors, epoch changes. One subprocess writer.
-SIDECAR_BYTES = 384
-_OPTICAL_SLOT_OFFSETS = (168, 240, 312)
+SIDECAR_BYTES = 456
+_OPTICAL_SLOT_OFFSETS = (168, 240, 312, 384)
 
 
 def initialise_sidecar(shm: SharedMemory) -> None:
@@ -365,7 +368,8 @@ class TelemetrySidecarWriter:
         if snapshot.optical_page_raw is not None:
             page = parse_page(snapshot.optical_page_raw)
             slot = (0 if isinstance(page, OpticalLive) else
-                    1 if isinstance(page, OpticalAcquisition) else 2)
+                    1 if isinstance(page, OpticalAcquisition) else
+                    2 if isinstance(page, OpticalABBA) else 3)
             offset = _OPTICAL_SLOT_OFFSETS[slot]
             source_received = max(
                 0, snapshot.received_monotonic_ns - snapshot.optical_page_age_ms * 1_000_000)
