@@ -25,6 +25,10 @@ class OpticalLive:
     sequence:int; tick_ms:int; state:int; phase:int; flags:int; gain_law:int
     dac:int; feedback:int; target:int; error:int; slope:float; kp:float; ki:float
     clip_count:int; quality_count:int; timing_min_us:int; timing_max_us:int
+    bad_feedback_frames:Optional[int]=None
+    dac_busy_completions:Optional[int]=None
+    control_exec_max_us:Optional[int]=None
+    frame_interval_max_us:Optional[int]=None
 @dataclass(frozen=True)
 class OpticalAcquisition:
     event_id:int; start_tick_ms:int; end_tick_ms:int; baseline:int; minimum:int; target:int
@@ -47,7 +51,8 @@ def parse_page(raw:bytes)->OpticalPage:
         seq,tick=struct.unpack_from("<II",raw,4); state,phase,flags,law=struct.unpack_from("<BBBB",raw,12)
         dac,fb,target,error,slope,kp,ki=struct.unpack_from("<HHHhhhh",raw,16)
         clip,quality=struct.unpack_from("<II",raw,30); tmin,tmax=struct.unpack_from("<HH",raw,38)
-        return OpticalLive(seq,tick,state,phase,flags,law,dac,fb,target,error,slope/256,kp/4096,ki/4096,clip,quality,tmin,tmax)
+        timing_diagnostics = struct.unpack_from("<HHHH", raw, 42) if flags & 0x08 else (None,) * 4
+        return OpticalLive(seq,tick,state,phase,flags,law,dac,fb,target,error,slope/256,kp/4096,ki/4096,clip,quality,tmin,tmax,*timing_diagnostics)
     if page_type==PAGE_ACQUISITION:
         vals=struct.unpack_from("<IIIHHHHHHHBBBB",raw,4)
         return OpticalAcquisition(*vals[:10], vals[10], bool(vals[11]), *vals[12:])
