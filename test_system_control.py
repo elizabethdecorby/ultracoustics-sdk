@@ -139,8 +139,8 @@ class SystemControlTests(unittest.TestCase):
     return SimpleNamespace(host_stale=False,stream_epoch=1,scan_sync=data,
                            record_sequence=total//8192-1,received_sample_end=total)
    def read_fp_scan_638(self,timeout_s=1):return {'state':'complete','result':'complete','count':1001}
-  for fail in (False,True):
-   clock[0]=0;f=LiveFake(fail);updates=[]
+  for cap,fail in ((44000,False),(52400,False),(52400,True)):
+   clock[0]=0;f=LiveFake(fail);f.values[638,7]=cap;updates=[]
    with patch('ultracoustics.system_control.time.monotonic',side_effect=lambda:clock[0]),patch('ultracoustics.system_control.time.sleep',side_effect=lambda dt:clock.__setitem__(0,clock[0]+dt)):
     if fail:
      with self.assertRaisesRegex(FPScanError,'discontinuity'):f.capture_fp_scan()
@@ -149,7 +149,7 @@ class SystemControlTests(unittest.TestCase):
      result=f.capture_fp_scan(on_progress=updates.append)
      self.assertEqual(len(result['raw_adc']),10_000_000)
      self.assertEqual(result['rows'][0]['main_pd_adc_counts'],1234)
-     self.assertEqual(result['rows'][-1]['commanded_dac'],44000)
+     self.assertEqual(result['rows'][-1]['commanded_dac'],cap)
      self.assertEqual(result['alignment_bound_us'],56.6)
      self.assertTrue(any(u['new_rows'] for u in updates))
      self.assertLess(clock[0],1.5)

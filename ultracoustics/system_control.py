@@ -116,7 +116,7 @@ class SystemControlMixin:
         if illumination <= 0:
             raise RuntimeError('Set a nonzero 1550 manual laser DAC for FP scan illumination')
         cap = self.read_optical_cap_638()['max_dac']
-        if not 0 < cap <= 50000:
+        if not 0 < cap <= 52400:
             raise RuntimeError('638 does not advertise the approved FP scan DAC cap')
         preflight = self.read_fp_scan_638()
         if preflight['state'] not in ('idle', 'complete', 'aborted'):
