@@ -95,7 +95,7 @@ class SystemControlMixin:
                 'result': FP_SCAN_RESULTS[result], 'result_code': result,
                 'count': count, 'raw': raw}
 
-    def capture_fp_scan(self, cancel=None, on_progress=None, timeout_s=20.0):
+    def capture_fp_scan(self, cancel=None, on_progress=None, timeout_s=75.0):
         """Run a firmware-paced scan and return causally paired DAC/ADC rows.
 
         Requires an active whole-system manual session with the 1550 DAC
@@ -104,8 +104,8 @@ class SystemControlMixin:
         The first trace record has no prior scan command and is excluded.
         This routine never infers analog DAC delivery from the SPI command.
         """
-        if not 1.0 <= timeout_s <= 20.0:
-            raise ValueError('scan timeout must be between 1 and 20 seconds')
+        if not 1.0 <= timeout_s <= 75.0:
+            raise ValueError('scan timeout must be between 1 and 75 seconds')
         if not self.system_manual_active:
             raise RuntimeError('Open a system manual session before FP scan')
         if not getattr(self, 'streaming', False):
@@ -137,15 +137,15 @@ class SystemControlMixin:
         baseline_page = getattr(getattr(self.telemetry, 'optical_trace_638', None), 'page', None)
         baseline_id = baseline_page.capture_id if isinstance(baseline_page, OpticalTrace) else None
         pages = {}
-        next_pair = 1
+        paired_indices = set()
         capture_id = None
         total = None
         clock_hz = None
         start_tick_ms = None
         def ingest(snapshot):
-            nonlocal capture_id, total, clock_hz, start_tick_ms, next_pair
+            nonlocal capture_id, total, clock_hz, start_tick_ms
             new_rows = []
-            if snapshot is None or snapshot.host_stale or snapshot.link_638_stale:
+            if snapshot is None or snapshot.host_stale:
                 return new_rows
             cached = snapshot.optical_trace_638
             if (cached is None or cached.host_stale or
@@ -167,9 +167,11 @@ class SystemControlMixin:
                 if index in pages and pages[index] != sample:
                     raise RuntimeError(f'conflicting FP trace record {index}')
                 pages[index] = sample
-            while next_pair in pages and next_pair - 1 in pages:
-                previous, current = pages[next_pair - 1], pages[next_pair]
-                row = {'index': next_pair, 'commanded_dac': previous.actual_dac,
+            for index in sorted(pages):
+                if index == 0 or index in paired_indices or index - 1 not in pages:
+                    continue
+                previous, current = pages[index - 1], pages[index]
+                row = {'index': index, 'commanded_dac': previous.actual_dac,
                        'main_pd_adc_counts': current.feedback,
                        'sample_cycles': current.cycles,
                        'preceding_command_cycles': previous.cycles,
@@ -177,7 +179,7 @@ class SystemControlMixin:
                        'dac_source': 'SPI5_command_not_analog_readback'}
                 rows.append(row)
                 new_rows.append(row)
-                next_pair += 1
+                paired_indices.add(index)
             return new_rows
         try:
             if acquired:
@@ -241,6 +243,7 @@ class SystemControlMixin:
                         len(pages) == total and status['state'] == 'complete' and status['count'] == total):
                     if len(rows) != total - 1:
                         raise RuntimeError('FP trace records are not contiguous')
+                    rows.sort(key=lambda row: row['index'])
                     commands = [pages[index].actual_dac for index in range(total)]
                     if (commands[0] != 0 or commands[-2] != cap or commands[-1] != 0 or
                             any(right < left or right > cap for left, right in
@@ -271,7 +274,7 @@ class SystemControlMixin:
                     self.system_manual_command(638, MANUAL_SET, CHANNEL_FP_SCAN, 0, timeout_s=.5)
                 except Exception as cleanup:
                     cleanup_error = cleanup
-            raise FPScanError(str(exc), rows, cleanup_error) from exc
+            raise FPScanError(str(exc), sorted(rows, key=lambda row: row['index']), cleanup_error) from exc
         finally:
             if acquired and (638, CHANNEL_OPTICAL) in self._system_manual_owned:
                 try:
@@ -282,9 +285,9 @@ class SystemControlMixin:
                     except Exception as shutdown:
                         raise FPScanError(
                             f'optical lease release failed; global STOP unconfirmed: {shutdown}',
-                            rows, cleanup) from cleanup
+                            sorted(rows, key=lambda row: row['index']), cleanup) from cleanup
                     raise FPScanError('optical lease release failed; system stopped',
-                                      rows, cleanup) from cleanup
+                                      sorted(rows, key=lambda row: row['index']), cleanup) from cleanup
     @property
     def system_manual_active(self):
         return bool(getattr(self, '_system_manual_active', False))

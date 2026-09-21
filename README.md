@@ -307,13 +307,14 @@ rows = result["rows"]  # commanded_dac and main_pd_adc_counts
 ```
 
 The `MANUAL_SET` and `CHANNEL_LASER_DAC` constants are available from
-`ultracoustics._internal.control`. `capture_fp_scan` accepts a 20-second
+`ultracoustics._internal.control`. `capture_fp_scan` accepts a 75-second
 maximum deadline and keeps manual leases alive. Each returned row pairs a
 fresh FAST feedback sample with the preceding SPI5 DAC command; the first
 feedback sample is excluded because it has no preceding scan command. The
 command is not an analog DAC readback. The result includes capture ID, raw
 clock rate, record count, duration, DAC cap, and quality flags. A canceled or
-failed scan raises `FPScanError` with any contiguous paired rows in `.rows`.
+failed scan raises `FPScanError` with any adjacent paired rows in `.rows`,
+sorted by scan index even when early trace pages were missed.
 
 `read_optical_cap_638`, `read_controller_timing_638`,
 `set_controller_timing_638(divider, held)`, and `read_fp_scan_638` expose the

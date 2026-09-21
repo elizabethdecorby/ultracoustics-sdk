@@ -90,6 +90,15 @@ class SystemControlTests(unittest.TestCase):
    f.capture_fp_scan(timeout_s=2)
   self.assertEqual(f._system_manual_owned,{(638,2),(1550,2)})
   self.assertFalse(any(c[1]==MANUAL_SET and c[2]==9 for c in f.calls))
+ def test_scan_timeout_bounds(self):
+  f=Fake()
+  for timeout in (.5,75.1):
+   with self.assertRaisesRegex(ValueError,'between 1 and 75'):
+    f.capture_fp_scan(timeout_s=timeout)
+  self.assertFalse(f.calls)
+  f.streaming=True;f.stream_stats={'stream_format':2}
+  with self.assertRaisesRegex(RuntimeError,'nonzero 1550'):
+   f.capture_fp_scan(timeout_s=75)
  def test_scan_protocol_channels_are_packable_without_relaxing_old_dac_cap(self):
   from ultracoustics._internal.control import pack_manual_request
   for channel in (7,8,9):
@@ -138,6 +147,30 @@ class SystemControlTests(unittest.TestCase):
   self.assertEqual(f._system_manual_owned,{(1550,2)})
   self.assertIn((638,MANUAL_SET,9,1),f.calls)
   self.assertIn((638,MANUAL_RELEASE,3,0),f.calls)
+ def test_fp_scan_partial_pairs_without_prefix_and_ignores_link_staleness(self):
+  from ultracoustics._internal.optical_diagnostics import OpticalTrace, OpticalTraceSample
+  class PartialFake(Fake):
+   def __init__(self):
+    super().__init__();self.streaming=True;self.stream_stats={'stream_format':2}
+    self.values[1550,2]=1000;self.values[638,7]=50000;self._reads=0
+    samples=[OpticalTraceSample(288000*i,1000+i,100*i,0,1) for i in range(6)]
+    self._pages=[OpticalTrace(7,2,501,144000000,9,tuple(samples[2:4]),42),
+                 OpticalTrace(7,4,501,144000000,9,tuple(samples[4:6]),42)]
+   @property
+   def telemetry(self):
+    self._reads+=1
+    page=None if self._reads==1 else self._pages[min(self._reads-2,1)]
+    cached=None if page is None else SimpleNamespace(page=page,host_stale=False,
+                                                     received_monotonic_ns=1<<62)
+    return SimpleNamespace(host_stale=False,link_638_stale=True,optical_trace_638=cached)
+   def read_fp_scan_638(self,timeout_s=1):return {'state':'idle','count':0}
+  f=PartialFake();updates=[]
+  from ultracoustics.system_control import FPScanError
+  with self.assertRaisesRegex(FPScanError,'canceled') as caught:
+   f.capture_fp_scan(cancel=lambda:f._reads>=4,on_progress=updates.append,timeout_s=2)
+  self.assertEqual([row['index'] for row in caught.exception.rows],[3,4,5])
+  self.assertEqual([row['commanded_dac'] for row in caught.exception.rows],[200,300,400])
+  self.assertTrue(any(update['new_rows'] for update in updates))
  def test_close_releases_usb_even_if_stop_is_unconfirmed(self):
   from ultracoustics import Controller
   from unittest.mock import Mock
