@@ -10,11 +10,19 @@ from ._internal.control import (
     CHANNEL_TEMPERATURE, CHANNEL_LASER_DAC,
 )
 from ._internal.protocol import CMD_BOOT, CMD_OVERRIDE_ENTER, CMD_POWER, CMD_TRIGGER
+from ._internal.optical_diagnostics import OpticalTrace
 
 CHANNEL_OPTICAL = 3
 CHANNEL_KP = 4
 CHANNEL_KI_NEGATIVE = 5
 CHANNEL_KI_POSITIVE = 6
+CHANNEL_DAC_CAP = 7
+CHANNEL_OPTICAL_RUNTIME = 8
+CHANNEL_FP_SCAN = 9
+FP_SCAN_STATES = ('idle', 'armed', 'qualifying', 'active', 'complete', 'aborted')
+FP_SCAN_RESULTS = ('none', 'complete', 'explicit_abort', 'invalid_or_fault')
+FP_SCAN_MIN_RECORDS = 500
+FP_SCAN_MAX_RECORDS = 1002
 GAIN_SCALE = 1_000_000
 OPTICAL_STATES = ('IDLE', 'CALIBRATING', 'ROOT_FINDING', 'LOCKED', 'ERROR', 'MEASURE_SLOPE')
 OPTICAL_ACTIONS = {'abort': 0, 'start': 1, 'reacquire': 2, 'retune': 3,
@@ -28,7 +36,255 @@ def require_applied(reply):
     return reply
 
 
+class FPScanError(RuntimeError):
+    """Scan failure with any causally paired rows already received."""
+
+    def __init__(self, message, rows=(), cleanup_error=None):
+        self.rows = tuple(rows)
+        self.cleanup_error = cleanup_error
+        if cleanup_error is not None:
+            message = f'{message}; cleanup also failed: {cleanup_error}'
+        super().__init__(message)
+
+
 class SystemControlMixin:
+    def read_optical_cap_638(self, timeout_s=1.0):
+        """Read this board's authoritative optical DAC ceiling (channel 7)."""
+        reply = require_applied(self.manual_command(
+            638, MANUAL_GET, CHANNEL_DAC_CAP, timeout_s=timeout_s))
+        if not 0 < reply.applied_value <= 65535:
+            raise RuntimeError('638 reported an invalid optical DAC cap')
+        return {'max_dac': reply.applied_value}
+
+    def read_controller_timing_638(self, timeout_s=1.0):
+        """Read held state and valid-FAST-frame control divider."""
+        reply = require_applied(self.manual_command(
+            638, MANUAL_GET, CHANNEL_OPTICAL_RUNTIME, timeout_s=timeout_s))
+        return self._decode_controller_timing_638(reply.applied_value)
+
+    @staticmethod
+    def _decode_controller_timing_638(value):
+        divider = (value >> 8) & 255
+        if value & ~0xff01 or divider not in (1, 2, 3, 5, 10):
+            raise RuntimeError(f'638 returned invalid controller timing word {value}')
+        return {'divider': divider, 'held': bool(value & 1), 'raw': value}
+
+    def set_controller_timing_638(self, divider, held, timeout_s=1.0):
+        """Set both runtime fields atomically, then verify the applied word."""
+        if type(divider) is not int or divider not in (1, 2, 3, 5, 10) or type(held) is not bool:
+            raise ValueError('divider must be 1, 2, 3, 5, or 10 and held must be bool')
+        if self.system_manual_active:
+            self._take_optical_638(timeout_s)
+        requested = (divider << 8) | int(held)
+        command = self.system_manual_command if self.system_manual_active else self.manual_command
+        reply = require_applied(command(638, MANUAL_SET, CHANNEL_OPTICAL_RUNTIME,
+                                        requested, timeout_s))
+        applied = self._decode_controller_timing_638(reply.applied_value)
+        if applied['raw'] != requested:
+            raise RuntimeError('638 controller timing readback differs from request')
+        return applied
+
+    def read_fp_scan_638(self, timeout_s=1.0):
+        reply = require_applied(self.manual_command(
+            638, MANUAL_GET, CHANNEL_FP_SCAN, timeout_s=timeout_s))
+        raw = reply.applied_value
+        state, result, count = raw & 15, (raw >> 4) & 15, (raw >> 8) & 0xffff
+        if raw < 0 or state >= len(FP_SCAN_STATES) or result >= len(FP_SCAN_RESULTS) or count > FP_SCAN_MAX_RECORDS:
+            raise RuntimeError(f'638 returned invalid FP scan status {raw}')
+        return {'state': FP_SCAN_STATES[state], 'state_code': state,
+                'result': FP_SCAN_RESULTS[result], 'result_code': result,
+                'count': count, 'raw': raw}
+
+    def capture_fp_scan(self, cancel=None, on_progress=None, timeout_s=20.0):
+        """Run a firmware-paced scan and return causally paired DAC/ADC rows.
+
+        Requires an active whole-system manual session with the 1550 DAC
+        already commanded above zero. Each trace record's feedback precedes
+        its own DAC write, so row *i* pairs feedback[i] with commanded DAC[i-1].
+        The first trace record has no prior scan command and is excluded.
+        This routine never infers analog DAC delivery from the SPI command.
+        """
+        if not 1.0 <= timeout_s <= 20.0:
+            raise ValueError('scan timeout must be between 1 and 20 seconds')
+        if not self.system_manual_active:
+            raise RuntimeError('Open a system manual session before FP scan')
+        if not getattr(self, 'streaming', False):
+            raise RuntimeError('An active stream is required for FP scan pages')
+        if (1550, CHANNEL_LASER_DAC) not in self._system_manual_owned:
+            raise RuntimeError('Take the 1550 manual laser DAC before FP scan illumination')
+        illumination = require_applied(self.system_manual_command(
+            1550, MANUAL_GET, CHANNEL_LASER_DAC)).applied_value
+        if illumination <= 0:
+            raise RuntimeError('Set a nonzero 1550 manual laser DAC for FP scan illumination')
+        cap = self.read_optical_cap_638()['max_dac']
+        if not 0 < cap <= 50000:
+            raise RuntimeError('638 does not advertise the approved FP scan DAC cap')
+        preflight = self.read_fp_scan_638()
+        if preflight['state'] not in ('idle', 'complete', 'aborted'):
+            raise RuntimeError(f"638 FP scan is already {preflight['state']}")
+        if (self.stream_stats or {}).get('stream_format') != 2:
+            raise RuntimeError('Enable optical diagnostics stream format 2 before FP scan')
+        if self.read_state_638()['state'] != 0:
+            raise RuntimeError('638 optical control must be IDLE before FP scan')
+
+        deadline = time.monotonic() + timeout_s
+        rows = []
+        started = False
+        acquired = (638, CHANNEL_OPTICAL) not in self._system_manual_owned
+        cleanup_error = None
+        last_renew = time.monotonic()
+        last_status = 0.0
+        baseline_page = getattr(getattr(self.telemetry, 'optical_trace_638', None), 'page', None)
+        baseline_id = baseline_page.capture_id if isinstance(baseline_page, OpticalTrace) else None
+        pages = {}
+        next_pair = 1
+        capture_id = None
+        total = None
+        clock_hz = None
+        start_tick_ms = None
+        def ingest(snapshot):
+            nonlocal capture_id, total, clock_hz, start_tick_ms, next_pair
+            new_rows = []
+            if snapshot is None or snapshot.host_stale or snapshot.link_638_stale:
+                return new_rows
+            cached = snapshot.optical_trace_638
+            if (cached is None or cached.host_stale or
+                    cached.received_monotonic_ns <= scan_start_ns):
+                return new_rows
+            page = cached.page
+            if (not isinstance(page, OpticalTrace) or not page.flags & 8 or
+                    not page.flags & 1 or page.total_samples > FP_SCAN_MAX_RECORDS or
+                    (baseline_id is not None and page.capture_id == baseline_id)):
+                return new_rows
+            if capture_id is None:
+                capture_id, total = page.capture_id, page.total_samples
+                clock_hz, start_tick_ms = page.clock_hz, page.start_tick_ms
+            if (page.capture_id != capture_id or page.total_samples != total or
+                    page.clock_hz != clock_hz or page.start_tick_ms != start_tick_ms):
+                return new_rows
+            for offset, sample in enumerate(page.samples):
+                index = page.start_index + offset
+                if index in pages and pages[index] != sample:
+                    raise RuntimeError(f'conflicting FP trace record {index}')
+                pages[index] = sample
+            while next_pair in pages and next_pair - 1 in pages:
+                previous, current = pages[next_pair - 1], pages[next_pair]
+                row = {'index': next_pair, 'commanded_dac': previous.actual_dac,
+                       'main_pd_adc_counts': current.feedback,
+                       'sample_cycles': current.cycles,
+                       'preceding_command_cycles': previous.cycles,
+                       'command_age_s': ((current.cycles - previous.cycles) & 0xffffffff) / clock_hz,
+                       'dac_source': 'SPI5_command_not_analog_readback'}
+                rows.append(row)
+                new_rows.append(row)
+                next_pair += 1
+            return new_rows
+        try:
+            if acquired:
+                # The standard system-manual setup owns the 638 DAC at zero.
+                # Hand it to optical control while preserving 1550 illumination.
+                self._take_optical_638(1.0)
+            scan_start_ns = time.monotonic_ns()
+            self.system_manual_command(638, MANUAL_SET, CHANNEL_FP_SCAN, 1)
+            started = True
+            # The 638 firmware refreshes its optical lease internally during
+            # FAST scan. A manual GET/RENEW would pause FAST and abort it.
+            scan_start = time.monotonic()
+            last_active_progress = scan_start
+            while time.monotonic() - scan_start < 1.35:
+                if cancel is not None and cancel():
+                    raise RuntimeError('FP scan canceled')
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('FP scan exceeded deadline')
+                if time.monotonic() - last_renew >= .4:
+                    for target, channel in sorted(self._system_manual_owned):
+                        if (target, channel) != (638, CHANNEL_OPTICAL):
+                            self.system_manual_command(target, MANUAL_RENEW, channel, timeout_s=.5)
+                    last_renew = time.monotonic()
+                new_rows = ingest(self.telemetry)
+                if on_progress is not None and (new_rows or time.monotonic() - last_active_progress >= .05):
+                    on_progress({'state': 'active', 'acquired': min(1000,
+                                 int((time.monotonic() - scan_start) * 1000)),
+                                 'received': len(pages), 'expected': 1000,
+                                 'estimated': True, 'new_rows': tuple(new_rows)})
+                    last_active_progress = time.monotonic()
+                time.sleep(.003)
+            status = None
+            last_progress = None
+            while time.monotonic() < deadline:
+                if cancel is not None and cancel():
+                    raise RuntimeError('FP scan canceled')
+                now = time.monotonic()
+                if now - last_renew >= .4:
+                    self.system_manual_command(638, MANUAL_RENEW, CHANNEL_OPTICAL, timeout_s=.5)
+                    for target, channel in sorted(self._system_manual_owned):
+                        if (target, channel) != (638, CHANNEL_OPTICAL):
+                            self.system_manual_command(target, MANUAL_RENEW, channel, timeout_s=.5)
+                    last_renew = time.monotonic()
+                new_rows = ingest(self.telemetry)
+                if status is None or now - last_status >= .5:
+                    status = self.read_fp_scan_638(timeout_s=.5)
+                    last_status = time.monotonic()
+                    if status['state'] == 'aborted':
+                        raise RuntimeError(f"638 aborted FP scan: {status['result']}")
+                    if status['state'] == 'complete' and not FP_SCAN_MIN_RECORDS <= status['count'] <= FP_SCAN_MAX_RECORDS:
+                        raise RuntimeError(f"638 completed unexpected {status['count']} FP scan records")
+                progress = (status['count'] if status else 0, len(pages))
+                if on_progress is not None and progress != last_progress:
+                    on_progress({'state': status['state'] if status else 'unknown',
+                                 'acquired': progress[0], 'received': progress[1],
+                                 'expected': status['count'] if status['state'] == 'complete' else 1000,
+                                 'estimated': False,
+                                 'new_rows': tuple(new_rows)})
+                    last_progress = progress
+                if (total is not None and FP_SCAN_MIN_RECORDS <= total <= FP_SCAN_MAX_RECORDS and
+                        len(pages) == total and status['state'] == 'complete' and status['count'] == total):
+                    if len(rows) != total - 1:
+                        raise RuntimeError('FP trace records are not contiguous')
+                    commands = [pages[index].actual_dac for index in range(total)]
+                    if (commands[0] != 0 or commands[-2] != cap or commands[-1] != 0 or
+                            any(right < left or right > cap for left, right in
+                                zip(commands[:-2], commands[1:-1]))):
+                        raise RuntimeError('FP trace DAC sequence violates 0-to-cap-to-zero scan')
+                    duration_s = ((pages[total - 1].cycles - pages[0].cycles) & 0xffffffff) / clock_hz
+                    if not .85 <= duration_s <= 1.25:
+                        raise RuntimeError(f'FP trace duration {duration_s:.3f}s is not the expected scan')
+                    quality = ['commanded_dac_not_analog_verified', 'first_feedback_unpaired']
+                    if total < 900:
+                        quality.append('sparse_scan_records')
+                    if any(row['command_age_s'] > .0025 for row in rows):
+                        quality.append('sample_gap_over_2p5ms')
+                    return {'status': 'complete',
+                            'quality_flags': tuple(quality),
+                            'rows': tuple(rows),
+                            'capture_id': capture_id, 'clock_hz': clock_hz,
+                            'start_tick_ms': start_tick_ms, 'point_count': total,
+                            'paired_count': len(rows), 'duration_s': duration_s,
+                            'dac_cap': cap,
+                            'illumination_1550_dac': illumination,
+                            'first_unpaired_feedback': pages[0].feedback}
+                time.sleep(.003)
+            raise TimeoutError(f'FP scan timed out with {len(pages)} trace records')
+        except Exception as exc:
+            if started:
+                try:
+                    self.system_manual_command(638, MANUAL_SET, CHANNEL_FP_SCAN, 0, timeout_s=.5)
+                except Exception as cleanup:
+                    cleanup_error = cleanup
+            raise FPScanError(str(exc), rows, cleanup_error) from exc
+        finally:
+            if acquired and (638, CHANNEL_OPTICAL) in self._system_manual_owned:
+                try:
+                    self.system_manual_command(638, MANUAL_RELEASE, CHANNEL_OPTICAL, timeout_s=.5)
+                except Exception as cleanup:
+                    try:
+                        self.stop_system_confirmed(timeout_s=1.0)
+                    except Exception as shutdown:
+                        raise FPScanError(
+                            f'optical lease release failed; global STOP unconfirmed: {shutdown}',
+                            rows, cleanup) from cleanup
+                    raise FPScanError('optical lease release failed; system stopped',
+                                      rows, cleanup) from cleanup
     @property
     def system_manual_active(self):
         return bool(getattr(self, '_system_manual_active', False))
@@ -57,12 +313,15 @@ class SystemControlMixin:
         self._last_manual_rail_off_ns = None
         return result
 
-    def begin_system_manual(self, timeout_s=1.0):
+    def begin_system_manual(self, timeout_s=1.0, optical_diagnostics=False):
         """Power both boards with START low and take both laser DACs at zero."""
         if self.system_manual_active:
             return self.system_manual_readback(timeout_s)
         self.stop_system_confirmed(timeout_s)
-        self.enable_telemetry(timeout_s)
+        if optical_diagnostics:
+            self.enable_optical_diagnostics(timeout_s)
+        else:
+            self.enable_telemetry(timeout_s)
         remaining = .2 - (time.monotonic_ns() - self._last_manual_rail_off_ns) / 1e9
         if remaining > 0:
             time.sleep(remaining)

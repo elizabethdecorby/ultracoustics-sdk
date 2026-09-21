@@ -290,6 +290,36 @@ pip install -e ".[plot]"
 
 ## Troubleshooting
 
+### Firmware-paced 638 FP scan
+
+For a 638 board advertising manual channels 7–9, select optical diagnostics
+before entering manual override. The standard manual setup sets both lasers to
+zero, so explicitly command a nonzero 1550 DAC for illumination before the
+scan. The SDK checks the acknowledged 1550 readback; it transfers the 638 zero
+DAC lease to optical control, runs the firmware-paced scan, and returns the 638
+to zero/IDLE. It never widens the older manual DAC limit of 44000.
+
+```python
+ctrl.begin_system_manual(optical_diagnostics=True)
+ctrl.system_manual_command(1550, MANUAL_SET, CHANNEL_LASER_DAC, illuminated_dac)
+result = ctrl.capture_fp_scan(cancel=cancel_requested, on_progress=show_progress)
+rows = result["rows"]  # commanded_dac and main_pd_adc_counts
+```
+
+The `MANUAL_SET` and `CHANNEL_LASER_DAC` constants are available from
+`ultracoustics._internal.control`. `capture_fp_scan` accepts a 20-second
+maximum deadline and keeps manual leases alive. Each returned row pairs a
+fresh FAST feedback sample with the preceding SPI5 DAC command; the first
+feedback sample is excluded because it has no preceding scan command. The
+command is not an analog DAC readback. The result includes capture ID, raw
+clock rate, record count, duration, DAC cap, and quality flags. A canceled or
+failed scan raises `FPScanError` with any contiguous paired rows in `.rows`.
+
+`read_optical_cap_638`, `read_controller_timing_638`,
+`set_controller_timing_638(divider, held)`, and `read_fp_scan_638` expose the
+new capability, runtime hold/rate, and scan status words. Timing accepts
+dividers 1, 2, 3, 5, and 10 and can be changed in automatic RUN.
+
 ModuleNotFoundError:
 
 - Ensure the virtual environment is activated.

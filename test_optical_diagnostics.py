@@ -49,3 +49,14 @@ def test_trace_page_decodes_records_and_checks_bounds():
     assert cache.abba is not None and cache.trace.page.capture_id==7
     cache.publish(page(PAGE_LIVE),2,3,102)
     assert cache.trace is None and cache.abba is None
+
+def test_scan_trace_flag_and_limit():
+    b=page(PAGE_TRACE)
+    struct.pack_into("<IHHIHBB",b,4,8,0,1000,144_000_000,9,2,12)
+    struct.pack_into("<IHHhH",b,20,100,6000,0,0,1)
+    struct.pack_into("<IHHhH",b,32,200,6001,50,0,1)
+    struct.pack_into("<H",b,50,crc16_ccitt(b[:50]))
+    assert parse_page(b).flags==9
+    struct.pack_into("<H",b,10,1001)
+    struct.pack_into("<H",b,50,crc16_ccitt(b[:50]))
+    with pytest.raises(OpticalDiagnosticError):parse_page(b)

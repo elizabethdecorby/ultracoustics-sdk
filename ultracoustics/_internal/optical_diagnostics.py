@@ -72,7 +72,8 @@ def parse_page(raw:bytes)->OpticalPage:
     if page_type==PAGE_TRACE:
         capture,start,total,clock,flags,count,record_bytes=struct.unpack_from("<IHHIHBB",raw,4)
         if (not 0<total<=4096 or count not in (1,2) or start>=total or
-                start+count>total or not clock or flags&~7 or flags&3 not in (1,2) or
+                start+count>total or not clock or flags&~15 or flags&3 not in (1,2) or
+                (flags&8 and (flags&4 or total>1002)) or
                 record_bytes!=12 or raw[48:50]!=b'\0\0'):
             raise OpticalDiagnosticError("invalid optical trace header")
         samples=[]
