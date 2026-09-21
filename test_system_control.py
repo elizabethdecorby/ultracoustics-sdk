@@ -113,64 +113,47 @@ class SystemControlTests(unittest.TestCase):
   self.assertEqual(f.read_fp_scan_638()['count'],1000)
   f.values[638,9]=6
   with self.assertRaisesRegex(RuntimeError,'invalid FP scan status'):f.read_fp_scan_638()
- def test_fp_scan_pairs_feedback_with_preceding_command_and_releases_638(self):
-  from ultracoustics._internal.optical_diagnostics import OpticalTrace, OpticalTraceSample
-  class ScanFake(Fake):
-   def __init__(self):
-    super().__init__();self.streaming=True;self.stream_stats={'stream_format':2}
-    self.values[1550,2]=1000;self.values[638,7]=50000;self._page_reads=0;self._status_reads=0
-    samples=[OpticalTraceSample(288000*i,1000+i,
-             round(50000*i/499) if i<500 else 0,0,1) for i in range(501)]
-    self._pages=[OpticalTrace(7,i,501,144000000,9,tuple(samples[i:i+2]),42)
-                 for i in range(0,501,2)]
-   @property
-   def telemetry(self):
-    self._page_reads+=1
-    page=None if self._page_reads==1 else self._pages[min(self._page_reads-2,len(self._pages)-1)]
-    cached=None if page is None else SimpleNamespace(page=page,host_stale=False,
-                                                     received_monotonic_ns=1<<62)
-    return SimpleNamespace(host_stale=False,link_638_stale=False,optical_trace_638=cached)
-   def read_fp_scan_638(self,timeout_s=1):
-    self._status_reads+=1
-    if self._status_reads==1:return {'state':'idle','count':0}
-    return {'state':'complete','count':501,'result':'complete'}
-  f=ScanFake();clock=[0.0]
-  def sleep(seconds):clock[0]+=seconds
-  with patch('ultracoustics.system_control.time.monotonic',side_effect=lambda:clock[0]),\
-       patch('ultracoustics.system_control.time.sleep',side_effect=sleep):
-   result=f.capture_fp_scan(timeout_s=5)
-  self.assertEqual(result['paired_count'],500)
-  self.assertEqual(result['rows'][0]['commanded_dac'],0)
-  self.assertEqual(result['rows'][0]['main_pd_adc_counts'],1001)
-  self.assertEqual(result['rows'][-1]['commanded_dac'],50000)
-  self.assertEqual(result['rows'][-1]['main_pd_adc_counts'],1500)
-  self.assertEqual(f._system_manual_owned,{(1550,2)})
-  self.assertIn((638,MANUAL_SET,9,1),f.calls)
-  self.assertIn((638,MANUAL_RELEASE,3,0),f.calls)
- def test_fp_scan_partial_pairs_without_prefix_and_ignores_link_staleness(self):
-  from ultracoustics._internal.optical_diagnostics import OpticalTrace, OpticalTraceSample
-  class PartialFake(Fake):
-   def __init__(self):
-    super().__init__();self.streaming=True;self.stream_stats={'stream_format':2}
-    self.values[1550,2]=1000;self.values[638,7]=50000;self._reads=0
-    samples=[OpticalTraceSample(288000*i,1000+i,100*i,0,1) for i in range(6)]
-    self._pages=[OpticalTrace(7,2,501,144000000,9,tuple(samples[2:4]),42),
-                 OpticalTrace(7,4,501,144000000,9,tuple(samples[4:6]),42)]
-   @property
-   def telemetry(self):
-    self._reads+=1
-    page=None if self._reads==1 else self._pages[min(self._reads-2,1)]
-    cached=None if page is None else SimpleNamespace(page=page,host_stale=False,
-                                                     received_monotonic_ns=1<<62)
-    return SimpleNamespace(host_stale=False,link_638_stale=True,optical_trace_638=cached)
-   def read_fp_scan_638(self,timeout_s=1):return {'state':'idle','count':0}
-  f=PartialFake();updates=[]
+ def test_live_scan_capture_alignment_and_loss_rejection(self):
+  import struct
+  import numpy as np
   from ultracoustics.system_control import FPScanError
-  with self.assertRaisesRegex(FPScanError,'canceled') as caught:
-   f.capture_fp_scan(cancel=lambda:f._reads>=4,on_progress=updates.append,timeout_s=2)
-  self.assertEqual([row['index'] for row in caught.exception.rows],[3,4,5])
-  self.assertEqual([row['commanded_dac'] for row in caught.exception.rows],[200,300,400])
-  self.assertTrue(any(update['new_rows'] for update in updates))
+  clock=[0.0]
+  class LiveFake(Fake):
+   def __init__(self,fail=False):
+    super().__init__();self.streaming=True;self.fail=fail
+    self.values[1550,2]=1000;self.values[638,7]=44000
+    self.buffer_capacity=20_000_000;self.buffer=np.full(self.buffer_capacity,1234,dtype=np.uint16)
+   @property
+   def samples_received(self):return (int(clock[0]*10_000_000)//8192+1)*8192
+   @property
+   def stream_stats(self):return {'stream_format':2,'drops_seq':int(self.fail and clock[0]>.4)}
+   @property
+   def telemetry(self):
+    total=self.samples_received
+    data=None
+    if clock[0]>.003:
+     data=bytearray(54);data[0]=1;data[1]=3 if clock[0]>1.01 else 1
+     struct.pack_into('<I',data,4,1)
+     for off,point in zip((8,14,20,26),(20000,21000,10020000,10021000)):
+      struct.pack_into('<IH',data,off,point//8192,point%8192)
+    return SimpleNamespace(host_stale=False,stream_epoch=1,scan_sync=data,
+                           record_sequence=total//8192-1,received_sample_end=total)
+   def read_fp_scan_638(self,timeout_s=1):return {'state':'complete','result':'complete','count':1001}
+  for fail in (False,True):
+   clock[0]=0;f=LiveFake(fail);updates=[]
+   with patch('ultracoustics.system_control.time.monotonic',side_effect=lambda:clock[0]),patch('ultracoustics.system_control.time.sleep',side_effect=lambda dt:clock.__setitem__(0,clock[0]+dt)):
+    if fail:
+     with self.assertRaisesRegex(FPScanError,'discontinuity'):f.capture_fp_scan()
+     self.assertIn((638,MANUAL_SET,9,0),f.calls)
+    else:
+     result=f.capture_fp_scan(on_progress=updates.append)
+     self.assertEqual(len(result['raw_adc']),10_000_000)
+     self.assertEqual(result['rows'][0]['main_pd_adc_counts'],1234)
+     self.assertEqual(result['rows'][-1]['commanded_dac'],44000)
+     self.assertEqual(result['alignment_bound_us'],56.6)
+     self.assertTrue(any(u['new_rows'] for u in updates))
+     self.assertLess(clock[0],1.5)
+   self.assertIn((638,MANUAL_RELEASE,3,0),f.calls)
  def test_close_releases_usb_even_if_stop_is_unconfirmed(self):
   from ultracoustics import Controller
   from unittest.mock import Mock

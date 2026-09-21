@@ -4,6 +4,8 @@ Methods are bounded synchronous operations; a GUI must run them off its paint
 thread and call renew_system_manual periodically while a session is active.
 """
 import math
+import struct
+import numpy as np
 import time
 from ._internal.control import (
     MANUAL_GET, MANUAL_TAKE, MANUAL_SET, MANUAL_RELEASE, MANUAL_RENEW,
@@ -95,14 +97,11 @@ class SystemControlMixin:
                 'result': FP_SCAN_RESULTS[result], 'result_code': result,
                 'count': count, 'raw': raw}
 
-    def capture_fp_scan(self, cancel=None, on_progress=None, timeout_s=75.0):
-        """Run a firmware-paced scan and return causally paired DAC/ADC rows.
+    def capture_fp_scan(self, cancel=None, on_progress=None, timeout_s=5.0):
+        """Capture the full live ADC sweep in RAM using master packet markers.
 
-        Requires an active whole-system manual session with the 1550 DAC
-        already commanded above zero. Each trace record's feedback precedes
-        its own DAC write, so row *i* pairs feedback[i] with commanded DAC[i-1].
-        The first trace record has no prior scan command and is excluded.
-        This routine never infers analog DAC delivery from the SPI command.
+        The plotted DAC axis estimates the known1ms ramp staircase; full-rate
+        ADC is retained in raw_adc. Old firmware fails explicitly without markers.
         """
         if not 1.0 <= timeout_s <= 75.0:
             raise ValueError('scan timeout must be between 1 and 75 seconds')
@@ -132,142 +131,149 @@ class SystemControlMixin:
         started = False
         acquired = (638, CHANNEL_OPTICAL) not in self._system_manual_owned
         cleanup_error = None
-        last_renew = time.monotonic()
-        last_status = 0.0
-        baseline_page = getattr(getattr(self.telemetry, 'optical_trace_638', None), 'page', None)
-        baseline_id = baseline_page.capture_id if isinstance(baseline_page, OpticalTrace) else None
-        pages = {}
-        paired_indices = set()
+        chunks = []
+        cursor = origin = self.samples_received
+        initial_stats = dict(self.stream_stats)
+        snapshot = self.telemetry
+        initial_epoch = snapshot.stream_epoch if snapshot else None
+        old_sync = getattr(snapshot, 'scan_sync', None)
+        baseline_id = struct.unpack_from('<I', old_sync, 4)[0] if old_sync else None
         capture_id = None
-        total = None
-        clock_hz = None
-        start_tick_ms = None
-        def ingest(snapshot):
-            nonlocal capture_id, total, clock_hz, start_tick_ms
-            new_rows = []
-            if snapshot is None or snapshot.host_stale:
-                return new_rows
-            cached = snapshot.optical_trace_638
-            if (cached is None or cached.host_stale or
-                    cached.received_monotonic_ns <= scan_start_ns):
-                return new_rows
-            page = cached.page
-            if (not isinstance(page, OpticalTrace) or not page.flags & 8 or
-                    not page.flags & 1 or page.total_samples > FP_SCAN_MAX_RECORDS or
-                    (baseline_id is not None and page.capture_id == baseline_id)):
-                return new_rows
-            if capture_id is None:
-                capture_id, total = page.capture_id, page.total_samples
-                clock_hz, start_tick_ms = page.clock_hz, page.start_tick_ms
-            if (page.capture_id != capture_id or page.total_samples != total or
-                    page.clock_hz != clock_hz or page.start_tick_ms != start_tick_ms):
-                return new_rows
-            for offset, sample in enumerate(page.samples):
-                index = page.start_index + offset
-                if index in pages and pages[index] != sample:
-                    raise RuntimeError(f'conflicting FP trace record {index}')
-                pages[index] = sample
-            for index in sorted(pages):
-                if index == 0 or index in paired_indices or index - 1 not in pages:
-                    continue
-                previous, current = pages[index - 1], pages[index]
-                row = {'index': index, 'commanded_dac': previous.actual_dac,
-                       'main_pd_adc_counts': current.feedback,
-                       'sample_cycles': current.cycles,
-                       'preceding_command_cycles': previous.cycles,
-                       'command_age_s': ((current.cycles - previous.cycles) & 0xffffffff) / clock_hz,
-                       'dac_source': 'SPI5_command_not_analog_readback'}
-                rows.append(row)
-                new_rows.append(row)
-                paired_indices.add(index)
-            return new_rows
+        anchors = None
+        last_renew = time.monotonic()
+        last_progress = 0.0
+        live_index = 0
+
+        def collect():
+            nonlocal cursor, capture_id, anchors
+            end = self.samples_received
+            if end - cursor > self.buffer_capacity:
+                raise RuntimeError('ADC ring overrun during FP scan')
+            if end > cursor:
+                count = end - cursor
+                index = cursor % self.buffer_capacity
+                chunk = (self.buffer[index:index+count].copy() if index+count <= self.buffer_capacity else
+                         np.concatenate((self.buffer[index:], self.buffer[:index+count-self.buffer_capacity])))
+                if self.samples_received - cursor > self.buffer_capacity:
+                    raise RuntimeError('ADC ring overwritten during FP copy')
+                chunks.append(chunk)
+                cursor = end
+            stats = self.stream_stats
+            if any(stats.get(k, 0) != initial_stats.get(k, 0) for k in
+                   ('drops_seq', 'transfer_errors', 'transfer_timeouts', 'malformed')):
+                raise RuntimeError('ADC discontinuity during FP scan; DAC alignment rejected')
+            snap = self.telemetry
+            if snap is None or snap.host_stale:
+                return
+            if snap.stream_epoch != initial_epoch:
+                raise RuntimeError('Stream epoch changed during FP scan')
+            sync = getattr(snap, 'scan_sync', None)
+            if not sync:
+                return
+            sid = struct.unpack_from('<I', sync, 4)[0]
+            if sid == baseline_id:
+                return
+            if capture_id is not None and sid != capture_id:
+                raise RuntimeError('FP capture identity changed')
+            capture_id = sid
+            if sync[1] & 4:
+                raise RuntimeError('Firmware could not align sweep markers to ADC packets')
+            points = []
+            for offset in (8, 14, 20, 26):
+                seq, index = struct.unpack_from('<IH', sync, offset)
+                if index >= 8192:
+                    raise RuntimeError('Invalid scan marker sample index')
+                delta = ((seq - snap.record_sequence + 0x80000000) & 0xffffffff) - 0x80000000
+                points.append(snap.received_sample_end - 8192 + delta * 8192 + index)
+            anchors = (sync[1], points)
+
         try:
             if acquired:
-                # The standard system-manual setup owns the 638 DAC at zero.
-                # Hand it to optical control while preserving 1550 illumination.
                 self._take_optical_638(1.0)
-            scan_start_ns = time.monotonic_ns()
+            # Capture begins before dispatch; alignment comes from hardware markers,
+            # never from the host command clock or command acknowledgement.
+            collect()
             self.system_manual_command(638, MANUAL_SET, CHANNEL_FP_SCAN, 1)
             started = True
-            # The 638 firmware refreshes its optical lease internally during
-            # FAST scan. A manual GET/RENEW would pause FAST and abort it.
-            scan_start = time.monotonic()
-            last_active_progress = scan_start
-            while time.monotonic() - scan_start < 1.35:
-                if cancel is not None and cancel():
-                    raise RuntimeError('FP scan canceled')
-                if time.monotonic() >= deadline:
-                    raise TimeoutError('FP scan exceeded deadline')
-                if time.monotonic() - last_renew >= .4:
-                    for target, channel in sorted(self._system_manual_owned):
-                        if (target, channel) != (638, CHANNEL_OPTICAL):
-                            self.system_manual_command(target, MANUAL_RENEW, channel, timeout_s=.5)
-                    last_renew = time.monotonic()
-                new_rows = ingest(self.telemetry)
-                if on_progress is not None and (new_rows or time.monotonic() - last_active_progress >= .05):
-                    on_progress({'state': 'active', 'acquired': min(1000,
-                                 int((time.monotonic() - scan_start) * 1000)),
-                                 'received': len(pages), 'expected': 1000,
-                                 'estimated': True, 'new_rows': tuple(new_rows)})
-                    last_active_progress = time.monotonic()
-                time.sleep(.003)
-            status = None
-            last_progress = None
+            start_host = time.monotonic()
             while time.monotonic() < deadline:
                 if cancel is not None and cancel():
                     raise RuntimeError('FP scan canceled')
+                collect()
                 now = time.monotonic()
-                if now - last_renew >= .4:
-                    self.system_manual_command(638, MANUAL_RENEW, CHANNEL_OPTICAL, timeout_s=.5)
+                if now-last_renew >= .3:
                     for target, channel in sorted(self._system_manual_owned):
                         if (target, channel) != (638, CHANNEL_OPTICAL):
                             self.system_manual_command(target, MANUAL_RENEW, channel, timeout_s=.5)
                     last_renew = time.monotonic()
-                new_rows = ingest(self.telemetry)
-                if status is None or now - last_status >= .5:
-                    status = self.read_fp_scan_638(timeout_s=.5)
-                    last_status = time.monotonic()
-                    if status['state'] == 'aborted':
-                        raise RuntimeError(f"638 aborted FP scan: {status['result']}")
-                    if status['state'] == 'complete' and not FP_SCAN_MIN_RECORDS <= status['count'] <= FP_SCAN_MAX_RECORDS:
-                        raise RuntimeError(f"638 completed unexpected {status['count']} FP scan records")
-                progress = (status['count'] if status else 0, len(pages))
-                if on_progress is not None and progress != last_progress:
-                    on_progress({'state': status['state'] if status else 'unknown',
-                                 'acquired': progress[0], 'received': progress[1],
-                                 'expected': status['count'] if status['state'] == 'complete' else 1000,
-                                 'estimated': False,
-                                 'new_rows': tuple(new_rows)})
-                    last_progress = progress
-                if (total is not None and FP_SCAN_MIN_RECORDS <= total <= FP_SCAN_MAX_RECORDS and
-                        len(pages) == total and status['state'] == 'complete' and status['count'] == total):
-                    if len(rows) != total - 1:
-                        raise RuntimeError('FP trace records are not contiguous')
-                    rows.sort(key=lambda row: row['index'])
-                    commands = [pages[index].actual_dac for index in range(total)]
-                    if (commands[0] != 0 or commands[-2] != cap or commands[-1] != 0 or
-                            any(right < left or right > cap for left, right in
-                                zip(commands[:-2], commands[1:-1]))):
-                        raise RuntimeError('FP trace DAC sequence violates 0-to-cap-to-zero scan')
-                    duration_s = ((pages[total - 1].cycles - pages[0].cycles) & 0xffffffff) / clock_hz
-                    if not .85 <= duration_s <= 1.25:
-                        raise RuntimeError(f'FP trace duration {duration_s:.3f}s is not the expected scan')
-                    quality = ['commanded_dac_not_analog_verified', 'first_feedback_unpaired']
-                    if total < 900:
-                        quality.append('sparse_scan_records')
-                    if any(row['command_age_s'] > .0025 for row in rows):
-                        quality.append('sample_gap_over_2p5ms')
-                    return {'status': 'complete',
-                            'quality_flags': tuple(quality),
-                            'rows': tuple(rows),
-                            'capture_id': capture_id, 'clock_hz': clock_hz,
-                            'start_tick_ms': start_tick_ms, 'point_count': total,
-                            'paired_count': len(rows), 'duration_s': duration_s,
-                            'dac_cap': cap,
-                            'illumination_1550_dac': illumination,
-                            'first_unpaired_feedback': pages[0].feedback}
-                time.sleep(.003)
-            raise TimeoutError(f'FP scan timed out with {len(pages)} trace records')
+                if on_progress is not None and now-last_progress >= .05:
+                    live_rows = []
+                    if anchors:
+                        live_begin = (anchors[1][0]+anchors[1][1]+132)//2
+                        ready = min(1000, max(0, (cursor-live_begin)//10000))
+                        for i in range(live_index, ready):
+                            absolute = live_begin+i*10000
+                            if self.samples_received-absolute > self.buffer_capacity:
+                                raise RuntimeError('ADC ring overwritten during live plotting')
+                            j = absolute % self.buffer_capacity
+                            v = (self.buffer[j:j+10000].copy() if j+10000 <= self.buffer_capacity else
+                                 np.concatenate((self.buffer[j:], self.buffer[:j+10000-self.buffer_capacity])))
+                            live_rows.append({'index': i, 'commanded_dac': cap*i/999,
+                                              'main_pd_adc_counts': float(v.mean())})
+                        live_index = ready
+                    on_progress({'state': 'capturing live ADC', 'acquired': min(1000, int((now-start_host)*1000)),
+                                 'received': min(1000, int((now-start_host)*1000)), 'expected': 1000,
+                                 'estimated': True, 'new_rows': tuple(live_rows)})
+                    last_progress = now
+                if anchors and anchors[0] & 2:
+                    break
+                if now-start_host > 2.5:
+                    raise RuntimeError('No complete live ADC scan markers; update master and638 firmware')
+                time.sleep(.005)
+            if not anchors or not anchors[0] & 2:
+                raise TimeoutError('FP scan marker timeout')
+            lo, hi, endlo, endhi = anchors[1]
+            # Guarded sample is32 samples behind the DMA frontier. The upper
+            # bound includes10us for wire transfer/ISR/DAC launch; validate width.
+            hi += 132
+            endhi += 132
+            if not 0 < hi-lo <= 3000 or not 0 < endhi-endlo <= 3000:
+                raise RuntimeError('FP marker uncertainty exceeds300us')
+            begin = (lo+hi)//2
+            finish = (endlo+endhi)//2
+            duration_s = (finish-begin)/10_000_000
+            if not .98 <= duration_s <= 1.03:
+                raise RuntimeError(f'Unexpected FP ramp duration {duration_s:.6f}s')
+            # Let the terminal marker drain and638 restore NORMAL before GET.
+            while time.monotonic()-start_host < 1.35:
+                collect();time.sleep(.005)
+            status = self.read_fp_scan_638(timeout_s=.5)
+            if status['state'] != 'complete' or status['result'] != 'complete':
+                raise RuntimeError(f'FP firmware scan did not complete: {status}')
+            collect()
+            raw = np.concatenate(chunks)
+            if begin < origin or finish > cursor:
+                raise RuntimeError('ADC capture does not contain the full sweep')
+            raw = raw[begin-origin:finish-origin].copy()
+            edges = np.linspace(0,len(raw),1001,dtype=np.int64)
+            for i,(left,right) in enumerate(zip(edges[:-1],edges[1:])):
+                values = raw[left:right]
+                rows.append({'index': i, 'commanded_dac': cap*i/999,
+                             'main_pd_adc_counts': float(values.mean()),
+                             'adc_min': int(values.min()), 'adc_max': int(values.max()),
+                             'time_s': float((left+right)/2/10_000_000),
+                             'dac_source': 'estimated_from_firmware_timed_ramp'})
+            if on_progress:
+                on_progress({'state': 'complete', 'acquired': 1000, 'received': 1000,
+                             'expected': 1000, 'estimated': False, 'new_rows': ()})
+            return {'status': 'complete', 'rows': tuple(rows), 'raw_adc': raw,
+                    'sample_rate_hz': 10_000_000, 'capture_id': capture_id,
+                    'duration_s': duration_s, 'dac_cap': cap, 'point_count': len(raw),
+                    'paired_count': len(rows), 'illumination_1550_dac': illumination,
+                    'alignment_bound_us': max(hi-lo,endhi-endlo)/20,
+                    'quality_flags': ('live_master_adc', 'dac_axis_estimated_1ms_staircase',
+                                      'commanded_dac_not_analog_verified'),
+                    'marker_sample_bounds': (lo,hi,endlo,endhi)}
         except Exception as exc:
             if started:
                 try:

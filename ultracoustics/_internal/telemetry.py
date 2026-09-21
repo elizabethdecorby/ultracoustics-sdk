@@ -164,6 +164,8 @@ class TelemetrySnapshot:
     optical_trace_638: Optional[CachedOpticalPage] = None
     optical_page_raw: Optional[bytes] = None
     optical_page_age_ms: int = 0
+    scan_sync: Optional[bytes] = None
+    received_sample_end: int = 0
 
     @property
     def host_age_s(self) -> float:
@@ -200,7 +202,7 @@ def _parse_board_tlv(payload: bytes, expected_board: int) -> tuple[BoardTelemetr
     return board, link_flags
 
 
-def parse_format1_trailer(trailer, *, include_optical=False):
+def parse_format1_trailer(trailer, *, include_optical=False, include_sync=False):
     """Parse a current or bounded future format-1 trailer.
 
     Unknown optional TLVs are skipped. Unknown required TLVs fail. Current
@@ -267,11 +269,17 @@ def parse_format1_trailer(trailer, *, include_optical=False):
                 raise TelemetryFormatError('optical TLV type does not match page type')
             optical_raw = payload[:52]
             optical_age_ms, = struct.unpack_from('<H', payload, 52)
+        elif version == 2 and tlv_type == 0x8007:
+            if len(payload) != 54 or payload[0] != 1 or payload[1] & ~7:
+                raise TelemetryFormatError('invalid scan synchronization TLV')
+            scan_sync = payload
         elif not (tlv_type & OPTIONAL_TLV_BIT):
             raise TelemetryFormatError(f"unknown required TLV {tlv_type:#x}")
-    if offset != trailer_len or board_1550 is None or (board_638 is None and 'optical_raw' not in locals()):
+    if offset != trailer_len or board_1550 is None or (board_638 is None and 'optical_raw' not in locals() and 'scan_sync' not in locals()):
         raise TelemetryFormatError("missing required board telemetry")
     result = (epoch, board_638, board_1550, link_flags_638, link_flags_1550)
+    if include_sync:
+        return result + (locals().get('optical_raw'), locals().get('optical_age_ms', 0), version, locals().get('scan_sync'))
     return result + (locals().get('optical_raw'),
                      locals().get('optical_age_ms', 0), version) if include_optical else result
 
@@ -297,8 +305,8 @@ def parse_record(raw, expected_format: int, *, received_monotonic_ns: Optional[i
         return ParsedRecord(sequence, drops_fw, samples, None)
 
     trailer = view[LEGACY_RECORD_BYTES:]
-    epoch, board_638, board_1550, link638, link1550, optical_raw, optical_age_ms, trailer_version = parse_format1_trailer(
-        trailer, include_optical=True)
+    epoch, board_638, board_1550, link638, link1550, optical_raw, optical_age_ms, trailer_version, scan_sync = parse_format1_trailer(
+        trailer, include_sync=True)
     if trailer_version != expected_format:
         raise TelemetryFormatError(
             f'format {expected_format} requires trailer version {expected_format}')
@@ -307,13 +315,13 @@ def parse_record(raw, expected_format: int, *, received_monotonic_ns: Optional[i
                                   board_1550, link638, link1550,
                                   wire_format=expected_format,
                                   optical_page_raw=optical_raw,
-                                  optical_page_age_ms=optical_age_ms)
+                                  optical_page_age_ms=optical_age_ms, scan_sync=scan_sync)
     return ParsedRecord(sequence, drops_fw, samples, telemetry)
 
 
 # Seqlock sidecar: generation, epoch/record, receive time, two canonical blobs,
 # records published, parse errors, epoch changes. One subprocess writer.
-SIDECAR_BYTES = 456
+SIDECAR_BYTES = 520
 _OPTICAL_SLOT_OFFSETS = (168, 240, 312, 384)
 
 
@@ -349,12 +357,16 @@ class TelemetrySidecarWriter:
         self._boards.clear()
         self._end()
 
-    def publish(self, snapshot: TelemetrySnapshot) -> None:
+    def publish(self, snapshot: TelemetrySnapshot, sample_end: int = 0) -> None:
         self._begin()
         if self._last_epoch is not None and self._last_epoch != snapshot.stream_epoch:
             self._boards.clear()
+            self._buf[456:510] = b'\0' * 54
             for offset in _OPTICAL_SLOT_OFFSETS:
                 self._buf[offset:offset + 72] = b'\0' * 72
+        struct.pack_into('<Q', self._buf, 512, sample_end)
+        if snapshot.scan_sync is not None:
+            self._buf[456:510] = snapshot.scan_sync
         if snapshot.board_638 is not None:
             self._boards[638] = (snapshot.board_638, snapshot.link_flags_638)
         if snapshot.board_1550 is not None:
@@ -427,5 +439,7 @@ def read_sidecar(shm: SharedMemory) -> tuple[Optional[TelemetrySnapshot], dict]:
         BoardTelemetry.from_bytes(data[24:76]),
         BoardTelemetry.from_bytes(data[76:128]),
         link638, link1550, active_format, *optical,
+        scan_sync=data[456:510] if data[456] == 1 else None,
+        received_sample_end=struct.unpack_from('<Q', data, 512)[0],
     )
     return snapshot, stats

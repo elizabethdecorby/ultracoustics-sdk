@@ -561,7 +561,7 @@ def reader_main(
                     counters[1] = total
                     counters[2] += 1  # packets
                     if parsed.telemetry is not None and telemetry_writer is not None:
-                        telemetry_writer.publish(parsed.telemetry)
+                        telemetry_writer.publish(parsed.telemetry, total)
 
             elif status == usb1.TRANSFER_TIMED_OUT:
                 counters[5] += 1

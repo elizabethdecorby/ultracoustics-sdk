@@ -68,6 +68,26 @@ def format2_record(kind=3, page_kind=2, seq=12, epoch=3, page_age_ms=0):
     return legacy + trailer
 
 
+class ScanSyncTests(unittest.TestCase):
+ def test_optional_marker_crc_and_sidecar_sample_coordinate(self):
+  marker=bytearray(54);marker[0]=1;marker[1]=3;struct.pack_into('<I',marker,4,19)
+  raw=bytearray(format1_record(tlvs=[(0x8007,marker),(2,board_blob(1550)+b'\0\0')]))
+  raw[LEGACY_RECORD_BYTES+4]=2
+  struct.pack_into('<I',raw,len(raw)-4,zlib.crc32(raw[LEGACY_RECORD_BYTES:-8])&0xffffffff)
+  parsed=parse_record(raw,2)
+  self.assertEqual(parsed.telemetry.scan_sync,marker)
+  shm=SharedMemory(create=True,size=SIDECAR_BYTES)
+  try:
+   initialise_sidecar(shm);writer=TelemetrySidecarWriter(shm)
+   writer.publish(parse_record(format1_record(),1).telemetry,8192)
+   writer.publish(parsed.telemetry,16384)
+   snapshot,_=read_sidecar(shm)
+   self.assertEqual(snapshot.scan_sync,marker)
+   self.assertEqual(snapshot.received_sample_end,16384)
+   raw[-1]^=1
+   with self.assertRaises(TelemetryFormatError):parse_record(raw,2)
+  finally:shm.close();shm.unlink()
+
 class TelemetryParserTests(unittest.TestCase):
     def test_attach_to_retained_format_without_control_commands(self):
         record, mode = stream_proc.parse_attached_record(format1_record(), 0, 99)
