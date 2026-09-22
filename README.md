@@ -321,6 +321,36 @@ sorted by scan index even when early trace pages were missed.
 new capability, runtime hold/rate, and scan status words. Timing accepts
 dividers 1, 2, 3, 5, and 10 and can be changed in automatic RUN.
 
+### Runtime normalized PI and box profile
+
+`read_normalized_pi_638()` returns `kp`, `ki_per_s`, `active`, `overridden`,
+`slope_valid`, and protocol `version`. Call `set_normalized_pi_638(kp,
+ki_per_s)` to change both gains atomically, or `restore_normalized_pi_638()`
+to recover the compiled box defaults. These calls require a healthy locked
+normalized PI path with a valid measured slope; a rejected request does not
+switch to the legacy gain law. The host accepts finite Kp from 0 to 1 and Ki
+from 0 to 1000 per second. Wire resolution is 0.001 Kp and 0.1/s Ki. Active
+overrides are volatile and survive bounded recovery/reacquisition; full
+IDLE/Stop resets them. Existing `optical_pid_638()` setters are legacy manual
+gain controls and select the legacy law.
+
+The 638 manual protocol uses channel 10 for one packed gain pair:
+`(round(Kp * 1000) << 14) | round(Ki_per_s * 10)`. `GET` and successful `SET`
+return the complete pair in the ACK's signed 24-bit value; decode it with
+`value & 0xffffff` before unpacking. Channel 11 `GET` reports contract
+version 1 in bits 0–7, normalized law active in bit 8, override in bit 9,
+and slope valid in bit 10. `SET 0` on channel 11 restores profile defaults.
+Channel 12 is a read-only numeric box profile: `1` Belycomm and `2`
+QPhotonics. `read_profile_638()` resolves it to a stable profile name; this
+ID is not a firmware version.
+
+These channels require updated master and 638 firmware. The SDK probes
+channel 11 before tuning and reports unsupported firmware or a failed
+capability probe explicitly. In automatic RUN the master permits these
+bounded 638 requests; in manual mode, release a manually owned 638 laser DAC
+before optical tuning. Run these synchronous SDK calls from a worker when
+using a graphical interface.
+
 ModuleNotFoundError:
 
 - Ensure the virtual environment is activated.
