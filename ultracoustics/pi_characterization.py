@@ -159,6 +159,10 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
         report["live_preflight"] = _plain(live)
         # Distinct live sequences over a recent 15 s window; 120 s maximum.
         emit("settling", "Waiting for a stable operating point")
+        report["settling"] = {"passed": False, "observations": 0,
+                              "limits": {"min_elapsed_s": 20, "window_s": 15,
+                                         "max_abs_drift_dac_per_s": 3, "max_dac_span": 100,
+                                         "max_median_abs_error": 60, "max_slope_span": .05}}
         settle_started = time.monotonic()
         history = []
         last_sequence = None
@@ -172,6 +176,7 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
             last_sequence = live.sequence
             now = time.monotonic()
             history.append((now, live.dac, live.feedback-live.target, live.slope))
+            report["settling"]["observations"] = len(history)
             recent = np.asarray([row for row in history if row[0] >= now-15], dtype=float)
             if len(recent) < 15 or recent[-1, 0]-recent[0, 0] < 14:
                 continue
@@ -180,8 +185,9 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
                         "drift_dac_per_s": round(drift, 3), "dac_span": float(np.ptp(recent[:, 1])),
                         "median_abs_error": float(np.median(abs(recent[:, 2]))),
                         "slope_span": float(np.ptp(recent[:, 3]))}
+            report["settling"].update(settling)
             if now-settle_started >= 20 and abs(drift) <= 3 and settling["dac_span"] <= 100 and settling["median_abs_error"] <= 60 and settling["slope_span"] <= .05:
-                report["settling"] = settling
+                report["settling"]["passed"] = True
                 settled = True
                 break
             notice = int(now-settle_started)//10
@@ -328,7 +334,7 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
         fit = (report.get("analysis") or {}).get("plant_fit") or {}
         screen = (report.get("analysis") or {}).get("screen") or {}
         candidates = (screen.get("best_supported") or []) if status == "complete" else []
-        lines = ["# 638 PI characterization", "", f"Status: **{status}**", f"Board: {report.get('board_serial') or 'unknown'}", f"Profile: {(report.get('profile') or {}).get('name', 'unknown')}", f"Reason: {report.get('reason') or 'See measured evidence below.'}", f"Master feedback filter assertion: {report['configuration'].get('master_feedback_filter')}", f"Original trace configuration restored: {report.get('trace_config_restored', 'not changed')}", f"Trace configuration restore error: {report.get('trace_config_restore_error', 'none')}", "", "## Measured evidence", "", f"Current gains: {report.get('pi_before')}", f"Trace: {report.get('trace_progress')}", f"Capture counter changes: {report.get('capture_counter_deltas')}", f"Replay counter changes: {report.get('replay_counter_deltas')}", f"Diagnostic fit: {fit}", "", "## Exploratory candidates", ""]
+        lines = ["# 638 PI characterization", "", f"Status: **{status}**", f"Board: {report.get('board_serial') or 'unknown'}", f"Profile: {(report.get('profile') or {}).get('name', 'unknown')}", f"Reason: {report.get('reason') or 'See measured evidence below.'}", f"Master feedback filter assertion: {report['configuration'].get('master_feedback_filter')}", f"Original trace configuration restored: {report.get('trace_config_restored', 'not changed')}", f"Trace configuration restore error: {report.get('trace_config_restore_error', 'none')}", "", "## Measured evidence", "", f"Current gains: {report.get('pi_before')}", f"Settling gate: {report.get('settling')}", f"Trace: {report.get('trace_progress')}", f"Capture counter changes: {report.get('capture_counter_deltas')}", f"Replay counter changes: {report.get('replay_counter_deltas')}", f"Diagnostic fit: {fit}", "", "## Exploratory candidates", ""]
         lines.extend(f"- Kp {item['kp']}, Ki {item['ki_per_s']}/s; worst estimated phase margin {item['worst_phase_margin_deg']}°" for item in candidates)
         if not candidates:
             lines.append("No candidate qualified for display from this record.")
