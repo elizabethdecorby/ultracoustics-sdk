@@ -329,7 +329,8 @@ ki_per_s)` to change both gains atomically, or `restore_normalized_pi_638()`
 to recover the compiled box defaults. These calls require a healthy locked
 normalized PI path with a valid measured slope; a rejected request does not
 switch to the legacy gain law. The host accepts finite Kp from 0 to 1 and Ki
-from 0 to 1000 per second. Wire resolution is 0.001 Kp and 0.1/s Ki. Active
+from 0 to 1638.3 per second on current firmware; older firmware may reject
+Ki above 1000/s. Wire resolution is 0.001 Kp and 0.1/s Ki. Active
 overrides are volatile and survive bounded recovery/reacquisition; full
 IDLE/Stop resets them. Existing `optical_pid_638()` setters are legacy manual
 gain controls and select the legacy law.
@@ -350,6 +351,43 @@ capability probe explicitly. In automatic RUN the master permits these
 bounded 638 requests; in manual mode, release a manually owned 638 laser DAC
 before optical tuning. Run these synchronous SDK calls from a worker when
 using a graphical interface.
+
+### Bounded PI characterization report
+
+`run_pi_characterization(controller, report_dir, progress=None, cancel=None,
+verified_master_filter=None)`
+uses an **existing** connected, streaming Controller with optical diagnostics
+format 2 and a healthy automatic 638 lock. It does not start or stop the
+system, connect a second session, command a robot, or apply PI gains. Call it
+from a GUI worker that exclusively owns Controller commands. `progress`
+receives a dictionary with `stage`, `message`, and `elapsed_s`; `cancel` is a
+zero-argument predicate. The return value and `summary.json` have a `status`
+of `complete`, `unqualified`, or `cancelled`, and a reason when appropriate.
+
+The routine checks profile identity (Belycomm 1 or QPhotonics 2), runtime PI,
+DAC cap and headroom, 10 kHz timing, configurable-trace support, fresh lock,
+and up to 120 seconds of settling. It requests one 4096-row, D4, hold4,
+8-DAC trace and waits at most 240 seconds for indexed replay. It keeps ADC
+counter changes during the capture separate from replay changes. The report
+directory contains a concise `report.md`, machine-readable `summary.json`,
+and a compressed `trace.npz` of just the bounded control trace; partial replay
+rows are saved as `trace-partial.npz` after failure or cancellation. No full
+10 MSPS ADC stream is saved. The measured FRF, diagnostic fit, and exploratory
+PI candidate screen are in the JSON report. Pass
+`verified_master_filter="single_sample"` only after independently verifying
+the installed master filter is OFF; otherwise the report withholds gain
+screening and retains measured FRFs. These candidates are local
+evidence for review, not an automatic gain recommendation. The installed
+master feedback filter must be verified to be `single_sample`; the SDK cannot
+read that setting, so the report records the caller's assertion. A cancellation
+returns promptly without stopping the shared controller; an excitation
+already started in firmware may finish after the caller returns.
+
+For a standalone session, `python examples/pi_characterization.py REPORT_DIR
+--start-and-stop --verified-single-sample-filter` explicitly starts and then
+stops the laser system with the filter assertion. Omit the filter flag to
+collect only measured FRFs. Do not
+run that program concurrently with a GUI owning the same device.
 
 ModuleNotFoundError:
 
