@@ -12,7 +12,7 @@ from typing import Optional
 import numpy as np
 from .optical_diagnostics import (CachedOpticalPage, OpticalABBA,
                                   OpticalAcquisition, OpticalDiagnosticError,
-                                  OpticalLive, OpticalTrace, parse_page)
+                                  OpticalLive, OpticalTrace, OpticalTraceSample, parse_page)
 
 
 LEGACY_RECORD_BYTES = 16_392
@@ -321,7 +321,11 @@ def parse_record(raw, expected_format: int, *, received_monotonic_ns: Optional[i
 
 # Seqlock sidecar: generation, epoch/record, receive time, two canonical blobs,
 # records published, parse errors, epoch changes. One subprocess writer.
-SIDECAR_BYTES = 520
+SNAPSHOT_BYTES = 520
+_TRACE_HEADER = 520
+_TRACE_VALID = 584
+_TRACE_ROWS = _TRACE_VALID + 4096
+SIDECAR_BYTES = _TRACE_ROWS + 4096 * 12
 _OPTICAL_SLOT_OFFSETS = (168, 240, 312, 384)
 
 
@@ -335,6 +339,8 @@ class TelemetrySidecarWriter:
         self._generation = 0
         self._last_epoch: Optional[int] = None
         self._boards = {}
+        self._trace_key = None
+        self._trace_last_raw = None
 
     def _begin(self) -> None:
         self._generation += 2
@@ -355,12 +361,45 @@ class TelemetrySidecarWriter:
         struct.pack_into("<II", self._buf, 152, 0, 0)
         self._last_epoch = None
         self._boards.clear()
+        self._clear_trace()
         self._end()
+
+    def _clear_trace(self):
+        self._buf[_TRACE_HEADER:SIDECAR_BYTES] = b'\0' * (SIDECAR_BYTES - _TRACE_HEADER)
+        self._trace_key = None
+        self._trace_last_raw = None
+
+    def _retain_trace(self, page, raw, epoch):
+        key = (epoch, page.capture_id, page.start_tick_ms)
+        if key != self._trace_key:
+            self._clear_trace()
+            self._trace_key = key
+            struct.pack_into('<8I', self._buf, _TRACE_HEADER, 1, epoch,
+                             page.capture_id, page.start_tick_ms, page.total_samples,
+                             page.clock_hz, page.flags, 0)
+        header = struct.unpack_from('<8I', self._buf, _TRACE_HEADER)
+        if header[4:7] != (page.total_samples, page.clock_hz, page.flags):
+            struct.pack_into('<I', self._buf, _TRACE_HEADER + 28, 1)
+            return
+        if raw == self._trace_last_raw:
+            return
+        self._trace_last_raw = raw
+        for j in range(len(page.samples)):
+            i = page.start_index + j
+            row = raw[20 + 12*j:32 + 12*j]
+            offset = _TRACE_ROWS + 12*i
+            if self._buf[_TRACE_VALID+i]:
+                if self._buf[offset:offset+12] != row:
+                    struct.pack_into('<I', self._buf, _TRACE_HEADER + 28, 1)
+            else:
+                self._buf[offset:offset+12] = row
+                self._buf[_TRACE_VALID+i] = 1
 
     def publish(self, snapshot: TelemetrySnapshot, sample_end: int = 0) -> None:
         self._begin()
         if self._last_epoch is not None and self._last_epoch != snapshot.stream_epoch:
             self._boards.clear()
+            self._clear_trace()
             self._buf[456:510] = b'\0' * 54
             for offset in _OPTICAL_SLOT_OFFSETS:
                 self._buf[offset:offset + 72] = b'\0' * 72
@@ -379,6 +418,8 @@ class TelemetrySidecarWriter:
             self._buf[76:128] = _CANONICAL.pack(*astuple(self._boards[1550][0]))
         if snapshot.optical_page_raw is not None:
             page = parse_page(snapshot.optical_page_raw)
+            if isinstance(page, OpticalTrace):
+                self._retain_trace(page, snapshot.optical_page_raw, snapshot.stream_epoch)
             slot = (0 if isinstance(page, OpticalLive) else
                     1 if isinstance(page, OpticalAcquisition) else
                     2 if isinstance(page, OpticalABBA) else 3)
@@ -412,7 +453,7 @@ def read_sidecar(shm: SharedMemory) -> tuple[Optional[TelemetrySnapshot], dict]:
         before, = struct.unpack_from("<Q", shm.buf, 0)
         if before & 1:
             continue
-        data = bytes(shm.buf[:SIDECAR_BYTES])
+        data = bytes(shm.buf[:SNAPSHOT_BYTES])
         after, = struct.unpack_from("<Q", shm.buf, 0)
         if before == after and not (after & 1):
             break
@@ -443,3 +484,26 @@ def read_sidecar(shm: SharedMemory) -> tuple[Optional[TelemetrySnapshot], dict]:
         received_sample_end=struct.unpack_from('<Q', data, 512)[0],
     )
     return snapshot, stats
+
+
+def read_retained_trace(shm):
+    """Latest indexed capture, retained until epoch/new capture/reset; not live state."""
+    for _ in range(8):
+        before, = struct.unpack_from('<Q', shm.buf, 0)
+        if before & 1:
+            continue
+        data = bytes(shm.buf[_TRACE_HEADER:SIDECAR_BYTES])
+        after, = struct.unpack_from('<Q', shm.buf, 0)
+        if before == after and not after & 1:
+            break
+    else:
+        return None
+    valid, epoch, capture, tick, total, clock, flags, conflict = struct.unpack_from('<8I', data)
+    if not valid:
+        return None
+    rows = {i: OpticalTraceSample(*struct.unpack_from('<IHHhH', data, _TRACE_ROWS-_TRACE_HEADER+12*i))
+            for i in range(total) if data[_TRACE_VALID-_TRACE_HEADER+i]}
+    return dict(stream_epoch=epoch, capture_id=capture, start_tick_ms=tick,
+                total_samples=total, clock_hz=clock, flags=flags, conflict=bool(conflict),
+                complete=len(rows)==total and not conflict and bool(flags&1),
+                samples=rows, missing_indices=tuple(i for i in range(total) if i not in rows))

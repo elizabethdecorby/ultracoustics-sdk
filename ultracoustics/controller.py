@@ -245,6 +245,17 @@ class Controller(SystemControlMixin):
             return None
         return self._stream.get_stream_stats()
 
+    def retained_control_trace(self):
+        """Read the latest bounded indexed trace without polling away older pages.
+
+        Historical capture, not a claim that the board is still locked. Check
+        epoch/capture identity, complete and conflict before using for tuning.
+        """
+        if self._stream is None or self._stream._telemetry_shm is None:
+            return None
+        from ._internal.telemetry import read_retained_trace
+        return read_retained_trace(self._stream._telemetry_shm)
+
     @property
     def telemetry(self):
         """Latest immutable diagnostic snapshot, or ``None``.
