@@ -84,9 +84,27 @@ class SystemControlTests(unittest.TestCase):
   self.assertTrue(result['active'] and result['overridden'])
   self.assertIn((638,MANUAL_SET,10,(800<<14)|950),f.calls)
   self.assertFalse(any(c[1]==MANUAL_TAKE for c in f.calls))
+  for kp,ki in ((.483,1178.7),(1.0,1638.3),(0.0,0.0)):
+   result=f.set_normalized_pi_638(kp,ki)
+   self.assertEqual((result['kp'],result['ki_per_s']),(kp,ki))
+   self.assertEqual(result['packed'],(round(kp*1000)<<14)|round(ki*10))
+  for invalid in (1638.31, -0.1, float('inf'), float('nan')):
+   before=len(f.calls)
+   with self.assertRaises(ValueError):f.set_normalized_pi_638(.2,invalid)
+   self.assertEqual(len(f.calls),before)
   self.assertFalse(f.restore_normalized_pi_638()['overridden'])
   with self.assertRaises(ValueError):f.set_normalized_pi_638(1.1,95)
   self.assertFalse(any(c[1]==MANUAL_SET and c[2] in (4,5,6) for c in f.calls))
+  class OldRangeFake(NormalizedFake):
+   def manual_command(self,target,opcode,channel,value=0,timeout_s=1):
+    if opcode==MANUAL_SET and channel==10 and (value&0x3fff)>10000:
+     self.calls.append((target,opcode,channel,value))
+     return SimpleNamespace(target=target,status=6,channel=channel,owner=0,applied_value=0)
+    return super().manual_command(target,opcode,channel,value,timeout_s)
+  old=OldRangeFake()
+  with self.assertRaisesRegex(RuntimeError,'status 6'):old.set_normalized_pi_638(.483,1178.7)
+  self.assertEqual(old.read_normalized_pi_638()['ki_per_s'],90)
+  self.assertEqual(sum(c[1]==MANUAL_SET for c in old.calls),1)
   class OldFake(NormalizedFake):
    def manual_command(self,target,opcode,channel,value=0,timeout_s=1):
     reply=super().manual_command(target,opcode,channel,value,timeout_s)

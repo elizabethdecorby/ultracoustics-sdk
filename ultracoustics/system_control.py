@@ -26,6 +26,7 @@ CHANNEL_NORMALIZED_PI_INFO = 11
 CHANNEL_PROFILE_ID = 12
 CHANNEL_TRACE_CONFIG = 13
 NORMALIZED_PI_VERSION = 1
+NORMALIZED_PI_MAX_KI_PER_S = 0x3fff / 10.0
 FP_SCAN_STATES = ('idle', 'armed', 'qualifying', 'active', 'complete', 'aborted')
 FP_SCAN_RESULTS = ('none', 'complete', 'explicit_abort', 'invalid_or_fault')
 FP_SCAN_MIN_RECORDS = 500
@@ -133,17 +134,22 @@ class SystemControlMixin:
             MANUAL_GET, CHANNEL_NORMALIZED_PI, timeout_s=timeout_s))
         packed = reply.applied_value & 0xffffff  # ACK is signed 24-bit.
         kp_milli, ki_deci = packed >> 14, packed & 0x3fff
-        if kp_milli > 1000 or ki_deci > 10000:
+        if kp_milli > 1000:
             raise RuntimeError(f'638 returned out-of-range normalized PI pair {packed}')
         return dict(info, kp=kp_milli / 1000.0, ki_per_s=ki_deci / 10.0,
                     packed=packed)
 
     def set_normalized_pi_638(self, kp, ki_per_s, timeout_s=1.0):
-        """Commit Kp and Ki/s together; verify the applied pair and law."""
+        """Commit Kp and Ki/s together; verify the applied pair and law.
+
+        The existing 14-bit Ki field permits 0..1638.3/s. Older firmware
+        may reject values above 1000/s; propagate that rejection without retries.
+        Runtime overrides do not change the compiled profile defaults.
+        """
         if (type(kp) not in (int, float) or type(ki_per_s) not in (int, float) or
                 not math.isfinite(kp) or not math.isfinite(ki_per_s) or
-                not 0 <= kp <= 1 or not 0 <= ki_per_s <= 1000):
-            raise ValueError('Normalized PI requires finite Kp 0..1 and Ki 0..1000 per second')
+                not 0 <= kp <= 1 or not 0 <= ki_per_s <= NORMALIZED_PI_MAX_KI_PER_S):
+            raise ValueError('Normalized PI requires finite Kp 0..1 and Ki 0..1638.3 per second')
         info = self._normalized_pi_info_638(timeout_s)
         if not info['active'] or not info['slope_valid']:
             raise RuntimeError('638 normalized PI must be active with a valid slope before tuning')
