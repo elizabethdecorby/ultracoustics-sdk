@@ -24,6 +24,7 @@ CHANNEL_FP_SCAN = 9
 CHANNEL_NORMALIZED_PI = 10
 CHANNEL_NORMALIZED_PI_INFO = 11
 CHANNEL_PROFILE_ID = 12
+CHANNEL_TRACE_CONFIG = 13
 NORMALIZED_PI_VERSION = 1
 FP_SCAN_STATES = ('idle', 'armed', 'qualifying', 'active', 'complete', 'aborted')
 FP_SCAN_RESULTS = ('none', 'complete', 'explicit_abort', 'invalid_or_fault')
@@ -54,6 +55,49 @@ class FPScanError(RuntimeError):
 
 
 class SystemControlMixin:
+    @staticmethod
+    def _decode_trace_config(word):
+        if type(word) is not int or word < 0 or (word & ~0x1fffff) != 0x400000:
+            raise RuntimeError('Unsupported 638 trace configuration version/reserved bits')
+        amplitude, hold = word & 0x7f, (word >> 7) & 255
+        decimation = ((word >> 15) & 63) + 1
+        if not 1 <= amplitude <= 64 or not 1 <= hold <= 255:
+            raise RuntimeError('638 returned invalid trace configuration')
+        return dict(version=1, amplitude_dac=amplitude, hold_updates=hold,
+                    decimation=decimation, packed=word,
+                    recorder_filter='four_boxcars' if decimation > 1 else 'none')
+
+    def read_control_trace_config_638(self, timeout_s=1.0):
+        """Read versioned identification settings; requires supporting firmware."""
+        reply = self._normalized_pi_command_638(MANUAL_GET, CHANNEL_TRACE_CONFIG,
+                                               timeout_s=timeout_s)
+        if reply.status == 4:
+            raise RuntimeError('638 firmware does not support configurable identification')
+        return self._decode_trace_config(require_applied(reply).applied_value)
+
+    def configure_control_trace_638(self, amplitude_dac=2, hold_updates=1,
+                                    decimation=1, timeout_s=1.0):
+        """Configure the next excited trace without starting it or changing PI gains.
+
+        The slave requires healthy locked normalized control and no busy capture.
+        For decimation > 1, y/u/d share four length-D boxcar filters at the control
+        rate. Record timestamps are output times; nominal filter delay is 2(D-1)
+        control updates. Quantization/coherence must be checked before fitting.
+        """
+        for value, maximum in ((amplitude_dac, 64), (hold_updates, 255), (decimation, 64)):
+            if type(value) is not int or not 1 <= value <= maximum:
+                raise ValueError('Trace settings require integer amplitude 1..64, hold 1..255, decimation 1..64')
+        self.read_control_trace_config_638(timeout_s)
+        word = 0x400000 | ((decimation-1) << 15) | (hold_updates << 7) | amplitude_dac
+        reply = require_applied(self._normalized_pi_command_638(
+            MANUAL_SET, CHANNEL_TRACE_CONFIG, word, timeout_s))
+        if reply.applied_value != word:
+            raise RuntimeError('638 trace configuration acknowledgement differs from request')
+        result = self.read_control_trace_config_638(timeout_s)
+        if result['packed'] != word:
+            raise RuntimeError('638 trace configuration readback differs from request')
+        return result
+
     def _normalized_pi_command_638(self, opcode, channel, value=0, timeout_s=1.0):
         if self.system_manual_active:
             if (638, CHANNEL_LASER_DAC) in self._system_manual_owned:

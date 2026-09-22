@@ -377,7 +377,15 @@ class TelemetrySidecarWriter:
             struct.pack_into('<8I', self._buf, _TRACE_HEADER, 1, epoch,
                              page.capture_id, page.start_tick_ms, page.total_samples,
                              page.clock_hz, page.flags, 0)
+            struct.pack_into('<4I', self._buf, _TRACE_HEADER + 32,
+                             page.amplitude_dac, page.hold_updates or 0,
+                             page.decimation, int(page.recorder_filtered))
+        metadata = (page.amplitude_dac, page.hold_updates or 0,
+                    page.decimation, int(page.recorder_filtered))
         header = struct.unpack_from('<8I', self._buf, _TRACE_HEADER)
+        if struct.unpack_from('<4I', self._buf, _TRACE_HEADER + 32) != metadata:
+            struct.pack_into('<I', self._buf, _TRACE_HEADER + 28, 1)
+            return
         if header[4:7] != (page.total_samples, page.clock_hz, page.flags):
             struct.pack_into('<I', self._buf, _TRACE_HEADER + 28, 1)
             return
@@ -501,9 +509,12 @@ def read_retained_trace(shm):
     valid, epoch, capture, tick, total, clock, flags, conflict = struct.unpack_from('<8I', data)
     if not valid:
         return None
+    amplitude, hold, decimation, filtered = struct.unpack_from('<4I', data, 32)
     rows = {i: OpticalTraceSample(*struct.unpack_from('<IHHhH', data, _TRACE_ROWS-_TRACE_HEADER+12*i))
             for i in range(total) if data[_TRACE_VALID-_TRACE_HEADER+i]}
     return dict(stream_epoch=epoch, capture_id=capture, start_tick_ms=tick,
                 total_samples=total, clock_hz=clock, flags=flags, conflict=bool(conflict),
+                amplitude_dac=amplitude, hold_updates=hold or None,
+                decimation=decimation, recorder_filtered=bool(filtered),
                 complete=len(rows)==total and not conflict and bool(flags&1),
                 samples=rows, missing_indices=tuple(i for i in range(total) if i not in rows))

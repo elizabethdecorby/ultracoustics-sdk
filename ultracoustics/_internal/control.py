@@ -35,7 +35,7 @@ def crc8_poly31(data: bytes) -> int:
 
 def pack_manual_request(opcode: int, channel: int, value: int,
                         transaction: int) -> bytes:
-    if opcode not in range(MANUAL_GET, MANUAL_RENEW + 1) or channel not in range(1, 13):
+    if opcode not in range(MANUAL_GET, MANUAL_RENEW + 1) or channel not in range(1, 14):
         raise ValueError("invalid manual opcode or channel")
     if not -(1 << 31) <= value < (1 << 31):
         raise ValueError("manual value is outside int32")

@@ -57,6 +57,6 @@ def test_scan_trace_flag_and_limit():
     struct.pack_into("<IHHhH",b,32,200,6001,50,0,1)
     struct.pack_into("<H",b,50,crc16_ccitt(b[:50]))
     assert parse_page(b).flags==9
-    struct.pack_into("<H",b,10,1001)
+    struct.pack_into("<H",b,10,1003)
     struct.pack_into("<H",b,50,crc16_ccitt(b[:50]))
     with pytest.raises(OpticalDiagnosticError):parse_page(b)
