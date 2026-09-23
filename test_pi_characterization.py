@@ -87,6 +87,15 @@ class CharacterizationRefusalTests(unittest.TestCase):
         self.assertEqual(result["status"], "cancelled")
         self.assertEqual(controller.commands, [])
 
+    def test_invalid_driver_prior_rejected_before_hardware(self):
+        controller = FakeController()
+        result = self.run_case(controller, driver_pole_hz=800,
+                               driver_pole_range_hz=[1000, 1600],
+                               driver_pole_source="inconsistent estimate")
+        self.assertEqual(result["status"], "unqualified")
+        self.assertIn("range", result["reason"])
+        self.assertEqual(controller.commands, [])
+
     def test_settling_progress_with_elapsed_detail_can_cancel(self):
         controller = FakeController()
         sequence = [0]

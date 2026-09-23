@@ -14,6 +14,7 @@ import time
 import numpy as np
 
 from .pi_analysis import review
+from ._internal import pi_model
 
 COUNTERS = ("drops_seq", "drops_fw", "transfer_errors", "transfer_timeouts", "malformed")
 
@@ -60,7 +61,8 @@ def _trace_array(trace):
 
 
 def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
-                            verified_master_filter=None):
+                            verified_master_filter=None, driver_pole_hz=None,
+                            driver_pole_range_hz=None, driver_pole_source=None):
     """Capture one 4096-row D4/hold4/8-DAC trace and write a reviewable report.
 
     ``controller`` must already be connected, streaming format-2 diagnostics,
@@ -70,7 +72,9 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
     ``verified_master_filter='single_sample'`` is an explicit caller
     assertion from installation evidence; absent that, measured FRFs remain
     available but gain screening is unqualified. No other thread should issue
-    Controller commands during this call.
+    Controller commands during this call. Driver-pole inputs are optional
+    independent hardware priors; without them only empirical FRF screening
+    can qualify. A supplied point defaults to a ±25% sensitivity bracket.
     """
     output = Path(report_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -83,7 +87,8 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
               "limitations": ["One local 1.64 s identification record is insufficient to deploy gains.",
                               "SPI5 DAC commands are not analog output measurements.",
                               "Only 10–400 Hz may be supported; low-frequency integral and high-frequency stability are not directly measured.",
-                              "Master feedback filter has no active-session readback; the caller must verify it independently before gain screening."],
+                              "Master feedback filter has no active-session readback; the caller must verify it independently before gain screening.",
+                              "Driver and thermal first-order poles cannot be separated from this FRF without an independent driver-pole prior."],
               "configuration": {"amplitude_dac": 8, "hold_updates": 4, "decimation": 4,
                                 "master_feedback_filter": verified_master_filter or "unverified"}}
 
@@ -117,6 +122,15 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
 
     try:
         check_cancel()
+        if any(value is not None for value in (driver_pole_hz, driver_pole_range_hz,
+                                               driver_pole_source)):
+            prior = {"driver_pole_hz": driver_pole_hz,
+                     "driver_pole_range_hz": driver_pole_range_hz,
+                     "driver_pole_source": driver_pole_source}
+            nominal, bounds, source_label = pi_model.driver_pole_config(prior)
+            report["driver_pole_prior"] = {"nominal_hz": nominal,
+                                           "range_hz": list(bounds),
+                                           "source": source_label}
         emit("preflight", "Checking board, firmware, and live lock")
         if getattr(controller, "system_manual_active", False) or not getattr(controller, "_running", True):
             raise RuntimeError("Characterization requires automatic RUN, not manual or IDLE")
@@ -210,6 +224,10 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
                 sleep(1)
         config.update(dac_cap=cap, master_feedback_filter=verified_master_filter or "unverified",
                       control_rate_hz=10000)
+        if "driver_pole_prior" in report:
+            config.update(driver_pole_hz=report["driver_pole_prior"]["nominal_hz"],
+                          driver_pole_range_hz=report["driver_pole_prior"]["range_hz"],
+                          driver_pole_source=report["driver_pole_prior"]["source"])
         report["configuration"] = config
         sleep(.3)
         live = _live(controller)
@@ -334,7 +352,7 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
         fit = (report.get("analysis") or {}).get("plant_fit") or {}
         screen = (report.get("analysis") or {}).get("screen") or {}
         candidates = (screen.get("best_supported") or []) if status == "complete" else []
-        lines = ["# 638 PI characterization", "", f"Status: **{status}**", f"Board: {report.get('board_serial') or 'unknown'}", f"Profile: {(report.get('profile') or {}).get('name', 'unknown')}", f"Reason: {report.get('reason') or 'See measured evidence below.'}", f"Master feedback filter assertion: {report['configuration'].get('master_feedback_filter')}", f"Original trace configuration restored: {report.get('trace_config_restored', 'not changed')}", f"Trace configuration restore error: {report.get('trace_config_restore_error', 'none')}", "", "## Measured evidence", "", f"Current gains: {report.get('pi_before')}", f"Settling gate: {report.get('settling')}", f"Trace: {report.get('trace_progress')}", f"Capture counter changes: {report.get('capture_counter_deltas')}", f"Replay counter changes: {report.get('replay_counter_deltas')}", f"Diagnostic fit: {fit}", "", "## Exploratory candidates", ""]
+        lines = ["# 638 PI characterization", "", f"Status: **{status}**", f"Board: {report.get('board_serial') or 'unknown'}", f"Profile: {(report.get('profile') or {}).get('name', 'unknown')}", f"Reason: {report.get('reason') or 'See measured evidence below.'}", f"Master feedback filter assertion: {report['configuration'].get('master_feedback_filter')}", f"Driver pole prior: {report['configuration'].get('driver_pole_hz', 'none')} Hz; range {report['configuration'].get('driver_pole_range_hz', 'default or none')}; source {report['configuration'].get('driver_pole_source', 'none')}", f"Original trace configuration restored: {report.get('trace_config_restored', 'not changed')}", f"Trace configuration restore error: {report.get('trace_config_restore_error', 'none')}", "", "## Measured evidence", "", f"Current gains: {report.get('pi_before')}", f"Settling gate: {report.get('settling')}", f"Trace: {report.get('trace_progress')}", f"Capture counter changes: {report.get('capture_counter_deltas')}", f"Replay counter changes: {report.get('replay_counter_deltas')}", f"Diagnostic fit: {fit}", "", "## Exploratory candidates", ""]
         lines.extend(f"- Kp {item['kp']}, Ki {item['ki_per_s']}/s; worst estimated phase margin {item['worst_phase_margin_deg']}°" for item in candidates)
         if not candidates:
             lines.append("No candidate qualified for display from this record.")
@@ -342,3 +360,64 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
         lines += ["", "Detailed frequency response, quality diagnostics, and screening evidence: `summary.json`. Bounded indexed trace: `trace.npz` when capture completed.", "No gains were applied by this run.", ""]
         (output/"report.md").write_text("\n".join(lines))
     return report
+
+
+def review_saved_pi_characterization(report_dir, *, driver_pole_hz=None,
+                                     driver_pole_range_hz=None,
+                                     driver_pole_source=None,
+                                     verified_master_filter=None):
+    """Reanalyze a complete bounded trace without connecting to hardware.
+
+    The original summary and trace remain unchanged. An independent pole
+    prior can be supplied later after reading the board schematic or making
+    a separate electrical measurement.
+    """
+    source = Path(report_dir).expanduser().resolve()
+    report = json.loads((source/"summary.json").read_text())
+    metadata = report["trace_metadata"]
+    if not metadata.get("complete") or metadata.get("conflict"):
+        raise ValueError("Saved characterization lacks a complete conflict-free trace")
+    capture_counters = report.get("capture_counter_deltas")
+    if not isinstance(capture_counters, dict) or any(key not in capture_counters for key in COUNTERS):
+        raise ValueError("Saved capture lacks complete ADC/USB integrity counters")
+    if any(capture_counters.values()):
+        raise ValueError("Saved capture has ADC/USB integrity counter changes")
+    if report.get("capture_live_after_host_delay_s", float("inf")) > 3:
+        raise ValueError("Saved capture lacks a timely post-excitation lock snapshot")
+    with np.load(source/report["trace_file"], allow_pickle=False) as saved:
+        rows = np.asarray(saved["rows"])
+    if rows.shape != (4096, 5) or not np.issubdtype(rows.dtype, np.integer):
+        raise ValueError("Saved bounded trace must contain 4096 indexed integer rows")
+    config = dict(report["configuration"])
+    if verified_master_filter is not None:
+        config["master_feedback_filter"] = verified_master_filter
+    if driver_pole_hz is not None:
+        if not driver_pole_source:
+            raise ValueError("A new driver-pole nominal requires new provenance")
+        config["driver_pole_hz"] = driver_pole_hz
+        config.pop("driver_pole_range_hz", None)
+        config.pop("driver_pole_source", None)
+    if driver_pole_range_hz is not None:
+        if driver_pole_hz is None:
+            raise ValueError("A new driver-pole range requires a new nominal")
+        config["driver_pole_range_hz"] = list(driver_pole_range_hz)
+    if driver_pole_source is not None:
+        config["driver_pole_source"] = driver_pole_source
+    if any(key in config for key in ("driver_pole_hz", "driver_pole_range_hz",
+                                      "driver_pole_source")):
+        nominal, bounds, source_label = pi_model.driver_pole_config(config)
+        config.update(driver_pole_hz=nominal, driver_pole_range_hz=list(bounds),
+                      driver_pole_source=source_label)
+    samples = {i: dict(zip(("cycles", "feedback", "actual_dac", "injection_dac", "flags"),
+                           map(int, row))) for i, row in enumerate(rows)}
+    current = report["pi_before"]
+    capture = {"trace": dict(metadata, samples=samples, missing_indices=[]),
+               "config": config, "pi": current,
+               "live": report["live_before"],
+               "capture_live_after": report["capture_live_after"],
+               "runtime_caps": {"kp_max": 1,
+                                "ki_max_per_s": max(1000, current["ki_per_s"])}}
+    return {"board_serial": report.get("board_serial"),
+            "profile": report.get("profile"),
+            "source_report_dir": str(source),
+            "analysis": review(capture, crossover_only=True)}

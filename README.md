@@ -355,7 +355,8 @@ using a graphical interface.
 ### Bounded PI characterization report
 
 `run_pi_characterization(controller, report_dir, progress=None, cancel=None,
-verified_master_filter=None)`
+verified_master_filter=None, driver_pole_hz=None, driver_pole_range_hz=None,
+driver_pole_source=None)`
 uses an **existing** connected, streaming Controller with optical diagnostics
 format 2 and a healthy automatic 638 lock. It does not start or stop the
 system, connect a second session, command a robot, or apply PI gains. Call it
@@ -372,21 +373,46 @@ counter changes during the capture separate from replay changes. The report
 directory contains a concise `report.md`, machine-readable `summary.json`,
 and a compressed `trace.npz` of just the bounded control trace; partial replay
 rows are saved as `trace-partial.npz` after failure or cancellation. No full
-10 MSPS ADC stream is saved. The measured FRF, diagnostic fit, and exploratory
-PI candidate screen are in the JSON report. Pass
+10 MSPS ADC stream is saved. The measured FRFs, model diagnostics when
+supported, and exploratory PI candidate screen are in the JSON report. Pass
 `verified_master_filter="single_sample"` only after independently verifying
 the installed master filter is OFF; otherwise the report withholds gain
 screening and retains measured FRFs. These candidates are local
 evidence for review, not an automatic gain recommendation. The installed
 master feedback filter must be verified to be `single_sample`; the SDK cannot
-read that setting, so the report records the caller's assertion. A cancellation
+read that setting, so the report records the caller's assertion. The driver
+pole is also installation specific: pass an independent nominal
+`driver_pole_hz` in 300–5000 Hz and a nonempty `driver_pole_source` naming
+the measurement, board revision/BOM, or explicit estimate. The optional
+`driver_pole_range_hz=[low, high]` must contain the nominal value and stay
+inside 300–5000 Hz; omitted bounds use nominal ±25%, clipped to that range.
+The reported first-order fit and robust model screen are conditional on this
+prior. With no pole prior, the routine still captures and reports the FRFs
+and can show candidates only when both empirical halves satisfy the strict
+measured-band gates. The driver and thermal poles cannot be distinguished
+from this trace alone, and no pole is inferred from the box or laser brand.
+If the current PI crossover is below the measured band, its measured-band
+sensitivity can still serve as the baseline comparator; every proposed pair
+must have a resolved crossover in both halves. Empirical phase margins are
+point estimates, not confidence-bound stability margins.
+A cancellation
 returns promptly without stopping the shared controller; an excitation
 already started in firmware may finish after the caller returns.
+
+`review_saved_pi_characterization(report_dir, driver_pole_hz=...,
+driver_pole_range_hz=..., driver_pole_source=...)` reanalyzes a complete
+saved `trace.npz` and `summary.json` without hardware or modifications to the
+original report. It checks the saved capture integrity and returns measured
+coverage, model diagnostics, and any qualified exploratory screen. This
+allows a later board measurement or schematic review to supply the driver
+pole without repeating the laser excitation.
 
 For a standalone session, `python examples/pi_characterization.py REPORT_DIR
 --start-and-stop --verified-single-sample-filter` explicitly starts and then
 stops the laser system with the filter assertion. Omit the filter flag to
-collect only measured FRFs. Do not
+collect only measured FRFs. Use `--driver-pole-hz`, optional
+`--driver-pole-low-hz` and `--driver-pole-high-hz`, and
+`--driver-pole-source` to supply an independent prior. Do not
 run that program concurrently with a GUI owning the same device.
 
 ModuleNotFoundError:

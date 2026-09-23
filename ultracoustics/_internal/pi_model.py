@@ -19,7 +19,27 @@ import numpy as np
 from scipy.optimize import least_squares
 
 ADC_HZ = 10_000_000.0
-RC_HZ = 1600.0
+
+def driver_pole_config(config):
+    """Validate an explicit first-order driver-pole prior and its provenance.
+
+    The FRF cannot distinguish the driver pole from the fitted thermal pole:
+    two first-order factors commute. A point prior gets a ±25% sensitivity
+    bracket; a supplied range must contain the point prior.
+    """
+    source = config.get("driver_pole_source")
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("driver pole requires explicit hardware/measurement provenance")
+    nominal = float(config["driver_pole_hz"])
+    if not np.isfinite(nominal) or not 300 <= nominal <= 5000:
+        raise ValueError("driver pole must be finite and within 300–5000 Hz")
+    bounds = config.get("driver_pole_range_hz")
+    low, high = ((max(300., nominal*.75), min(5000., nominal*1.25))
+                 if bounds is None else map(float, bounds))
+    if (not np.isfinite(low) or not np.isfinite(high) or
+            not 300 <= low <= nominal <= high <= 5000):
+        raise ValueError("driver pole range must be finite, ordered, contain nominal, and stay within 300–5000 Hz")
+    return nominal, (low, high), source.strip()
 
 
 def fir_taps():
@@ -44,9 +64,9 @@ def rows(data):
     return f, g, lm, ph
 
 
-def model(freq, gain, tau, delay, taps_response):
+def model(freq, gain, tau, delay, taps_response, driver_pole_hz):
     w = 2*np.pi*freq
-    rc = 1/(1+1j*freq/RC_HZ)
+    rc = 1/(1+1j*freq/driver_pole_hz)
     return gain*rc*taps_response/(1+1j*w*tau)*np.exp(-1j*w*delay)
 
 
@@ -57,6 +77,7 @@ def residual(observed, predicted, sigma_mag, sigma_phase):
 
 
 def fit(bundle):
+    driver_pole_hz, driver_pole_range_hz, driver_pole_source = driver_pole_config(bundle.get("config", {}))
     mode = bundle.get("config", {}).get("master_feedback_filter")
     if mode not in ("single_sample", "hann2000"):
         raise ValueError("config.master_feedback_filter must explicitly be single_sample or hann2000")
@@ -83,7 +104,7 @@ def fit(bundle):
     sign = math.copysign(1, slope)
     def unpack(v): return sign*np.exp(v[0]), v[1], v[2]
     def objective(v):
-        return residual(lg, model(lf, *unpack(v), hlow), lm, lp)
+        return residual(lg, model(lf, *unpack(v), hlow, driver_pole_hz), lm, lp)
     bounds = ([math.log(abs(slope)*.25), 0., 0.],
               [math.log(abs(slope)*4.), .05, .005])
     best = None
@@ -94,12 +115,15 @@ def fit(bundle):
             best = trial
     gain, tau, delay = unpack(best.x)
     fit_rms = float(np.sqrt(np.mean(best.fun**2)))
-    held = residual(hg, model(hf, gain, tau, delay, hhigh), hm, hp)
+    held = residual(hg, model(hf, gain, tau, delay, hhigh, driver_pole_hz), hm, hp)
     held_rms = float(np.sqrt(np.mean(held**2)))
     # Keep the diagnostic fit but do not screen gains when held-out evidence
     # differs materially from its stated uncertainty.
     validated = bool(best.success and fit_rms <= 1.5 and held_rms <= 1.5)
     return {"gain_adc_per_dac": gain, "master_feedback_filter": mode,
+            "driver_pole_hz": driver_pole_hz,
+            "driver_pole_range_hz": list(driver_pole_range_hz),
+            "driver_pole_source": driver_pole_source,
             "thermal_tau_s": tau,
             "extra_delay_s": delay, "fit_rms_sigma": fit_rms,
             "heldout_rms_sigma": held_rms, "overlap_max_hz": overlap_max,
@@ -122,11 +146,15 @@ def margins(loop, freq):
     return fc, pm, gm
 
 
-def screen(fit_result, taps, control_rate, kp_cap, ki_cap):
+def screen(fit_result, taps, control_rate, kp_cap, ki_cap,
+           baseline_kp=.2, baseline_ki=750.):
     slope = fit_result["slope_adc_per_dac"]
     tau = fit_result["thermal_tau_s"]
     delay = fit_result["extra_delay_s"]
     gain = fit_result["gain_adc_per_dac"]
+    driver_poles = (fit_result["driver_pole_range_hz"][0],
+                    fit_result["driver_pole_hz"],
+                    fit_result["driver_pole_range_hz"][1])
     T = 1/control_rate
     measured_limit = fit_result["overlap_max_hz"]
     freq = np.geomspace(max(.2, measured_limit/1000), control_rate/2*.95, 1400)
@@ -138,8 +166,9 @@ def screen(fit_result, taps, control_rate, kp_cap, ki_cap):
     for gain_scale in (.8, 1., 1.2):
         for tau_scale in (.5, 1., 2.):
             for extra_ticks in (0., 1., 2.):
-                family.append(model(freq, gain*gain_scale, tau*tau_scale,
-                                    delay+extra_ticks*T, h)/slope)
+                for pole in driver_poles:
+                    family.append(model(freq, gain*gain_scale, tau*tau_scale,
+                                        delay+extra_ticks*T, h, pole)/slope)
     def assess(kp, ki):
         c = kp + ki*T/(1-zinv)
         checks = [margins(p*c, freq) for p in family]
@@ -150,7 +179,7 @@ def screen(fit_result, taps, control_rate, kp_cap, ki_cap):
                 "worst_gain_margin_db": round(min(gm_values), 1) if gm_values else None,
                 "max_crossover_hz": round(max(v[0] for v in checks), 2),
                 "supported_by_current_runtime": bool(kp <= kp_cap and ki <= ki_cap)}
-    baseline = assess(.2, 750.)
+    baseline = assess(baseline_kp, baseline_ki)
     candidates = []
     for kp in np.linspace(.05, 2., 28):
         for ki in np.geomspace(25., 5000., 34):
@@ -168,7 +197,7 @@ def screen(fit_result, taps, control_rate, kp_cap, ki_cap):
     candidates.sort(key=lambda x: (-x["max_crossover_hz"],
                                    -x["worst_phase_margin_deg"]))
     supported = [v for v in candidates if v["supported_by_current_runtime"]]
-    return {"baseline_kp_0_2_ki_750": baseline,
+    return {"baseline": baseline,
             "best_unrestricted": candidates[:6], "best_supported": supported[:6],
             "candidate_count": len(candidates), "supported_count": len(supported)}
 
@@ -186,13 +215,16 @@ def evaluate(bundle):
             raise ValueError("control rate outside evaluated 1–10 kHz range")
         cap_kp = float(config.get("runtime_kp_max", 1.))
         cap_ki = float(config.get("runtime_ki_max_per_s", 1000.))
-        screened = screen(fitted, taps, rate, cap_kp, cap_ki)
+        current = bundle.get("current_pi") or {}
+        screened = screen(fitted, taps, rate, cap_kp, cap_ki,
+                          baseline_kp=float(current.get("kp", .2)),
+                          baseline_ki=float(current.get("ki_per_s", 750.)))
     except (KeyError, TypeError, ValueError, OSError) as exc:
         return {"accepted": False, "reason": str(exc), "candidates": []}
     return {"accepted": True, "plant_fit": fitted, "screen": screened,
             "status": "offline review candidates only; no gain applied",
             "limitations": ["First-order thermal pole plus delay is a model assumption.",
-                            "The 1600 Hz driver RC is included; the master filter follows the explicit config.",
+                            "Driver pole and range come from explicit provenance; the master filter follows the explicit config.",
                             "Gain/delay/tau sensitivity grid is not a statistical confidence region.",
                             "Crossover is restricted below 70% of measured overlap bandwidth.",
                             "Two captures and live slope must represent the same operating point; this is not proven by FRF files alone.",
@@ -201,10 +233,10 @@ def evaluate(bundle):
 
 
 def self_test():
-    taps = fir_taps()
+    taps = None
     slope = -4.7
     def fake(freq):
-        g = model(freq, slope, .0012, .00018, fir_response(freq, taps))
+        g = model(freq, slope, .0012, .00018, fir_response(freq, taps), 1600)
         return {"accepted": True, "frf": [{"hz": float(f),
                 "gain_adc_per_dac": float(abs(v)), "phase_deg": float(np.degrees(np.angle(v))),
                 "magnitude_95pct_factor": 1.2, "phase_95pct_deg": 8.}
@@ -212,7 +244,9 @@ def self_test():
     b = {"low": fake(np.arange(2., 181., 2.)),
          "high": fake(np.arange(20., 181., 20.)),
          "live": {"slope": slope}, "config": {"control_rate_hz": 10000,
-                                               "master_feedback_filter": "hann2000"}}
+                                               "master_feedback_filter": "single_sample",
+                                               "driver_pole_hz": 1600,
+                                               "driver_pole_source": "synthetic test fixture"}}
     result = evaluate(b)
     assert result["accepted"], result
     assert abs(result["plant_fit"]["thermal_tau_s"]-.0012) < .0003

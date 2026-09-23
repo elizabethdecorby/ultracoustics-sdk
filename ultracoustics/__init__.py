@@ -28,7 +28,7 @@ from .characterization import (
     analyze_dips,
 )
 from .manual_sweep import ManualSweepError, run_manual_sweep
-from .pi_characterization import run_pi_characterization
+from .pi_characterization import run_pi_characterization, review_saved_pi_characterization
 
 __all__ = [
     "__version__",
@@ -60,4 +60,5 @@ __all__ = [
     "ManualSweepError",
     "run_manual_sweep",
     "run_pi_characterization",
+    "review_saved_pi_characterization",
 ]

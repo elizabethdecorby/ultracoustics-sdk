@@ -24,12 +24,14 @@ def robust_screen(fit, control_rate, kp_cap, ki_cap, empirical_pairs, baseline_k
     measured = min(400., fit["overlap_max_hz"])
     freq = np.geomspace(.4, .95 * rate / 2, 1000)
     zinv = np.exp(-2j * np.pi * freq * period)
+    poles = (fit["driver_pole_range_hz"][0], fit["driver_pole_hz"],
+             fit["driver_pole_range_hz"][1])
     family = [pi.model(freq, fit["gain_adc_per_dac"] * gs,
                        fit["thermal_tau_s"] * ts,
                        fit["extra_delay_s"] + ticks * period,
-                       np.ones_like(freq)) / fit["slope_adc_per_dac"]
+                       np.ones_like(freq), pole) / fit["slope_adc_per_dac"]
               for gs in (.8, 1., 1.2) for ts in (.5, 1., 2.)
-              for ticks in (0, 1, 2)]
+              for ticks in (0, 1, 2) for pole in poles]
     def assess(kp, ki):
         c = kp + ki * period / (1 - zinv)
         margins = [pi.margins(plant * c, freq) for plant in family]
@@ -61,12 +63,15 @@ def robust_screen(fit, control_rate, kp_cap, ki_cap, empirical_pairs, baseline_k
     candidates.sort(key=lambda v: (-v["min_crossover_hz"],
                                    -v["worst_phase_margin_deg"]))
     return {"baseline": baseline, "candidate_count": len(candidates),
+            "candidate_grid": candidates,
             "best_unrestricted": candidates[:6],
             "best_supported": [v for v in candidates if v["supported_by_current_runtime"]][:6],
-            "ranking": "largest minimum crossover across 27 gain/pole/delay sensitivity cases",
+            "ranking": "largest minimum crossover across 81 gain/thermal/delay/driver-pole sensitivity cases",
+            "driver_pole_range_hz": list(fit["driver_pole_range_hz"]),
             "measured_support_hz": [10, measured],
             "crossover_limit_hz": .7 * measured,
             "margin_status": "phase/gain margins come from extrapolating the fitted model beyond measured support; they are screening estimates, not measured margins",
+            "candidate_margin_is_confidence_bound": False,
             "status": "exploratory offline candidates; no gain applied"}
 
 
@@ -77,8 +82,25 @@ def empirical_screen(first, second, slope, rate, kp_cap, ki_cap, crossover_only=
     b = {r["hz"]: r for r in second if 10 <= r["hz"] <= 400}
     hz = np.asarray(sorted(set(a) & set(b)), dtype=float)
     floor = 50 if crossover_only else 20
-    if len(hz) < 20 or hz[0] > floor or hz[-1] < 300:
-        return {"accepted": False, "reason": f"common coherent band lacks 20 bins or {floor}-300 Hz coverage"}
+    coverage = {"common_bin_count": len(hz),
+                "common_band_hz": [float(hz[0]), float(hz[-1])] if len(hz) else None,
+                "required_low_hz": floor, "required_high_hz": 300,
+                "minimum_common_bins": 20,
+                "comparison_band_hz": [50, 100] if crossover_only else [20, 60],
+                "comparison_bin_count": int(np.sum((hz >= (50 if crossover_only else 20)) &
+                                                    (hz <= (100 if crossover_only else 60)))),
+                "minimum_comparison_bins": 3,
+                "max_gap_hz_below_300": float(np.max(np.diff(hz[hz <= 300])))
+                                        if np.sum(hz <= 300) >= 2 else None,
+                "max_allowed_gap_hz_below_300": 30,
+                "has_low_coverage": bool(len(hz) and hz[0] <= floor),
+                "has_high_coverage": bool(len(hz) and hz[-1] >= 300)}
+    if (len(hz) < 20 or not coverage["has_low_coverage"] or not coverage["has_high_coverage"] or
+            coverage["comparison_bin_count"] < 3 or
+            coverage["max_gap_hz_below_300"] is None or
+            coverage["max_gap_hz_below_300"] > 30):
+        return {"accepted": False, "reason": f"common coherent band lacks 20 bins, {floor}-300 Hz coverage, or occupied comparison band",
+                "coverage": coverage}
     def complex_rows(table):
         r = [table[f] for f in hz]
         g = np.asarray([v["gain_adc_per_dac"] *
@@ -95,19 +117,20 @@ def empirical_screen(first, second, slope, rate, kp_cap, ki_cap, crossover_only=
                  "half_difference_rms_sigma": mismatch_rms,
                  "gate_rms_sigma": 1.5}
     if mismatch_rms > 1.5:
-        return {"accepted": False, "reason": "adjacent empirical FRFs disagree", "agreement": agreement}
+        return {"accepted": False, "reason": "adjacent empirical FRFs disagree",
+                "agreement": agreement, "coverage": coverage}
     period = 1/float(rate)
     zinv = np.exp(-2j*np.pi*hz*period)
     plants = [ga/slope, gb/slope]
     band = (hz >= (50 if crossover_only else 20)) & (hz <= (100 if crossover_only else 60))
-    def assess(kp, ki):
+    def assess(kp, ki, require_crossover=True):
         controller = kp + ki*period/(1-zinv)
         checks = []
         for plant in plants:
             loop = plant*controller
             mag = abs(loop)
             crossings = np.flatnonzero((mag[:-1]-1)*(mag[1:]-1) <= 0)
-            if not len(crossings):
+            if require_crossover and not len(crossings):
                 return None
             phase = np.unwrap(np.angle(loop))
             margins = []
@@ -117,22 +140,21 @@ def empirical_screen(first, second, slope, rate, kp_cap, ki_cap, crossover_only=
                 pm = float(180+np.rad2deg(phase[i]+t*(phase[i+1]-phase[i])))
                 margins.append((fc, pm))
             s = abs(1/(1+loop))
-            checks.append((min(v[0] for v in margins), max(v[0] for v in margins),
-                           min(v[1] for v in margins),
+            checks.append((min(v[0] for v in margins) if margins else None,
+                           max(v[0] for v in margins) if margins else None,
+                           min(v[1] for v in margins) if margins else None,
                            float(np.max(s)), float(np.min(abs(1+loop))),
                            float(20*np.log10(np.mean(s[band])))))
         return {"kp": round(float(kp), 3), "ki_per_s": round(float(ki), 1),
-                "min_crossover_hz": round(min(v[0] for v in checks), 2),
-                "max_crossover_hz": round(max(v[1] for v in checks), 2),
-                "worst_phase_margin_deg": round(min(v[2] for v in checks), 1),
+                "crossover_in_measured_band": all(v[0] is not None for v in checks),
+                "min_crossover_hz": round(min(v[0] for v in checks), 2) if all(v[0] is not None for v in checks) else None,
+                "max_crossover_hz": round(max(v[1] for v in checks), 2) if all(v[1] is not None for v in checks) else None,
+                "worst_phase_margin_deg": round(min(v[2] for v in checks), 1) if all(v[2] is not None for v in checks) else None,
                 "max_inband_sensitivity": round(max(v[3] for v in checks), 3),
                 "min_inband_return_distance": round(min(v[4] for v in checks), 3),
                 "worst_lowband_sensitivity_db": round(max(v[5] for v in checks), 2),
                 "supported_by_current_runtime": bool(kp <= kp_cap and ki <= ki_cap)}
-    baseline = assess(baseline_kp, baseline_ki)
-    if baseline is None:
-        return {"accepted": False, "reason": "baseline crossover is outside or unresolved inside common measured band",
-                "agreement": agreement}
+    baseline = assess(baseline_kp, baseline_ki, require_crossover=False)
     candidates = []
     for kp in np.linspace(.05, 2., 28):
         for ki in np.geomspace(25., 5000., 34):
@@ -151,13 +173,20 @@ def empirical_screen(first, second, slope, rate, kp_cap, ki_cap, crossover_only=
             candidates.append(item)
     candidates.sort(key=lambda v: (v["worst_lowband_sensitivity_db"],
                                    -v["min_crossover_hz"]))
-    return {"accepted": bool(candidates), "agreement": agreement,
+    return {"accepted": bool(candidates), "agreement": agreement, "coverage": coverage,
             "baseline": baseline, "candidate_count": len(candidates),
             "_passing_candidates": candidates,
             "best_unrestricted": candidates[:6],
             "best_supported": [v for v in candidates if v["supported_by_current_runtime"]][:6],
             "measured_support_hz": [float(hz[0]), float(hz[-1])],
             "screen_mode": "crossover-only, 50-100 Hz comparison" if crossover_only else "full 20-60 Hz comparison",
+            "candidate_margin_basis": "worst point estimate across two adjacent measured FRFs; jackknife phase intervals are not propagated into margin",
+            "candidate_margin_is_confidence_bound": False,
+            "candidate_gates": {"minimum_phase_margin_deg": 45,
+                                "maximum_crossover_fraction_of_measured_high": .7,
+                                "maximum_inband_sensitivity": 2,
+                                "minimum_return_distance": .5,
+                                "minimum_lowband_sensitivity_improvement_db": .5},
             "low_frequency_limit": "DC and integral behavior below first qualified bin inferred from static slope and model, not measured dynamically" if crossover_only else None,
             "status": "in-band exploratory screen only; no high-frequency stability qualification or gain application"}
 
@@ -197,11 +226,12 @@ def review(capture, crossover_only=False):
         def pack(rows):
             return {"accepted": True, "master_feedback_filter": "single_sample",
                     "frf": [r for r in rows if 10 <= r["hz"] <= 400]}
-        fitted, taps = pi.fit({"low": pack(first), "high": pack(second),
-                               "live": {"slope": slope0},
-                               "config": {"master_feedback_filter": "single_sample"}})
+        config = capture.get("config") or {}
+        model_bundle = {"low": pack(first), "high": pack(second),
+                        "live": {"slope": slope0}, "config": config}
         output = {"accepted": False, "capture_duration_s": float(np.sum(diffs)/capture["trace"]["clock_hz"]),
                   "sample_rate_hz": fs, "amplitude_dac": amp,
+                  "current_pi": capture.get("pi"),
                   "first_half": {"quality": q1, "dac_mean": float(np.mean(u[:2048])),
                                  "feedback_mean": float(np.mean(y[:2048])), "frf": first},
                   "second_half": {"quality": q2, "dac_mean": float(np.mean(u[2048:])),
@@ -210,10 +240,21 @@ def review(capture, crossover_only=False):
                   "pre_post_live_dac_delta": dac_live_delta,
                   "recorded_half_dac_delta": dac_half_delta,
                   "operating_point_warning": bool(abs(dac_live_delta) > 100),
-                  "plant_fit": fitted,
                   "limitations": ["Adjacent frequency bins and jackknife intervals are approximate, not independent confidence tests.",
+                                  "Empirical phase margins are point estimates from adjacent halves, not confidence-bound stability margins.",
                                   "SPI5 DAC command is not an analog output measurement.",
-                                  "One 1.64 s record tests a local plant; repeat and motion trials remain necessary before gain deployment."]}
+                                  "One 1.64 s record tests a local plant; repeat and motion trials remain necessary before gain deployment.",
+                                  "Driver and thermal first-order poles cannot be separated from this FRF without independent hardware evidence."]}
+        try:
+            fitted, taps = pi.fit(model_bundle)
+            output["plant_fit"] = fitted
+            output["driver_model"] = {"available": True, "source": fitted["driver_pole_source"],
+                                      "nominal_hz": fitted["driver_pole_hz"],
+                                      "range_hz": fitted["driver_pole_range_hz"],
+                                      "interpretation": "conditional first-order model; driver/thermal poles are not separately identified by this trace"}
+        except (KeyError, TypeError, ValueError) as exc:
+            fitted, taps = None, None
+            output["driver_model"] = {"available": False, "reason": str(exc)}
         runtime = capture.get("runtime_caps", {})
         current = capture.get("pi") or {}
         baseline_kp = float(current.get("kp", .2))
@@ -225,15 +266,20 @@ def review(capture, crossover_only=False):
                                      crossover_only=crossover_only,
                                      baseline_kp=baseline_kp, baseline_ki=baseline_ki)
         empirical_candidates = empirical.pop("_passing_candidates", [])
+        if empirical_candidates:
+            empirical["candidate_grid"] = empirical_candidates
         empirical_by_pair = {(v["kp"], v["ki_per_s"]): v for v in empirical_candidates}
         empirical_pairs = set(empirical_by_pair)
         output["empirical_screen"] = empirical
+        if output["operating_point_warning"]:
+            output["reason"] = "Pre/post DAC operating point shifted by more than 100 codes; gain candidates withheld"
+            return output
         if not empirical["accepted"]:
             output["reason"] = empirical.get("reason", "no empirical PI pair passed the in-band screen")
             return output
-        if not fitted["validated_for_screening"]:
+        if fitted is None or not fitted["validated_for_screening"]:
             output.update(accepted=True, basis="empirical halves only",
-                          reason="one-pole model failed; empirical halves agreed",
+                          reason="driver prior absent or model fit failed; empirical halves agreed",
                           screen=empirical)
             return output
         screen = robust_screen(fitted, float(capture["config"]["control_rate_hz"]),
@@ -241,7 +287,7 @@ def review(capture, crossover_only=False):
                                float(runtime.get("ki_max_per_s", 1000)), empirical_pairs,
                                baseline_kp=baseline_kp, baseline_ki=baseline_ki)
         screen["measured_support_hz"] = empirical["measured_support_hz"]
-        for category in ("best_supported", "best_unrestricted"):
+        for category in ("candidate_grid", "best_supported", "best_unrestricted"):
             for item in screen[category]:
                 same = empirical_by_pair[(item["kp"], item["ki_per_s"])]
                 item["empirical_half_worst"] = {
@@ -274,7 +320,7 @@ def plot_review(result, target):
     support_max = min(400, fit["overlap_max_hz"])
     f = np.geomspace(support_min, support_max, 300)
     plant = pi.model(f, fit["gain_adc_per_dac"], fit["thermal_tau_s"],
-                     fit["extra_delay_s"], np.ones_like(f))
+                     fit["extra_delay_s"], np.ones_like(f), fit["driver_pole_hz"])
     fig, ax = plt.subplots(3, 1, figsize=(8, 9), constrained_layout=True)
     for key, label, color in (("first_half", "Fit half", "#27649a"),
                                ("second_half", "Held-out half", "#d27720")):
@@ -296,7 +342,8 @@ def plot_review(result, target):
     normalized = plant / slope
     period = 1 / 10000
     zinv = np.exp(-2j * np.pi * f * period)
-    pairs = [("Current PI", .2, 750., "#666666")]
+    current = result.get("current_pi") or {}
+    pairs = [("Current PI", current.get("kp", .2), current.get("ki_per_s", 750.), "#666666")]
     screened = result.get("screen") or {}
     supported = screened.get("best_supported") or []
     if supported:
