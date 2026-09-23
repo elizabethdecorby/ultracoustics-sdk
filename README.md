@@ -352,6 +352,15 @@ bounded 638 requests; in manual mode, release a manually owned 638 laser DAC
 before optical tuning. Run these synchronous SDK calls from a worker when
 using a graphical interface.
 
+### Local slope readiness telemetry compatibility
+
+`OpticalLive.slope_readiness` decodes the packed quiet-gate status only when
+live flag `0x20` is present; it returns `None` for older pages. The packed
+status requires 638 firmware commit `c5cf633` and master firmware commit
+`7cf06c31121a250aa123d7bc837b25d6ee0e0e9d` or later. Earlier masters
+reject the new flag and discard those live pages. Flag `0x10` still means
+PI held, and the live page length and layout are unchanged.
+
 ### Bounded PI characterization report
 
 `run_pi_characterization(controller, report_dir, progress=None, cancel=None,
