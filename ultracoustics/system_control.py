@@ -597,6 +597,9 @@ class SystemControlMixin:
         """
         if action not in OPTICAL_ACTIONS:
             raise ValueError('Unknown optical action')
+        if self.system_manual_active and action == 'retune':
+            raise RuntimeError('Local slope measurement requires automatic locking; '
+                               'manual-session lease renewals interrupt its quiet interval')
         if self.system_manual_active:
             if (638, CHANNEL_LASER_DAC) in self._system_manual_owned:
                 raise RuntimeError('Release the manually-owned 638 laser DAC before optical control')

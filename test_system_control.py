@@ -40,6 +40,11 @@ class SystemControlTests(unittest.TestCase):
   for action in ('start','abort'):
    with self.assertRaisesRegex(RuntimeError,'only reacquire, retune, trace, or identify'):
     f.control_638(action)
+ def test_queued_retune_rejects_manual_session_before_any_command(self):
+  f=Fake();f._system_manual_owned={(638,3),(1550,2)}
+  with self.assertRaisesRegex(RuntimeError,'requires automatic locking'):
+   f.control_638('retune')
+  self.assertFalse(f.calls)
  def test_manual_start_abort_compatibility(self):
   f=Fake();f._system_manual_owned={(638,3),(1550,2)}
   f.lock_638('start');f.lock_638('abort')
