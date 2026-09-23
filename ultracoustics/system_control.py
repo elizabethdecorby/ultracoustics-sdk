@@ -592,6 +592,8 @@ class SystemControlMixin:
         Automatic RUN routing is owned by the master and therefore does not
         acquire a slave lease.  An active manual session may use an existing
         optical lease, but never silently replaces a manually-owned laser DAC.
+        For ``retune``, the reply confirms a queued local slope request only;
+        the subsequent ABBA telemetry event reports acceptance or rejection.
         """
         if action not in OPTICAL_ACTIONS:
             raise ValueError('Unknown optical action')
@@ -620,7 +622,9 @@ class SystemControlMixin:
         """Capture bounded ring-buffer windows around one automatic lock action.
 
         This reuses the controller's existing stream and USB owner. It creates
-        no reader, background queue, or unbounded recording.
+        no reader, background queue, or unbounded recording. The returned
+        acknowledgement means the request was queued; the snapshot may still
+        contain an older event and does not establish action completion.
         """
         if action not in ('reacquire', 'retune'):
             raise ValueError('Captured automatic action must be reacquire or retune')
