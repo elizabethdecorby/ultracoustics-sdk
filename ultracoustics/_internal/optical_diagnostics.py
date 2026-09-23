@@ -11,6 +11,7 @@ PAGE_LIVE=2
 PAGE_ACQUISITION=3
 PAGE_ABBA=4
 PAGE_TRACE=5
+LIVE_SLOPE_READINESS=0x20
 
 class OpticalDiagnosticError(ValueError): pass
 
@@ -30,6 +31,27 @@ class OpticalLive:
     dac_busy_completions:Optional[int]=None
     control_exec_max_us:Optional[int]=None
     frame_interval_max_us:Optional[int]=None
+
+    @property
+    def slope_readiness(self):
+        """Decoded quiet-gate status, or None on older live pages."""
+        if not self.flags & LIVE_SLOPE_READINESS:
+            return None
+        word = self.quality_count
+        gates = (word >> 16) & 0xff
+        rms_tenths_percent = (word >> 24) & 0xff
+        return {
+            'stable_run': word & 0xff,
+            'best_run': (word >> 8) & 0xff,
+            'feedback_quiet': bool(gates & 0x01),
+            'dac_pp_quiet': bool(gates & 0x02),
+            'dac_trend_ready': bool(gates & 0x04),
+            'manual_pending': bool(gates & 0x08),
+            'auto_attempt_done': bool(gates & 0x10),
+            'trusted_slope': bool(gates & 0x20),
+            'tracking_error_rms_percent_of_dip': rms_tenths_percent / 10,
+            'tracking_error_rms_saturated': rms_tenths_percent == 0xff,
+        }
 @dataclass(frozen=True)
 class OpticalAcquisition:
     event_id:int; start_tick_ms:int; end_tick_ms:int; baseline:int; minimum:int; target:int

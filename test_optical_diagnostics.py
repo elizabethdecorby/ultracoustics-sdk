@@ -31,6 +31,36 @@ def test_live_timing_extension_is_optional_and_decodes_when_flagged():
     assert new.dac_busy_completions==2
     assert new.control_exec_max_us==37
     assert new.frame_interval_max_us==401
+
+def test_live_slope_readiness_is_flagged_and_preserves_pid_held():
+    old=parse_page(page(PAGE_LIVE))
+    assert old.slope_readiness is None
+    assert old.quality_count == 0
+
+    held=page(PAGE_LIVE)
+    held[14]=0x10
+    struct.pack_into("<I",held,34,0x122b2514)
+    struct.pack_into("<H",held,50,crc16_ccitt(held[:50]))
+    assert parse_page(held).slope_readiness is None
+
+    b=page(PAGE_LIVE)
+    b[14]=0x30  # readiness and the independent PID-held flag
+    struct.pack_into("<I",b,34,0x122b2514)
+    struct.pack_into("<H",b,50,crc16_ccitt(b[:50]))
+    live=parse_page(b)
+    assert live.flags & 0x10
+    assert live.quality_count == 0x122b2514
+    assert live.slope_readiness == {
+        'stable_run': 20, 'best_run': 37,
+        'feedback_quiet': True, 'dac_pp_quiet': True,
+        'dac_trend_ready': False, 'manual_pending': True,
+        'auto_attempt_done': False, 'trusted_slope': True,
+        'tracking_error_rms_percent_of_dip': 1.8,
+        'tracking_error_rms_saturated': False,
+    }
+    struct.pack_into("<I",b,34,0xff000000)
+    struct.pack_into("<H",b,50,crc16_ccitt(b[:50]))
+    assert parse_page(b).slope_readiness['tracking_error_rms_saturated']
 def test_trace_page_decodes_records_and_checks_bounds():
     b=page(PAGE_TRACE)
     struct.pack_into("<IHHIHBB",b,4,7,4094,4096,144_000_000,5,2,12)
