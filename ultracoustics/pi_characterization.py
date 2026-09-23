@@ -105,9 +105,15 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
     def sleep(seconds, require_lock=True):
         nonlocal last_fresh_lock
         until = time.monotonic() + seconds
+        slope_seen_at = None
         while time.monotonic() < until:
             check_cancel()
             live = _live(controller)
+            if live is not None and live.state == 5:
+                if getattr(live, "phase", None) not in (0, 1, 2):
+                    raise RuntimeError("638 reported invalid slope-measurement phase")
+                if slope_seen_at is None:
+                    slope_seen_at = time.monotonic()
             if require_lock:
                 if live is not None:
                     if live.state != 3:
@@ -119,6 +125,7 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
             if stats.get("device_lost") or stats.get("fatal"):
                 raise RuntimeError("ADC stream ended")
             time.sleep(min(.05, max(0, until-time.monotonic())))
+        return slope_seen_at
 
     try:
         check_cancel()
@@ -174,21 +181,62 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
         # Distinct live sequences over a recent 15 s window; 120 s maximum.
         emit("settling", "Waiting for a stable operating point")
         report["settling"] = {"passed": False, "observations": 0,
+                              "slope_measurement_events": 0,
+                              "slope_measurement_durations_s": [],
                               "limits": {"min_elapsed_s": 20, "window_s": 15,
+                                         "max_single_slope_measurement_s": 5,
                                          "max_abs_drift_dac_per_s": 3, "max_dac_span": 100,
                                          "max_median_abs_error": 60, "max_slope_span": .05}}
         settle_started = time.monotonic()
+        stable_started = settle_started
+        last_fresh_settling = settle_started
+        slope_measurement_started = None
         history = []
         last_sequence = None
         last_settle_notice = 0
         settled = False
         while time.monotonic() - settle_started < 120:
-            sleep(.2)
+            slope_seen_during_wait = sleep(.2, require_lock=False)
             live = _live(controller)
-            if live is None or live.sequence == last_sequence:
+            now = time.monotonic()
+            if slope_seen_during_wait is not None and slope_measurement_started is None:
+                slope_measurement_started = slope_seen_during_wait
+                report["settling"]["slope_measurement_events"] += 1
+                history.clear()
+                last_sequence = None
+                report["settling"]["observations"] = 0
+                emit("settling", "Slope measurement observed; restarting stability window")
+            if live is None:
+                if now-last_fresh_settling > 2:
+                    raise RuntimeError("No fresh optical telemetry for two seconds during settling")
+                continue
+            last_fresh_settling = now
+            if live.state == 5:  # Firmware MEASURE_SLOPE briefly freezes the loop.
+                if getattr(live, "phase", None) not in (0, 1, 2):
+                    raise RuntimeError("638 reported invalid slope-measurement phase")
+                if slope_measurement_started is None:
+                    slope_measurement_started = now
+                    report["settling"]["slope_measurement_events"] += 1
+                    history.clear()
+                    last_sequence = None
+                    report["settling"]["observations"] = 0
+                    emit("settling", "Slope measurement observed; restarting stability window")
+                if now-slope_measurement_started > 5:
+                    raise RuntimeError("638 slope measurement exceeded five seconds during settling")
+                continue
+            if live.state != 3:
+                raise RuntimeError(f"638 left locked state during settling: {live.state}")
+            last_fresh_lock = now
+            if slope_measurement_started is not None:
+                report["settling"]["slope_measurement_durations_s"].append(
+                    round(now-slope_measurement_started, 3))
+                slope_measurement_started = None
+                stable_started = now
+                history.clear()
+                last_sequence = None
+            if live.sequence == last_sequence:
                 continue
             last_sequence = live.sequence
-            now = time.monotonic()
             history.append((now, live.dac, live.feedback-live.target, live.slope))
             report["settling"]["observations"] = len(history)
             recent = np.asarray([row for row in history if row[0] >= now-15], dtype=float)
@@ -196,11 +244,12 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
                 continue
             drift = float(np.polyfit(recent[:, 0]-recent[0, 0], recent[:, 1], 1)[0])
             settling = {"elapsed_s": round(now-settle_started, 2),
+                        "stable_elapsed_s": round(now-stable_started, 2),
                         "drift_dac_per_s": round(drift, 3), "dac_span": float(np.ptp(recent[:, 1])),
                         "median_abs_error": float(np.median(abs(recent[:, 2]))),
                         "slope_span": float(np.ptp(recent[:, 3]))}
             report["settling"].update(settling)
-            if now-settle_started >= 20 and abs(drift) <= 3 and settling["dac_span"] <= 100 and settling["median_abs_error"] <= 60 and settling["slope_span"] <= .05:
+            if now-stable_started >= 20 and abs(drift) <= 3 and settling["dac_span"] <= 100 and settling["median_abs_error"] <= 60 and settling["slope_span"] <= .05:
                 report["settling"]["passed"] = True
                 settled = True
                 break
@@ -210,6 +259,12 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
                 emit("settling", "Operating point still settling", **settling)
         if not settled:
             raise RuntimeError("Settling gate not reached within 120 seconds")
+        pi_at_capture = controller.read_normalized_pi_638()
+        report["pi_at_capture"] = pi_at_capture
+        if (not pi_at_capture["active"] or not pi_at_capture["slope_valid"] or
+                pi_at_capture["kp"] != report["pi_before"]["kp"] or
+                pi_at_capture["ki_per_s"] != report["pi_before"]["ki_per_s"]):
+            raise RuntimeError("Normalized PI became inactive or changed during settling")
         # A bounded configuration write; no PI or laser operating-point change.
         deadline = time.monotonic()+30
         while True:

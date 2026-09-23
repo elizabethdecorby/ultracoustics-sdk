@@ -368,7 +368,11 @@ of `complete`, `unqualified`, or `cancelled`, and a reason when appropriate.
 The routine checks profile identity (Belycomm 1 or QPhotonics 2), runtime PI,
 DAC cap and headroom, 10 kHz timing, configurable-trace support, fresh lock,
 and up to 120 seconds of settling. It requests one 4096-row, D4, hold4,
-8-DAC trace and waits at most 240 seconds for indexed replay. It keeps ADC
+8-DAC trace and waits at most 240 seconds for indexed replay.
+During settling only, a fresh firmware `MEASURE_SLOPE` state is allowed for
+at most five continuous seconds; the 15-second stability history and 20-second
+minimum stable time restart on return to `LOCKED`. Other states still reject,
+and the pre-capture/capture checks require `LOCKED` throughout. It keeps ADC
 counter changes during the capture separate from replay changes. The report
 directory contains a concise `report.md`, machine-readable `summary.json`,
 and a compressed `trace.npz` of just the bounded control trace; partial replay

@@ -44,6 +44,9 @@ class FakeController:
     def control_638(self, action):
         self.commands.append(action)
 
+    def retained_control_trace(self):
+        return None
+
 
 class CharacterizationRefusalTests(unittest.TestCase):
     def run_case(self, controller, **kwargs):
@@ -122,6 +125,83 @@ class CharacterizationRefusalTests(unittest.TestCase):
         self.assertEqual(result["status"], "cancelled")
         self.assertTrue(any("drift_dac_per_s" in item for item in events))
         self.assertNotIn("configure", controller.commands)
+
+    def test_brief_slope_measurement_resets_settling_then_reaches_capture_gate(self):
+        controller = FakeController()
+        tick, sequence, cancel_now = [0.], [0], [False]
+        class FreshTelemetry:
+            @property
+            def optical_live_638(self):
+                sequence[0] += 1
+                state = 5 if 3 < tick[0] < 4 else 3
+                live = SimpleNamespace(state=state, phase=1 if state == 5 else 0,
+                                       slope=0 if state == 5 else -6.5,
+                                       dac=45000, gain_law=0 if state == 5 else 1,
+                                       sequence=sequence[0], target=3500, feedback=3500)
+                return SimpleNamespace(page=live, host_stale=False)
+        controller.telemetry = FreshTelemetry()
+        def advance():
+            tick[0] += .04
+            return tick[0]
+        def progress(event):
+            if event["stage"] == "capture":
+                cancel_now[0] = True
+        with patch.object(pi_characterization.time, "monotonic", side_effect=advance), \
+             patch.object(pi_characterization.time, "sleep"):
+            result = self.run_case(controller, progress=progress,
+                                   cancel=lambda: cancel_now[0])
+        self.assertEqual(result["status"], "cancelled")
+        self.assertTrue(result["settling"]["passed"])
+        self.assertEqual(result["settling"]["slope_measurement_events"], 1)
+        self.assertGreaterEqual(result["settling"]["stable_elapsed_s"], 20)
+        self.assertNotIn("identify", controller.commands)
+
+    def test_stuck_slope_measurement_fails_without_excitation(self):
+        controller = FakeController()
+        tick, sequence = [0.], [0]
+        class FreshTelemetry:
+            @property
+            def optical_live_638(self):
+                sequence[0] += 1
+                state = 5 if tick[0] > 3 else 3
+                live = SimpleNamespace(state=state, phase=1 if state == 5 else 0,
+                                       slope=0 if state == 5 else -6.5,
+                                       dac=45000, gain_law=0 if state == 5 else 1,
+                                       sequence=sequence[0], target=3500, feedback=3500)
+                return SimpleNamespace(page=live, host_stale=False)
+        controller.telemetry = FreshTelemetry()
+        def advance():
+            tick[0] += .04
+            return tick[0]
+        with patch.object(pi_characterization.time, "monotonic", side_effect=advance), \
+             patch.object(pi_characterization.time, "sleep"):
+            result = self.run_case(controller)
+        self.assertEqual(result["status"], "unqualified")
+        self.assertIn("exceeded five seconds", result["reason"])
+        self.assertNotIn("identify", controller.commands)
+
+    def test_non_slope_transition_during_settling_still_rejects(self):
+        controller = FakeController()
+        tick, sequence = [0.], [0]
+        class FreshTelemetry:
+            @property
+            def optical_live_638(self):
+                sequence[0] += 1
+                state = 4 if tick[0] > 3 else 3
+                live = SimpleNamespace(state=state, phase=0, slope=-6.5,
+                                       dac=45000, gain_law=1, sequence=sequence[0],
+                                       target=3500, feedback=3500)
+                return SimpleNamespace(page=live, host_stale=False)
+        controller.telemetry = FreshTelemetry()
+        def advance():
+            tick[0] += .04
+            return tick[0]
+        with patch.object(pi_characterization.time, "monotonic", side_effect=advance), \
+             patch.object(pi_characterization.time, "sleep"):
+            result = self.run_case(controller)
+        self.assertEqual(result["status"], "unqualified")
+        self.assertIn("left locked state during settling", result["reason"])
+        self.assertNotIn("identify", controller.commands)
 
 
 if __name__ == "__main__":
