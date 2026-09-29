@@ -321,6 +321,113 @@ sorted by scan index even when early trace pages were missed.
 new capability, runtime hold/rate, and scan status words. Timing accepts
 dividers 1, 2, 3, 5, and 10 and can be changed in automatic RUN.
 
+### Runtime normalized PI and box profile
+
+`read_normalized_pi_638()` returns `kp`, `ki_per_s`, `active`, `overridden`,
+`slope_valid`, and protocol `version`. Call `set_normalized_pi_638(kp,
+ki_per_s)` to change both gains atomically, or `restore_normalized_pi_638()`
+to recover the compiled box defaults. These calls require a healthy locked
+normalized PI path with a valid measured slope; a rejected request does not
+switch to the legacy gain law. The host accepts finite Kp from 0 to 1 and Ki
+from 0 to 1638.3 per second on current firmware; older firmware may reject
+Ki above 1000/s. Wire resolution is 0.001 Kp and 0.1/s Ki. Active
+overrides are volatile and survive bounded recovery/reacquisition; full
+IDLE/Stop resets them. Existing `optical_pid_638()` setters are legacy manual
+gain controls and select the legacy law.
+
+The 638 manual protocol uses channel 10 for one packed gain pair:
+`(round(Kp * 1000) << 14) | round(Ki_per_s * 10)`. `GET` and successful `SET`
+return the complete pair in the ACK's signed 24-bit value; decode it with
+`value & 0xffffff` before unpacking. Channel 11 `GET` reports contract
+version 1 in bits 0–7, normalized law active in bit 8, override in bit 9,
+and slope valid in bit 10. `SET 0` on channel 11 restores profile defaults.
+Channel 12 is a read-only numeric box profile: `1` Belycomm and `2`
+QPhotonics. `read_profile_638()` resolves it to a stable profile name; this
+ID is not a firmware version.
+
+These channels require updated master and 638 firmware. The SDK probes
+channel 11 before tuning and reports unsupported firmware or a failed
+capability probe explicitly. In automatic RUN the master permits these
+bounded 638 requests; in manual mode, release a manually owned 638 laser DAC
+before optical tuning. Run these synchronous SDK calls from a worker when
+using a graphical interface.
+
+### Local slope readiness telemetry compatibility
+
+`OpticalLive.slope_readiness` decodes the packed quiet-gate status only when
+live flag `0x20` is present; it returns `None` for older pages. The packed
+status requires 638 firmware commit `c5cf633` and master firmware commit
+`7cf06c31121a250aa123d7bc837b25d6ee0e0e9d` or later. Earlier masters
+reject the new flag and discard those live pages. Flag `0x10` still means
+PI held, and the live page length and layout are unchanged.
+
+### Bounded PI characterization report
+
+`run_pi_characterization(controller, report_dir, progress=None, cancel=None,
+verified_master_filter=None, driver_pole_hz=None, driver_pole_range_hz=None,
+driver_pole_source=None)`
+uses an **existing** connected, streaming Controller with optical diagnostics
+format 2 and a healthy automatic 638 lock. It does not start or stop the
+system, connect a second session, command a robot, or apply PI gains. Call it
+from a GUI worker that exclusively owns Controller commands. `progress`
+receives a dictionary with `stage`, `message`, and `elapsed_s`; `cancel` is a
+zero-argument predicate. The return value and `summary.json` have a `status`
+of `complete`, `unqualified`, or `cancelled`, and a reason when appropriate.
+
+The routine checks profile identity (Belycomm 1 or QPhotonics 2), runtime PI,
+DAC cap and headroom, 10 kHz timing, configurable-trace support, fresh lock,
+and up to 120 seconds of settling. It requests one 4096-row, D4, hold4,
+8-DAC trace and waits at most 240 seconds for indexed replay.
+During settling only, a fresh firmware `MEASURE_SLOPE` state is allowed for
+at most five continuous seconds; the 15-second stability history and 20-second
+minimum stable time restart on return to `LOCKED`. Other states still reject,
+and the pre-capture/capture checks require `LOCKED` throughout. It keeps ADC
+counter changes during the capture separate from replay changes. The report
+directory contains a concise `report.md`, machine-readable `summary.json`,
+and a compressed `trace.npz` of just the bounded control trace; partial replay
+rows are saved as `trace-partial.npz` after failure or cancellation. No full
+10 MSPS ADC stream is saved. The measured FRFs, model diagnostics when
+supported, and exploratory PI candidate screen are in the JSON report. Pass
+`verified_master_filter="single_sample"` only after independently verifying
+the installed master filter is OFF; otherwise the report withholds gain
+screening and retains measured FRFs. These candidates are local
+evidence for review, not an automatic gain recommendation. The installed
+master feedback filter must be verified to be `single_sample`; the SDK cannot
+read that setting, so the report records the caller's assertion. The driver
+pole is also installation specific: pass an independent nominal
+`driver_pole_hz` in 300–5000 Hz and a nonempty `driver_pole_source` naming
+the measurement, board revision/BOM, or explicit estimate. The optional
+`driver_pole_range_hz=[low, high]` must contain the nominal value and stay
+inside 300–5000 Hz; omitted bounds use nominal ±25%, clipped to that range.
+The reported first-order fit and robust model screen are conditional on this
+prior. With no pole prior, the routine still captures and reports the FRFs
+and can show candidates only when both empirical halves satisfy the strict
+measured-band gates. The driver and thermal poles cannot be distinguished
+from this trace alone, and no pole is inferred from the box or laser brand.
+If the current PI crossover is below the measured band, its measured-band
+sensitivity can still serve as the baseline comparator; every proposed pair
+must have a resolved crossover in both halves. Empirical phase margins are
+point estimates, not confidence-bound stability margins.
+A cancellation
+returns promptly without stopping the shared controller; an excitation
+already started in firmware may finish after the caller returns.
+
+`review_saved_pi_characterization(report_dir, driver_pole_hz=...,
+driver_pole_range_hz=..., driver_pole_source=...)` reanalyzes a complete
+saved `trace.npz` and `summary.json` without hardware or modifications to the
+original report. It checks the saved capture integrity and returns measured
+coverage, model diagnostics, and any qualified exploratory screen. This
+allows a later board measurement or schematic review to supply the driver
+pole without repeating the laser excitation.
+
+For a standalone session, `python examples/pi_characterization.py REPORT_DIR
+--start-and-stop --verified-single-sample-filter` explicitly starts and then
+stops the laser system with the filter assertion. Omit the filter flag to
+collect only measured FRFs. Use `--driver-pole-hz`, optional
+`--driver-pole-low-hz` and `--driver-pole-high-hz`, and
+`--driver-pole-source` to supply an independent prior. Do not
+run that program concurrently with a GUI owning the same device.
+
 ModuleNotFoundError:
 
 - Ensure the virtual environment is activated.

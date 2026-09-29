@@ -11,6 +11,7 @@ PAGE_LIVE=2
 PAGE_ACQUISITION=3
 PAGE_ABBA=4
 PAGE_TRACE=5
+LIVE_SLOPE_READINESS=0x20
 
 class OpticalDiagnosticError(ValueError): pass
 
@@ -30,6 +31,27 @@ class OpticalLive:
     dac_busy_completions:Optional[int]=None
     control_exec_max_us:Optional[int]=None
     frame_interval_max_us:Optional[int]=None
+
+    @property
+    def slope_readiness(self):
+        """Decoded quiet-gate status, or None on older live pages."""
+        if not self.flags & LIVE_SLOPE_READINESS:
+            return None
+        word = self.quality_count
+        gates = (word >> 16) & 0xff
+        rms_tenths_percent = (word >> 24) & 0xff
+        return {
+            'stable_run': word & 0xff,
+            'best_run': (word >> 8) & 0xff,
+            'feedback_quiet': bool(gates & 0x01),
+            'dac_pp_quiet': bool(gates & 0x02),
+            'dac_trend_ready': bool(gates & 0x04),
+            'manual_pending': bool(gates & 0x08),
+            'auto_attempt_done': bool(gates & 0x10),
+            'trusted_slope': bool(gates & 0x20),
+            'tracking_error_rms_percent_of_dip': rms_tenths_percent / 10,
+            'tracking_error_rms_saturated': rms_tenths_percent == 0xff,
+        }
 @dataclass(frozen=True)
 class OpticalAcquisition:
     event_id:int; start_tick_ms:int; end_tick_ms:int; baseline:int; minimum:int; target:int
@@ -48,6 +70,10 @@ class OpticalTraceSample:
 class OpticalTrace:
     capture_id:int; start_index:int; total_samples:int; clock_hz:int; flags:int
     samples:tuple[OpticalTraceSample,...]; start_tick_ms:int
+    amplitude_dac:int=2
+    hold_updates:Optional[int]=None
+    decimation:int=1
+    recorder_filtered:bool=False
 OpticalPage=Union[OpticalLive,OpticalAcquisition,OpticalABBA,OpticalTrace]
 
 def parse_page(raw:bytes)->OpticalPage:
@@ -72,15 +98,28 @@ def parse_page(raw:bytes)->OpticalPage:
     if page_type==PAGE_TRACE:
         capture,start,total,clock,flags,count,record_bytes=struct.unpack_from("<IHHIHBB",raw,4)
         if (not 0<total<=4096 or count not in (1,2) or start>=total or
-                start+count>total or not clock or flags&~15 or flags&3 not in (1,2) or
+                start+count>total or not clock or flags&~0x7ff or flags&3 not in (1,2) or
                 (flags&8 and (flags&4 or total>1002)) or
-                record_bytes!=12 or raw[48:50]!=b'\0\0'):
+                record_bytes!=12):
             raise OpticalDiagnosticError("invalid optical trace header")
+        amplitude, hold = raw[48], raw[49]
+        decimation = ((flags >> 4) & 63) + 1
+        filtered = bool(flags & 0x400)
+        extended = amplitude != 0 or hold != 0
+        if extended:
+            if (not flags & 4 or not 1 <= amplitude <= 64 or not hold or
+                    filtered != (decimation > 1)):
+                raise OpticalDiagnosticError("invalid optical trace configuration")
+        elif flags & ~15:
+            raise OpticalDiagnosticError("missing optical trace configuration")
+        else:
+            amplitude, hold = 2, None
         samples=[]
         for index in range(count):
             values=struct.unpack_from("<IHHhH",raw,20+12*index)
             if ((not flags&4 and values[3]!=0) or
-                    (flags&4 and values[3] not in (-2,2))):
+                    (flags&4 and ((not filtered and values[3] not in (-amplitude,amplitude)) or
+                                  (filtered and not -amplitude <= values[3] <= amplitude)))):
                 raise OpticalDiagnosticError("invalid optical trace injection")
             if values[4]!=1:
                 raise OpticalDiagnosticError("invalid optical trace sample flags")
@@ -88,7 +127,8 @@ def parse_page(raw:bytes)->OpticalPage:
         if count==1 and any(raw[32:44]):
             raise OpticalDiagnosticError("nonzero unused optical trace record")
         start_tick,=struct.unpack_from("<I",raw,44)
-        return OpticalTrace(capture,start,total,clock,flags,tuple(samples),start_tick)
+        return OpticalTrace(capture,start,total,clock,flags,tuple(samples),start_tick,
+                            amplitude,hold,decimation,filtered)
     raise OpticalDiagnosticError(f"unknown optical page type {page_type}")
 
 @dataclass(frozen=True)

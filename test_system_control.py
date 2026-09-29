@@ -40,6 +40,11 @@ class SystemControlTests(unittest.TestCase):
   for action in ('start','abort'):
    with self.assertRaisesRegex(RuntimeError,'only reacquire, retune, trace, or identify'):
     f.control_638(action)
+ def test_queued_retune_rejects_manual_session_before_any_command(self):
+  f=Fake();f._system_manual_owned={(638,3),(1550,2)}
+  with self.assertRaisesRegex(RuntimeError,'requires automatic locking'):
+   f.control_638('retune')
+  self.assertFalse(f.calls)
  def test_manual_start_abort_compatibility(self):
   f=Fake();f._system_manual_owned={(638,3),(1550,2)}
   f.lock_638('start');f.lock_638('abort')
@@ -63,6 +68,61 @@ class SystemControlTests(unittest.TestCase):
   self.assertFalse(f.calls)
   result=f.optical_pid_638(kp=0,ki_negative=.000001,ki_positive=.2)
   self.assertEqual(result['kp'],0);self.assertEqual(result['ki_positive'],.2)
+ def test_normalized_pi_atomic_pair_restore_and_capability(self):
+  class NormalizedFake(Fake):
+   def __init__(self):
+    super().__init__();self._system_manual_active=False;self._system_manual_owned=set()
+    self.values[638,10]=(200<<14)|900;self.values[638,11]=1|256|1024
+   def manual_command(self,target,opcode,channel,value=0,timeout_s=1):
+    self.calls.append((target,opcode,channel,value))
+    if opcode==MANUAL_SET and channel==10:
+     self.values[638,10]=value;self.values[638,11]|=512
+    if opcode==MANUAL_SET and channel==11:
+     self.values[638,10]=(200<<14)|900;self.values[638,11]&=~512
+    raw=self.values.get((target,channel),0)
+    if channel==10 and raw & (1<<23):raw-=1<<24
+    return SimpleNamespace(target=target,status=0,channel=channel,owner=0,applied_value=raw)
+  f=NormalizedFake()
+  self.assertEqual(f.read_normalized_pi_638()['ki_per_s'],90)
+  result=f.set_normalized_pi_638(.8,95)
+  self.assertEqual((result['kp'],result['ki_per_s']),(.8,95))
+  self.assertTrue(result['active'] and result['overridden'])
+  self.assertIn((638,MANUAL_SET,10,(800<<14)|950),f.calls)
+  self.assertFalse(any(c[1]==MANUAL_TAKE for c in f.calls))
+  for kp,ki in ((.483,1178.7),(1.0,1638.3),(0.0,0.0)):
+   result=f.set_normalized_pi_638(kp,ki)
+   self.assertEqual((result['kp'],result['ki_per_s']),(kp,ki))
+   self.assertEqual(result['packed'],(round(kp*1000)<<14)|round(ki*10))
+  for invalid in (1638.31, -0.1, float('inf'), float('nan')):
+   before=len(f.calls)
+   with self.assertRaises(ValueError):f.set_normalized_pi_638(.2,invalid)
+   self.assertEqual(len(f.calls),before)
+  self.assertFalse(f.restore_normalized_pi_638()['overridden'])
+  with self.assertRaises(ValueError):f.set_normalized_pi_638(1.1,95)
+  self.assertFalse(any(c[1]==MANUAL_SET and c[2] in (4,5,6) for c in f.calls))
+  class OldRangeFake(NormalizedFake):
+   def manual_command(self,target,opcode,channel,value=0,timeout_s=1):
+    if opcode==MANUAL_SET and channel==10 and (value&0x3fff)>10000:
+     self.calls.append((target,opcode,channel,value))
+     return SimpleNamespace(target=target,status=6,channel=channel,owner=0,applied_value=0)
+    return super().manual_command(target,opcode,channel,value,timeout_s)
+  old=OldRangeFake()
+  with self.assertRaisesRegex(RuntimeError,'status 6'):old.set_normalized_pi_638(.483,1178.7)
+  self.assertEqual(old.read_normalized_pi_638()['ki_per_s'],90)
+  self.assertEqual(sum(c[1]==MANUAL_SET for c in old.calls),1)
+  class OldFake(NormalizedFake):
+   def manual_command(self,target,opcode,channel,value=0,timeout_s=1):
+    reply=super().manual_command(target,opcode,channel,value,timeout_s)
+    if channel==11:reply.status=4
+    return reply
+  with self.assertRaisesRegex(RuntimeError,'does not support'):
+   OldFake().set_normalized_pi_638(.2,90)
+  class OldMasterFake(NormalizedFake):
+   def manual_command(self,target,opcode,channel,value=0,timeout_s=1):
+    if channel==11:raise RuntimeError('stream-control request failed (USB STALL)')
+    return super().manual_command(target,opcode,channel,value,timeout_s)
+  with self.assertRaisesRegex(RuntimeError,'capability probe failed; check master/638 firmware support'):
+   OldMasterFake().read_normalized_pi_638()
  def test_renew_failure_stops_both(self):
   f=Fake()
   def fail(*a,**k):raise TimeoutError('ack')

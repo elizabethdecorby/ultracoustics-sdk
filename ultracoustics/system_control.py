@@ -21,6 +21,12 @@ CHANNEL_KI_POSITIVE = 6
 CHANNEL_DAC_CAP = 7
 CHANNEL_OPTICAL_RUNTIME = 8
 CHANNEL_FP_SCAN = 9
+CHANNEL_NORMALIZED_PI = 10
+CHANNEL_NORMALIZED_PI_INFO = 11
+CHANNEL_PROFILE_ID = 12
+CHANNEL_TRACE_CONFIG = 13
+NORMALIZED_PI_VERSION = 1
+NORMALIZED_PI_MAX_KI_PER_S = 0x3fff / 10.0
 FP_SCAN_STATES = ('idle', 'armed', 'qualifying', 'active', 'complete', 'aborted')
 FP_SCAN_RESULTS = ('none', 'complete', 'explicit_abort', 'invalid_or_fault')
 FP_SCAN_MIN_RECORDS = 500
@@ -50,6 +56,134 @@ class FPScanError(RuntimeError):
 
 
 class SystemControlMixin:
+    @staticmethod
+    def _decode_trace_config(word):
+        if type(word) is not int or word < 0 or (word & ~0x1fffff) != 0x400000:
+            raise RuntimeError('Unsupported 638 trace configuration version/reserved bits')
+        amplitude, hold = word & 0x7f, (word >> 7) & 255
+        decimation = ((word >> 15) & 63) + 1
+        if not 1 <= amplitude <= 64 or not 1 <= hold <= 255:
+            raise RuntimeError('638 returned invalid trace configuration')
+        return dict(version=1, amplitude_dac=amplitude, hold_updates=hold,
+                    decimation=decimation, packed=word,
+                    recorder_filter='four_boxcars' if decimation > 1 else 'none')
+
+    def read_control_trace_config_638(self, timeout_s=1.0):
+        """Read versioned identification settings; requires supporting firmware."""
+        reply = self._normalized_pi_command_638(MANUAL_GET, CHANNEL_TRACE_CONFIG,
+                                               timeout_s=timeout_s)
+        if reply.status == 4:
+            raise RuntimeError('638 firmware does not support configurable identification')
+        return self._decode_trace_config(require_applied(reply).applied_value)
+
+    def configure_control_trace_638(self, amplitude_dac=2, hold_updates=1,
+                                    decimation=1, timeout_s=1.0):
+        """Configure the next excited trace without starting it or changing PI gains.
+
+        The slave requires healthy locked normalized control and no busy capture.
+        For decimation > 1, y/u/d share four length-D boxcar filters at the control
+        rate. Record timestamps are output times; nominal filter delay is 2(D-1)
+        control updates. Quantization/coherence must be checked before fitting.
+        """
+        for value, maximum in ((amplitude_dac, 64), (hold_updates, 255), (decimation, 64)):
+            if type(value) is not int or not 1 <= value <= maximum:
+                raise ValueError('Trace settings require integer amplitude 1..64, hold 1..255, decimation 1..64')
+        self.read_control_trace_config_638(timeout_s)
+        word = 0x400000 | ((decimation-1) << 15) | (hold_updates << 7) | amplitude_dac
+        reply = require_applied(self._normalized_pi_command_638(
+            MANUAL_SET, CHANNEL_TRACE_CONFIG, word, timeout_s))
+        if reply.applied_value != word:
+            raise RuntimeError('638 trace configuration acknowledgement differs from request')
+        result = self.read_control_trace_config_638(timeout_s)
+        if result['packed'] != word:
+            raise RuntimeError('638 trace configuration readback differs from request')
+        return result
+
+    def _normalized_pi_command_638(self, opcode, channel, value=0, timeout_s=1.0):
+        if self.system_manual_active:
+            if (638, CHANNEL_LASER_DAC) in self._system_manual_owned:
+                raise RuntimeError('Release the manually-owned 638 laser DAC before normalized PI control')
+            command = self.system_manual_command
+        else:
+            command = self.manual_command
+        return command(638, opcode, channel, value, timeout_s)
+
+    def _normalized_pi_info_638(self, timeout_s=1.0):
+        try:
+            reply = self._normalized_pi_command_638(MANUAL_GET, CHANNEL_NORMALIZED_PI_INFO,
+                                                    timeout_s=timeout_s)
+        except (RuntimeError, TimeoutError) as exc:
+            if 'manually-owned 638 laser DAC' in str(exc):
+                raise
+            raise RuntimeError('638 normalized PI capability probe failed; '
+                               'check master/638 firmware support and connection: '
+                               f'{exc}') from exc
+        if reply.status == 4:
+            raise RuntimeError('638 firmware does not support normalized PI runtime controls')
+        require_applied(reply)
+        raw = reply.applied_value
+        if raw < 0 or raw & ~0x7ff or (raw & 255) != NORMALIZED_PI_VERSION:
+            raise RuntimeError(f'638 returned unsupported normalized PI contract {raw}')
+        return {'version': raw & 255, 'active': bool(raw & 256),
+                'overridden': bool(raw & 512), 'slope_valid': bool(raw & 1024)}
+
+    def read_normalized_pi_638(self, timeout_s=1.0):
+        """Read the explicit symmetric normalized PI pair and active law."""
+        info = self._normalized_pi_info_638(timeout_s)
+        reply = require_applied(self._normalized_pi_command_638(
+            MANUAL_GET, CHANNEL_NORMALIZED_PI, timeout_s=timeout_s))
+        packed = reply.applied_value & 0xffffff  # ACK is signed 24-bit.
+        kp_milli, ki_deci = packed >> 14, packed & 0x3fff
+        if kp_milli > 1000:
+            raise RuntimeError(f'638 returned out-of-range normalized PI pair {packed}')
+        return dict(info, kp=kp_milli / 1000.0, ki_per_s=ki_deci / 10.0,
+                    packed=packed)
+
+    def set_normalized_pi_638(self, kp, ki_per_s, timeout_s=1.0):
+        """Commit Kp and Ki/s together; verify the applied pair and law.
+
+        The existing 14-bit Ki field permits 0..1638.3/s. Older firmware
+        may reject values above 1000/s; propagate that rejection without retries.
+        Runtime overrides do not change the compiled profile defaults.
+        """
+        if (type(kp) not in (int, float) or type(ki_per_s) not in (int, float) or
+                not math.isfinite(kp) or not math.isfinite(ki_per_s) or
+                not 0 <= kp <= 1 or not 0 <= ki_per_s <= NORMALIZED_PI_MAX_KI_PER_S):
+            raise ValueError('Normalized PI requires finite Kp 0..1 and Ki 0..1638.3 per second')
+        info = self._normalized_pi_info_638(timeout_s)
+        if not info['active'] or not info['slope_valid']:
+            raise RuntimeError('638 normalized PI must be active with a valid slope before tuning')
+        packed = (round(kp * 1000) << 14) | round(ki_per_s * 10)
+        reply = require_applied(self._normalized_pi_command_638(
+            MANUAL_SET, CHANNEL_NORMALIZED_PI, packed, timeout_s))
+        if (reply.applied_value & 0xffffff) != packed:
+            raise RuntimeError('638 normalized PI applied pair differs from request')
+        result = self.read_normalized_pi_638(timeout_s)
+        if not result['active'] or not result['overridden'] or result['packed'] != packed:
+            raise RuntimeError('638 normalized PI verification failed after SET')
+        return result
+
+    def restore_normalized_pi_638(self, timeout_s=1.0):
+        """Restore profile defaults and verify normalized control remains active."""
+        info = self._normalized_pi_info_638(timeout_s)
+        if not info['active'] or not info['slope_valid']:
+            raise RuntimeError('638 normalized PI must be active with a valid slope before restore')
+        require_applied(self._normalized_pi_command_638(
+            MANUAL_SET, CHANNEL_NORMALIZED_PI_INFO, 0, timeout_s))
+        result = self.read_normalized_pi_638(timeout_s)
+        if not result['active'] or result['overridden']:
+            raise RuntimeError('638 normalized PI verification failed after restore')
+        return result
+
+    def read_profile_638(self, timeout_s=1.0):
+        """Read the compiled box profile identity from the 638 board."""
+        reply = require_applied(self.manual_command(
+            638, MANUAL_GET, CHANNEL_PROFILE_ID, timeout_s=timeout_s))
+        names = {1: '638-belycomm-v1', 2: '638-qphotonics-v1'}
+        if reply.applied_value not in names:
+            raise RuntimeError(f'638 returned unknown profile ID {reply.applied_value}')
+        return {'id': reply.applied_value, 'name': names[reply.applied_value]}
+
     def read_optical_cap_638(self, timeout_s=1.0):
         """Read this board's authoritative optical DAC ceiling (channel 7)."""
         reply = require_applied(self.manual_command(
@@ -463,9 +597,14 @@ class SystemControlMixin:
         Automatic RUN routing is owned by the master and therefore does not
         acquire a slave lease.  An active manual session may use an existing
         optical lease, but never silently replaces a manually-owned laser DAC.
+        For ``retune``, the reply confirms a queued local slope request only;
+        the subsequent ABBA telemetry event reports acceptance or rejection.
         """
         if action not in OPTICAL_ACTIONS:
             raise ValueError('Unknown optical action')
+        if self.system_manual_active and action == 'retune':
+            raise RuntimeError('Local slope measurement requires automatic locking; '
+                               'manual-session lease renewals interrupt its quiet interval')
         if self.system_manual_active:
             if (638, CHANNEL_LASER_DAC) in self._system_manual_owned:
                 raise RuntimeError('Release the manually-owned 638 laser DAC before optical control')
@@ -491,7 +630,9 @@ class SystemControlMixin:
         """Capture bounded ring-buffer windows around one automatic lock action.
 
         This reuses the controller's existing stream and USB owner. It creates
-        no reader, background queue, or unbounded recording.
+        no reader, background queue, or unbounded recording. The returned
+        acknowledgement means the request was queued; the snapshot may still
+        contain an older event and does not establish action completion.
         """
         if action not in ('reacquire', 'retune'):
             raise ValueError('Captured automatic action must be reacquire or retune')
