@@ -66,6 +66,31 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(fake.events[:3], ['stop', ('request', 1, 7500), 'boot'])
         self.assertEqual(result['illumination'].applied_dac, 7500)
 
+    def test_default_wait_allows_bootloader_and_telemetry_qualification(self):
+        fake = FakeSystem()
+        polls = [0]
+        clock = [0.0]
+
+        def request(payload, kind, timeout_s=1.0):
+            if payload[1] == 0:
+                polls[0] += 1
+                if polls[0] <= 5:
+                    return {'firmware_response': parse_startup_illumination(
+                        packet(2, staged=7500, boot=2))}
+            return fake.request(payload, kind, timeout_s)
+
+        def monotonic():
+            clock[0] += 0.25
+            return clock[0]
+
+        fake._stream._request_stream_control = request
+        with patch('ultracoustics.system_control.time.sleep'), \
+                patch('ultracoustics.system_control.time.monotonic', monotonic):
+            result = fake.start_with_startup_illumination_1550(7500)
+        self.assertGreater(clock[0], 1.0)
+        self.assertEqual(polls[0], 6)
+        self.assertEqual(result['illumination'].applied_dac, 7500)
+
     def test_out_of_range_never_boots(self):
         fake = FakeSystem()
         with patch('ultracoustics.system_control.time.sleep'):

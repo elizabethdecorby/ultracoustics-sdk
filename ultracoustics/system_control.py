@@ -120,7 +120,10 @@ class SystemControlMixin:
             self.stage_startup_illumination_1550(dac, timeout_s)
             delivery = self._send_confirmed(CMD_BOOT, timeout_s=timeout_s)
             self._running = True
-            deadline = time.monotonic() + max(1.0, timeout_s)
+            # The 1550 bootloader waits a second before application telemetry
+            # can qualify. Keep the per-request timeout independent of the
+            # bounded pre-trigger application wait in master firmware.
+            deadline = time.monotonic() + max(5.0, timeout_s)
             while time.monotonic() < deadline:
                 remaining = deadline - time.monotonic()
                 status = self.read_startup_illumination_1550(
