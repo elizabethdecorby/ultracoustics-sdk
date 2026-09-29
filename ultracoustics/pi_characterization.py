@@ -15,8 +15,12 @@ import numpy as np
 
 from .pi_analysis import review
 from ._internal import pi_model
+from ._internal.control import MANUAL_SET
+from .system_control import SlaveCommandRejected
 
 COUNTERS = ("drops_seq", "drops_fw", "transfer_errors", "transfer_timeouts", "malformed")
+TRACE_CONFIG_FIELDS = ("amplitude_dac", "hold_updates", "decimation")
+TRACE_RESTORE_MAX_S = 30
 
 
 class _Cancelled(Exception):
@@ -60,9 +64,48 @@ def _trace_array(trace):
                        for r in ordered], dtype=np.int64)
 
 
+def _restore_trace_config(controller, original, *, timeout_s, emit, cancel, state):
+    """Retry only an acknowledged 638 trace-config BUSY, then verify readback."""
+    expected = tuple(original[key] for key in TRACE_CONFIG_FIELDS)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if state["attempts"] and time.monotonic() >= deadline:
+            raise TimeoutError("Original trace configuration remained busy for restore deadline")
+        state["attempts"] += 1  # Cleanup gets one attempt even after cancellation.
+        emit("restore", "Restoring original trace configuration",
+             attempt=state["attempts"], timeout_s=timeout_s)
+        remaining = deadline - time.monotonic()
+        try:
+            # configure_control_trace_638 performs SET, GET and packed-word
+            # verification. Also compare the returned fields to the saved values.
+            restored = controller.configure_control_trace_638(
+                *expected, timeout_s=max(.05, min(1.0, remaining / 3)))
+            actual = tuple(restored[key] for key in TRACE_CONFIG_FIELDS)
+            if actual != expected:
+                raise RuntimeError(f"638 trace configuration restore readback differs: {actual} != {expected}")
+            emit("restore", "Original trace configuration confirmed",
+                 attempt=state["attempts"])
+            return
+        except SlaveCommandRejected as exc:
+            if (exc.target, exc.channel, exc.status, exc.opcode) != (638, 13, 10, MANUAL_SET):
+                raise
+            if cancel and cancel():
+                raise _Cancelled("Cancelled while waiting to restore original trace configuration") from exc
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Original trace configuration remained busy for restore deadline") from exc
+            emit("restore", "Trace configuration still busy; waiting to retry",
+                 attempt=state["attempts"], remaining_s=round(deadline-time.monotonic(), 2))
+            until = min(deadline, time.monotonic() + 1.0)
+            while time.monotonic() < until:
+                if cancel and cancel():
+                    raise _Cancelled("Cancelled while waiting to restore original trace configuration") from exc
+                time.sleep(min(.05, max(0, until-time.monotonic())))
+
+
 def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
                             verified_master_filter=None, driver_pole_hz=None,
-                            driver_pole_range_hz=None, driver_pole_source=None):
+                            driver_pole_range_hz=None, driver_pole_source=None,
+                            trace_restore_timeout_s=TRACE_RESTORE_MAX_S):
     """Capture one 4096-row D4/hold4/8-DAC trace and write a reviewable report.
 
     ``controller`` must already be connected, streaming format-2 diagnostics,
@@ -129,6 +172,8 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
 
     try:
         check_cancel()
+        if not 0 < trace_restore_timeout_s <= TRACE_RESTORE_MAX_S:
+            raise ValueError("Trace restore timeout must be in (0, 30] seconds")
         if any(value is not None for value in (driver_pole_hz, driver_pole_range_hz,
                                                driver_pole_source)):
             prior = {"driver_pole_hz": driver_pole_hz,
@@ -273,8 +318,9 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
                 configured = configuration_differs  # SET may succeed even if its readback fails.
                 config = controller.configure_control_trace_638(8, 4, 4)
                 break
-            except RuntimeError as exc:
-                if "status 10" not in str(exc) or time.monotonic() >= deadline:
+            except SlaveCommandRejected as exc:
+                if ((exc.target, exc.channel, exc.status, exc.opcode) !=
+                        (638, 13, 10, MANUAL_SET) or time.monotonic() >= deadline):
                     raise
                 sleep(1)
         config.update(dac_cap=cap, master_feedback_filter=verified_master_filter or "unverified",
@@ -366,7 +412,6 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
         report["analysis"] = analysis
         report["status"] = "complete" if analysis.get("accepted") else "unqualified"
         report["reason"] = analysis.get("reason")
-        emit("done", "Characterization report written", status=report["status"])
     except _Cancelled as exc:
         report.update(status="cancelled", reason=str(exc))
     except Exception as exc:
@@ -374,17 +419,26 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
     finally:
         if configured:
             old_config = report.get("trace_config_before") or {}
+            restore_state = {"attempts": 0}
             try:
-                controller.configure_control_trace_638(old_config["amplitude_dac"],
-                                                       old_config["hold_updates"],
-                                                       old_config["decimation"])
+                _restore_trace_config(controller, old_config,
+                                      timeout_s=trace_restore_timeout_s,
+                                      emit=emit, cancel=cancel, state=restore_state)
                 report["trace_config_restored"] = True
+            except _Cancelled as exc:
+                report["trace_config_restored"] = False
+                report["trace_config_restore_error"] = str(exc)
+                if report["status"] == "complete":
+                    report.update(status="cancelled", reason="Cancelled by user")
             except Exception as exc:
                 report["trace_config_restored"] = False
                 report["trace_config_restore_error"] = str(exc)
                 if report["status"] == "complete":
                     report["status"] = "unqualified"
                     report["reason"] = "Original trace configuration could not be restored"
+            report["trace_config_restore_attempts"] = restore_state["attempts"]
+            if cancel and cancel() and report["status"] == "complete":
+                report.update(status="cancelled", reason="Cancelled by user")
         if partial_trace is not None and "trace_file" not in report:
             try:
                 # A failed or cancelled replay can still leave useful indexed
@@ -414,6 +468,7 @@ def run_pi_characterization(controller, report_dir, progress=None, cancel=None,
         lines += ["", "## Limits", ""] + [f"- {item}" for item in report["limitations"]]
         lines += ["", "Detailed frequency response, quality diagnostics, and screening evidence: `summary.json`. Bounded indexed trace: `trace.npz` when capture completed.", "No gains were applied by this run.", ""]
         (output/"report.md").write_text("\n".join(lines))
+        emit("done", "Characterization report written", status=report["status"])
     return report
 
 

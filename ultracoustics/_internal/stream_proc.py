@@ -70,6 +70,8 @@ from .telemetry import (
 )
 from .control import (ControlProtocolError, parse_manual_response,
                       parse_runtime_metrics)
+from .startup_illumination import (StartupIlluminationProtocolError,
+                                   parse_startup_illumination)
 
 
 def parse_attached_record(raw, current_format, received_monotonic_ns):
@@ -483,9 +485,12 @@ def reader_main(
                             response = parse_manual_response(bytes(raw))
                         elif response_kind == "runtime":
                             response = parse_runtime_metrics(bytes(raw))
+                        elif response_kind == "startup_1550":
+                            response = parse_startup_illumination(bytes(raw))
                         else:
                             raise TelemetryFormatError("unknown pending control response")
-                    except (TelemetryFormatError, ControlProtocolError) as exc:
+                    except (TelemetryFormatError, ControlProtocolError,
+                            StartupIlluminationProtocolError) as exc:
                         delivery = {**delivery, "transport_status": "failed",
                                     "error": str(exc)}
                     else:

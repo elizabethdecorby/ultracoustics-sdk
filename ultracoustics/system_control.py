@@ -14,6 +14,7 @@ from ._internal.control import (
 )
 from ._internal.protocol import (
     CMD_BOOT, CMD_KEEPALIVE, CMD_OVERRIDE_ENTER, CMD_POWER, CMD_TRIGGER,
+    CMD_STARTUP_1550, pack_command,
 )
 from ._internal.optical_diagnostics import OpticalTrace
 from .characterization import ProbeCharacterizationResult
@@ -49,10 +50,22 @@ RENEW_INTERVAL_S = 0.5
 STREAM_HEALTH_KEYS = ('drops_seq', 'transfer_errors', 'transfer_timeouts', 'malformed')
 
 
+class SlaveCommandRejected(RuntimeError):
+    def __init__(self, target, channel, status, opcode=None):
+        self.target = target
+        self.channel = channel
+        self.status = status
+        self.opcode = opcode
+        reason = {6: 'value outside bounds or TEC not yet LOCKED',
+                  7: 'channel is not owned', 8: 'channel is already owned',
+                  10: 'optical transition busy'}.get(status, 'command rejected')
+        super().__init__(f'Board {target}, channel {channel}: {reason} (status {status})')
+
+
 def require_applied(reply):
     if reply.status != 0:
-        reason = {6: 'value outside bounds or TEC not yet LOCKED', 7: 'channel is not owned', 8: 'channel is already owned', 10: 'optical transition busy'}.get(reply.status, 'command rejected')
-        raise RuntimeError(f'Board {reply.target}, channel {reply.channel}: {reason} (status {reply.status})')
+        raise SlaveCommandRejected(reply.target, reply.channel, reply.status,
+                                   getattr(reply, 'opcode', None))
     return reply
 
 
@@ -68,6 +81,68 @@ class FPScanError(RuntimeError):
 
 
 class SystemControlMixin:
+    def _startup_illumination_request(self, action, dac=0, timeout_s=1.0):
+        if self._stream is None or not self._stream.running:
+            raise RuntimeError('call begin_stream() before 1550 startup control')
+        result = self._stream._request_stream_control(
+            pack_command(CMD_STARTUP_1550, action, dac),
+            'startup_1550', timeout_s=timeout_s)
+        return result['firmware_response']
+
+    def read_startup_illumination_1550(self, timeout_s=1.0):
+        """Read volatile one-use stage/application state; old firmware fails closed."""
+        return self._startup_illumination_request(0, timeout_s=timeout_s)
+
+    def stage_startup_illumination_1550(self, dac, timeout_s=1.0):
+        """Stage one automatic START (1..43253); IDLE with both rails off."""
+        if type(dac) is not int or not 1 <= dac <= 43253:
+            raise ValueError('1550 startup DAC must be an integer from 1 to 43253')
+        result = self._startup_illumination_request(1, dac, timeout_s)
+        if result.state != 'staged' or result.staged_dac != dac:
+            raise RuntimeError('1550 startup staging readback differs from request')
+        return result
+
+    def clear_startup_illumination_1550(self, timeout_s=1.0):
+        """Clear an unused stage from IDLE with rails off."""
+        result = self._startup_illumination_request(2, timeout_s=timeout_s)
+        if result.state != 'clear':
+            raise RuntimeError('1550 startup stage did not clear')
+        return result
+
+    def start_with_startup_illumination_1550(self, dac, timeout_s=1.0):
+        """STOP, stage once, start AUTO, and require exact pre-trigger ACK."""
+        self.stop_system_confirmed(timeout_s)
+        self._require_system_board('Starting the box')
+        remaining = .2 - (time.monotonic_ns() - self._last_manual_rail_off_ns) / 1e9
+        if remaining > 0:
+            time.sleep(remaining)
+        try:
+            self.stage_startup_illumination_1550(dac, timeout_s)
+            delivery = self._send_confirmed(CMD_BOOT, timeout_s=timeout_s)
+            self._running = True
+            deadline = time.monotonic() + max(1.0, timeout_s)
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                status = self.read_startup_illumination_1550(
+                    timeout_s=min(timeout_s, max(0.05, remaining)))
+                if status.state == 'applied':
+                    if status.applied_dac != dac:
+                        raise RuntimeError('1550 startup applied DAC differs from request')
+                    self._last_manual_rail_off_ns = None
+                    return {'delivery': delivery, 'illumination': status}
+                if status.state == 'clear':
+                    raise RuntimeError('1550 startup cleared before exact application')
+                time.sleep(0.025)
+            raise TimeoutError('1550 startup application was not acknowledged')
+        except Exception as exc:
+            # A failed/uncertain stage must never continue into 638 acquisition.
+            try:
+                self.stop_system_confirmed(timeout_s)
+            except Exception as cleanup_exc:
+                raise RuntimeError(
+                    f'{exc}; STOP verification also failed: {cleanup_exc}') from exc
+            raise
+
     @staticmethod
     def _decode_trace_config(word):
         if type(word) is not int or word < 0 or (word & ~0x1fffff) != 0x400000:

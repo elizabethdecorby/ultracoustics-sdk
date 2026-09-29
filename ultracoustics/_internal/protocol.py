@@ -30,6 +30,7 @@ CMD_RUNTIME_METRICS = ord('r')      # IDLE-only fixed runtime snapshot
 CMD_MANUAL_CONTROL = ord('j')       # Leased manual command relay
 CMD_IDENTITY_READ = ord('n')        # Read a board identity record (wIndex=target)
 CMD_IDENTITY_WRITE = ord('N')       # Write + read back a board identity record
+CMD_STARTUP_1550 = ord('k')          # One-use pre-trigger AUTO 1550 DAC
 
 # Target IDs for Manual Control
 TARGET_1550 = 1550
