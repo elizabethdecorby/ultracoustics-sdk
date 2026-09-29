@@ -62,6 +62,7 @@ from .processing import compute_noise_metrics
 
 
 from .system_control import SystemControlMixin
+from .manual_sweep import CAPS as DEFAULT_DAC_CAPS
 
 
 class Controller(SystemControlMixin):
@@ -153,6 +154,10 @@ class Controller(SystemControlMixin):
         self._packet_diagnostics_attach_s = packet_diagnostics_attach_s
         self._manual_transaction = 0
         self._last_manual_rail_off_ns = None
+        # Host-side laser DAC ceilings. The 638 value is replaced by the
+        # board's own cap (manual channel 7) once read_optical_cap_638() has
+        # run; the 1550 exposes no cap, so its compiled limit stands.
+        self._dac_caps = dict(DEFAULT_DAC_CAPS)
 
         # Ring capacity in samples, sized from ring_seconds. Lives in shared
         # memory once the stream subprocess is spawned (allocated by USBStream)
@@ -367,13 +372,24 @@ class Controller(SystemControlMixin):
             time.sleep(0.001)
         raise TimeoutError("no ADC packet received after runtime metrics response")
 
+    def dac_cap(self, target: int) -> int:
+        """Highest laser DAC this controller will send to *target*.
+
+        For the 638 this is the board's own ``CALIBRATION_DAC_VALUE`` once
+        :meth:`read_optical_cap_638` has read it, else the historical 44000.
+        The 1550 has no cap channel and stays at its hardware limit, 43253.
+        """
+        if target not in self._dac_caps:
+            raise ValueError("target must be 638 or 1550")
+        return self._dac_caps[target]
+
     def manual_command(self, target: int, opcode: int, channel: int,
                        value: int = 0, timeout_s: float = 1.0):
         """Execute one manual slave transaction and validate its full identity."""
         if target not in (TARGET_638, TARGET_1550):
             raise ValueError("target must be 638 or 1550")
         if opcode in (MANUAL_TAKE, MANUAL_SET) and channel == CHANNEL_LASER_DAC:
-            cap = 44000 if target == TARGET_638 else 43253
+            cap = self.dac_cap(target)
             if not 0 <= value <= cap:
                 raise ValueError(f"laser DAC must be between 0 and {cap}")
         if self._stream is None or not self._stream.running:
@@ -986,7 +1002,7 @@ class Controller(SystemControlMixin):
         if sample_rate_hz is None:
             sample_rate_hz = SAMPLE_RATE
 
-        cap = 44000 if target == TARGET_638 else 43253
+        cap = self.dac_cap(target) if target in self._dac_caps else 0
         if dac_end is None:
             dac_end = cap
         if (target not in (TARGET_638, TARGET_1550) or

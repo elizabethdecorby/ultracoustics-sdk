@@ -173,6 +173,24 @@ class ControllerControlTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ctrl.manual_command(638, MANUAL_SET, CHANNEL_LASER_DAC, 44001)
 
+    def test_board_reported_638_cap_replaces_default(self):
+        ctrl = Controller()
+        self.assertEqual((ctrl.dac_cap(638), ctrl.dac_cap(1550)), (44000, 43253))
+        cap_reply = SimpleNamespace(status=0, applied_value=50000)
+        with mock.patch.object(ctrl, "manual_command", return_value=cap_reply):
+            self.assertEqual(ctrl.read_optical_cap_638()["max_dac"], 50000)
+        self.assertEqual((ctrl.dac_cap(638), ctrl.dac_cap(1550)), (50000, 43253))
+        ctrl._stream = FakeStream(parse_manual_response(
+            manual_response(txn=1, applied=50000)))
+        self.assertEqual(ctrl.manual_command(
+            638, MANUAL_SET, CHANNEL_LASER_DAC, 50000).applied_value, 50000)
+        with self.assertRaises(ValueError):
+            ctrl.manual_command(638, MANUAL_SET, CHANNEL_LASER_DAC, 50001)
+        with self.assertRaises(ValueError):
+            ctrl.manual_command(1550, MANUAL_SET, CHANNEL_LASER_DAC, 43254)
+        # A second controller has not read any board and keeps the default.
+        self.assertEqual(Controller().dac_cap(638), 44000)
+
     def test_begin_manual_legacy_settle_covers_bootloader_and_poll_gate(self):
         events = []
         ctrl = Controller()

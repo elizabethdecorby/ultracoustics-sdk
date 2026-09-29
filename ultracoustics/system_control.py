@@ -56,6 +56,11 @@ class SystemControlMixin:
             638, MANUAL_GET, CHANNEL_DAC_CAP, timeout_s=timeout_s))
         if not 0 < reply.applied_value <= 65535:
             raise RuntimeError('638 reported an invalid optical DAC cap')
+        # The board's cap is authoritative; manual laser SETs are bounded by
+        # it from now on instead of the historical 44000.
+        caps = getattr(self, '_dac_caps', None)
+        if caps is not None:
+            caps[638] = reply.applied_value
         return {'max_dac': reply.applied_value}
 
     def read_controller_timing_638(self, timeout_s=1.0):

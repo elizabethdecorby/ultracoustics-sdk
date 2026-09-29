@@ -7,6 +7,8 @@ from ._internal.control import (
     CHANNEL_LASER_DAC, MANUAL_RENEW, MANUAL_SET, MANUAL_TAKE,
 )
 
+#: Default laser DAC ceilings. The 638 value is superseded by the board's own
+#: cap once ``Controller.read_optical_cap_638()`` has read it.
 CAPS = {638: 44000, 1550: 43253}
 STATUS_NAMES = {
     1: "bad start", 2: "bad CRC", 3: "bad opcode", 4: "bad channel",
@@ -161,7 +163,10 @@ def run_manual_sweep(ctrl, target, points=100, max_dac=None, on_point=None,
         raise ValueError("points must be an integer between 2 and 1000")
     if not ctrl.connected:
         raise RuntimeError("Controller must be connected")
-    cap = CAPS[target]
+    # A controller's cap follows the board once read_optical_cap_638() has
+    # run; CAPS are the defaults for one that has not (or a test double).
+    dac_cap = getattr(ctrl, "dac_cap", None)
+    cap = dac_cap(target) if callable(dac_cap) else CAPS[target]
     if max_dac is None:
         max_dac = cap
     if (not isinstance(max_dac, int) or isinstance(max_dac, bool) or
