@@ -51,11 +51,12 @@ STREAM_HEALTH_KEYS = ('drops_seq', 'transfer_errors', 'transfer_timeouts', 'malf
 
 
 class SlaveCommandRejected(RuntimeError):
-    def __init__(self, target, channel, status, opcode=None):
+    def __init__(self, target, channel, status, opcode=None, reply=None):
         self.target = target
         self.channel = channel
         self.status = status
         self.opcode = opcode
+        self.reply = reply
         reason = {6: 'value outside bounds or TEC not yet LOCKED',
                   7: 'channel is not owned', 8: 'channel is already owned',
                   10: 'optical transition busy'}.get(status, 'command rejected')
@@ -65,16 +66,17 @@ class SlaveCommandRejected(RuntimeError):
 def require_applied(reply):
     if reply.status != 0:
         raise SlaveCommandRejected(reply.target, reply.channel, reply.status,
-                                   getattr(reply, 'opcode', None))
+                                   getattr(reply, 'opcode', None), reply)
     return reply
 
 
 class FPScanError(RuntimeError):
     """Scan failure with any causally paired rows already received."""
 
-    def __init__(self, message, rows=(), cleanup_error=None):
+    def __init__(self, message, rows=(), cleanup_error=None, arm_rejections=()):
         self.rows = tuple(rows)
         self.cleanup_error = cleanup_error
+        self.arm_rejections = tuple(arm_rejections)
         if cleanup_error is not None:
             message = f'{message}; cleanup also failed: {cleanup_error}'
         super().__init__(message)
@@ -361,6 +363,7 @@ class SystemControlMixin:
         started = False
         acquired = (638, CHANNEL_OPTICAL) not in self._system_manual_owned
         cleanup_error = None
+        arm_rejections = []
         chunks = []
         cursor = origin = self.samples_received
         initial_stats = dict(self.stream_stats)
@@ -417,13 +420,92 @@ class SystemControlMixin:
                 points.append(snap.received_sample_end - 8192 + delta * 8192 + index)
             anchors = (sync[1], points)
 
+        def scan_arm_receipt(exc):
+            reply = exc.reply
+            if reply is None:
+                return {'target': exc.target, 'channel': exc.channel,
+                        'opcode': exc.opcode, 'status': exc.status}
+            return {'target': reply.target, 'transaction': reply.transaction,
+                    'opcode': reply.opcode, 'channel': reply.channel,
+                    'status': reply.status, 'owner': reply.owner,
+                    'applied_value': reply.applied_value,
+                    'raw_ack_hex': reply.raw_ack.hex()}
+
         try:
             if acquired:
                 self._take_optical_638(1.0)
-            # Capture begins before dispatch; alignment comes from hardware markers,
-            # never from the host command clock or command acknowledgement.
-            collect()
-            self.system_manual_command(638, MANUAL_SET, CHANNEL_FP_SCAN, 1)
+            # A status-10 ACK is an explicit firmware rejection: the scan was
+            # not armed. Retry only that exact response, within the original
+            # caller deadline. Capture begins before each dispatch so accepted
+            # markers still bound the first sample; rejected attempt samples
+            # are discarded and never accumulated during the wait.
+            arm_progress_tick = 0.0
+            arm_renew_tick = time.monotonic()
+            while True:
+                if cancel is not None and cancel():
+                    raise RuntimeError('FP scan canceled while waiting for 638 readiness')
+                if time.monotonic() >= deadline:
+                    if arm_rejections:
+                        raise TimeoutError(
+                            '638 FP scan not ready (temperature or optical transition)')
+                    raise TimeoutError('FP scan arm deadline expired')
+                chunks.clear()
+                cursor = origin = self.samples_received
+                anchors = None
+                capture_id = None
+                live_index = 0
+                snapshot = self.telemetry
+                if snapshot is not None and not snapshot.host_stale:
+                    if snapshot.stream_epoch != initial_epoch:
+                        raise RuntimeError('Stream epoch changed before FP scan arm')
+                    sync = getattr(snapshot, 'scan_sync', None)
+                    baseline_id = struct.unpack_from('<I', sync, 4)[0] if sync else None
+                collect()
+                remaining = deadline - time.monotonic()
+                if remaining < 1.5:
+                    raise TimeoutError(
+                        '638 FP scan not ready (temperature or optical transition)')
+                try:
+                    self.system_manual_command(
+                        638, MANUAL_SET, CHANNEL_FP_SCAN, 1,
+                        timeout_s=min(1.0, remaining))
+                    break
+                except SlaveCommandRejected as exc:
+                    if not (exc.target == 638 and exc.channel == CHANNEL_FP_SCAN and
+                            exc.opcode == MANUAL_SET and exc.status == 10):
+                        raise
+                    arm_rejections.append(scan_arm_receipt(exc))
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            '638 FP scan not ready (temperature or optical transition)') from exc
+                    now = time.monotonic()
+                    if now - arm_renew_tick >= .3:
+                        for key in ((638, CHANNEL_OPTICAL),
+                                    (1550, CHANNEL_LASER_DAC)):
+                            if key in self._system_manual_owned:
+                                remaining = deadline - time.monotonic()
+                                if remaining <= 0:
+                                    break
+                                self.system_manual_command(
+                                    key[0], MANUAL_RENEW, key[1],
+                                    timeout_s=min(.25, remaining))
+                        arm_renew_tick = time.monotonic()
+                    if on_progress is not None and now - arm_progress_tick >= .05:
+                        telemetry = self.telemetry
+                        board = (getattr(telemetry, 'board_638', None)
+                                 if telemetry is not None and not telemetry.host_stale else None)
+                        temp_c = (None if board is None else
+                                  board.temperature_mdegc / 1000.0)
+                        on_progress({'state': 'Waiting for 638 readiness',
+                                     'detail': 'temperature or optical transition',
+                                     'temperature_c': temp_c,
+                                     'acquired': 0, 'received': 0, 'expected': 1000,
+                                     'estimated': True, 'new_rows': ()})
+                        arm_progress_tick = now
+                    # No collect() during this wait: the ADC ring is finite.
+                    time.sleep(min(.025, max(0.0, deadline-time.monotonic())))
+            # Capture begins before dispatch; marker alignment comes from the
+            # accepted firmware scan, never from host command timing.
             started = True
             start_host = time.monotonic()
             while time.monotonic() < deadline:
@@ -500,6 +582,7 @@ class SystemControlMixin:
                     'sample_rate_hz': 10_000_000, 'capture_id': capture_id,
                     'duration_s': duration_s, 'dac_cap': cap, 'point_count': len(raw),
                     'paired_count': len(rows), 'illumination_1550_dac': illumination,
+                    'arm_rejections': tuple(arm_rejections),
                     'alignment_bound_us': max(hi-lo,endhi-endlo)/20,
                     'quality_flags': ('live_master_adc', 'dac_axis_estimated_1ms_staircase',
                                       'commanded_dac_not_analog_verified'),
@@ -510,7 +593,8 @@ class SystemControlMixin:
                     self.system_manual_command(638, MANUAL_SET, CHANNEL_FP_SCAN, 0, timeout_s=.5)
                 except Exception as cleanup:
                     cleanup_error = cleanup
-            raise FPScanError(str(exc), sorted(rows, key=lambda row: row['index']), cleanup_error) from exc
+            raise FPScanError(str(exc), sorted(rows, key=lambda row: row['index']),
+                              cleanup_error, arm_rejections) from exc
         finally:
             if acquired and (638, CHANNEL_OPTICAL) in self._system_manual_owned:
                 try:
@@ -679,14 +763,21 @@ class SystemControlMixin:
             for target in boards:
                 ack = self._send_confirmed(CMD_POWER, wValue=1, wIndex=target, timeout_s=timeout_s)
                 power_times[target] = ack['bulk_write_completed_monotonic_ns']
+            initial_stats = self.stream_stats or {}
+            initial_samples = initial_stats.get('total_samples')
             time.sleep(1.25)
             deadline = time.monotonic() + 3.0
+            last_snapshot = None
             while time.monotonic() < deadline:
                 snapshot = self.telemetry
+                last_snapshot = snapshot
                 if snapshot is not None and not snapshot.host_stale:
                     ready = True
                     for target in boards:
                         b = getattr(snapshot, f'board_{target}')
+                        if b is None:
+                            ready = False
+                            continue
                         age = b.temperature_age_ms + snapshot.host_age_s * 1000
                         elapsed = (time.monotonic_ns() - power_times[target]) / 1e6
                         ready &= (getattr(snapshot, f'link_flags_{target}') == 0 and
@@ -697,9 +788,83 @@ class SystemControlMixin:
                         break
                 time.sleep(.01)
             else:
-                names = ' and '.join(f'{target}' for target in boards)
-                raise TimeoutError(f'The {names} board{"s" if len(boards) > 1 else ""} '
-                                   f'did not produce fresh post-power temperatures')
+                final_stats = self.stream_stats or {}
+                now_ns = time.monotonic_ns()
+                host_stale = None if last_snapshot is None else last_snapshot.host_stale
+                board_info = {}
+                for target in boards:
+                    board = (None if last_snapshot is None else
+                             getattr(last_snapshot, f'board_{target}', None))
+                    power_ns = power_times[target]
+                    receipt_ns = (None if last_snapshot is None else
+                                  last_snapshot.received_monotonic_ns)
+                    board_info[target] = {
+                        'link_flags': (None if last_snapshot is None else
+                                       getattr(last_snapshot, f'link_flags_{target}', None)),
+                        'snapshot_tick_ms': (None if board is None else board.snapshot_tick_ms),
+                        'temperature_valid': (None if board is None else board.temperature_valid),
+                        'temperature_stale': (None if board is None else board.temperature_stale),
+                        'temperature_fault': (None if board is None else board.temperature_fault),
+                        'temperature_age_ms': (None if board is None else
+                            board.temperature_age_ms + last_snapshot.host_age_s * 1000),
+                        'power_ack_elapsed_ms': (now_ns - power_ns) / 1e6,
+                        'post_power_receipt_delay_ms': (None if receipt_ns is None else
+                                                       (receipt_ns - power_ns) / 1e6),
+                    }
+                samples = final_stats.get('total_samples')
+                diagnostics = {
+                    'snapshot_missing': last_snapshot is None,
+                    'snapshot_stale': host_stale,
+                    'snapshot_record_sequence': (None if last_snapshot is None else
+                                                 last_snapshot.record_sequence),
+                    'boards': board_info,
+                    'adc': {
+                        'samples_total': samples,
+                        'samples_since_power': (None if samples is None or initial_samples is None
+                                                else samples - initial_samples),
+                        'stream_fatal': final_stats.get('fatal'),
+                        'stream_ready': final_stats.get('ready'),
+                        'device_lost': final_stats.get('device_lost'),
+                        'stream_format': final_stats.get('stream_format'),
+                    },
+                }
+                if last_snapshot is None:
+                    reason = 'ADC telemetry unavailable'
+                elif host_stale:
+                    reason = 'ADC telemetry stale'
+                elif final_stats.get('fatal'):
+                    reason = 'ADC stream fatal'
+                elif final_stats.get('stream_format') not in (1, 2):
+                    reason = f"ADC stream format {final_stats.get('stream_format')}"
+                else:
+                    board_states = []
+                    for target in boards:
+                        state = board_info[target]
+                        board = (None if last_snapshot is None else
+                                 getattr(last_snapshot, f'board_{target}', None))
+                        if state['link_flags']:
+                            status = 'link unavailable'
+                        elif board is None:
+                            status = 'snapshot missing'
+                        elif not state['temperature_valid']:
+                            status = 'temperature invalid'
+                        elif state['temperature_stale']:
+                            status = 'temperature stale'
+                        elif state['temperature_fault']:
+                            status = f"temperature fault {state['temperature_fault']}"
+                        elif (state['temperature_age_ms'] is None or
+                              state['temperature_age_ms'] >= min(500, state['power_ack_elapsed_ms'])):
+                            status = 'temperature too old'
+                        elif (state['post_power_receipt_delay_ms'] is None or
+                              state['post_power_receipt_delay_ms'] <= 0):
+                            status = 'no post-power snapshot'
+                        else:
+                            status = 'ready'
+                        board_states.append(f'{target} {status}')
+                    reason = '; '.join(board_states)
+                error = TimeoutError(f'Manual readiness timed out: {reason}')
+                error.diagnostics = diagnostics
+                raise error
             self._system_manual_active = True
             self._session_boards = boards
             for target in boards:
@@ -714,7 +879,10 @@ class SystemControlMixin:
             try:
                 self.stop_system_confirmed(timeout_s)
             except Exception as cleanup:
-                raise RuntimeError(f'{original}; global shutdown unconfirmed: {cleanup}') from original
+                error = RuntimeError(f'{original}; global shutdown unconfirmed: {cleanup}')
+                if hasattr(original, 'diagnostics'):
+                    error.diagnostics = original.diagnostics
+                raise error from original
             raise
 
     def take_over_638(self, dac, timeout_s=1.0, keepalive_ms=KEEPALIVE_MS,

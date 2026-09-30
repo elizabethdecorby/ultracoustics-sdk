@@ -49,6 +49,12 @@ from .. import identity as _identity
 from .. import tec_tuning as _tuning
 
 
+# A diagnostic reply can follow a 16,532-byte format-2 stream record on the
+# same bulk endpoint.  Read a whole USB transfer so an old record is discarded
+# as one unit instead of consuming it in 512-byte fragments.
+DIAGNOSTIC_READ_BYTES = 64 * 1024
+
+
 # ---------------------------------------------------------------------------
 # CRC-32 (Ethernet / MPEG-2 polynomial – matches slave bootloaders)
 # ---------------------------------------------------------------------------
@@ -401,7 +407,6 @@ class DiagnosticsManager:
         Returns a dict with *version*, *build_date*, and *hardware_rev*.
         """
         self._conn.send_command(CMD_FWINFO)
-        time.sleep(0.5)
         return self._read_firmware_info(40, timeout_ms)
 
     def query_slave_version(self, target=TARGET_1550, timeout_ms=5000):
@@ -411,7 +416,6 @@ class DiagnosticsManager:
         """
         cmd = CMD_BOOT_VERSION if target == TARGET_1550 else CMD_BOOT_VERSION_638
         self._conn.send_command(cmd)
-        time.sleep(0.5)
         return self._read_slave_version(timeout_ms)
 
     # -- Board identity (docs/BOARD_IDENTITY.md) ------------------------------
@@ -672,10 +676,11 @@ class DiagnosticsManager:
             If no valid response arrives within *timeout_ms*.
         """
         MST = timezone(timedelta(hours=-7), "MST")
-        deadline = time.time() + timeout_ms / 1000.0
-        while time.time() < deadline:
-            remaining = max(100, int((deadline - time.time()) * 1000))
-            chunk = self._conn.receive(512, timeout_ms=min(remaining, 500))
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            remaining = max(1, int((deadline - time.monotonic()) * 1000))
+            chunk = self._conn.receive(DIAGNOSTIC_READ_BYTES,
+                                       timeout_ms=min(remaining, 500))
             if chunk is None or len(chunk) != expected_len:
                 continue
             version_str = chunk[:32].rstrip(b"\x00\xff").decode("ascii", errors="replace")
@@ -745,10 +750,11 @@ class DiagnosticsManager:
             If no valid 80-byte response arrives within *timeout_ms*.
         """
         MST = timezone(timedelta(hours=-7), "MST")
-        deadline = time.time() + timeout_ms / 1000.0
-        while time.time() < deadline:
-            remaining = max(100, int((deadline - time.time()) * 1000))
-            chunk = self._conn.receive(512, timeout_ms=min(remaining, 500))
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            remaining = max(1, int((deadline - time.monotonic()) * 1000))
+            chunk = self._conn.receive(DIAGNOSTIC_READ_BYTES,
+                                       timeout_ms=min(remaining, 500))
             if chunk is None or len(chunk) != 80:
                 continue
 

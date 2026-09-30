@@ -314,6 +314,7 @@ class SessionFake(Fake):
         super().__init__()
         self._running = False
         self.flags = flags
+        self.stream_stats = {}  # read by the readiness diagnostics
         board = SimpleNamespace(temperature_age_ms=1, temperature_valid=True,
                                 temperature_stale=False, temperature_fault=0)
         self.telemetry = SimpleNamespace(

@@ -18,6 +18,68 @@ class Fake(SystemControlMixin):
   if opcode==MANUAL_RELEASE and channel==3:self.values[target,channel]=0
   return SimpleNamespace(target=target,status=0,channel=channel,owner=1,applied_value=self.values.get((target,channel),25000 if channel==1 else 0))
 class SystemControlTests(unittest.TestCase):
+ def _manual_readiness_timeout(self,snapshot):
+  class Clock:
+   ns=5_000_000_000
+   def monotonic(self):return self.ns/1e9
+   def monotonic_ns(self):return self.ns
+   def sleep(self,seconds):self.ns+=int(seconds*1e9)
+  clock=Clock()
+  class ReadinessFake(Fake):
+   def __init__(self):
+    super().__init__();self._system_manual_active=False;self._system_manual_owned=set()
+    self.snapshot=snapshot;self._stream_stats={'total_samples':120,'fatal':False,
+      'ready':False,'device_lost':False,'stream_format':1}
+   def stop_confirmed(self,timeout_s):
+    self.calls.append(('stop',));self._running=False
+    return {'bulk_write_completed_monotonic_ns':1_000_000_000}
+   def enable_telemetry(self,timeout_s):pass
+   @property
+   def telemetry(self):return self.snapshot
+   @property
+   def stream_stats(self):return self._stream_stats
+   def _send_confirmed(self,*args,**kwargs):
+    return {'bulk_write_completed_monotonic_ns':clock.monotonic_ns()}
+  fake=ReadinessFake()
+  with patch('ultracoustics.system_control.time.monotonic',clock.monotonic), \
+       patch('ultracoustics.system_control.time.monotonic_ns',clock.monotonic_ns), \
+       patch('ultracoustics.system_control.time.sleep',clock.sleep):
+   with self.assertRaises(TimeoutError) as caught:fake.begin_system_manual()
+  return fake,caught.exception
+
+ def _ready_board(self,tick=42):
+  return SimpleNamespace(snapshot_tick_ms=tick,temperature_valid=True,
+   temperature_stale=False,temperature_fault=0,temperature_age_ms=2)
+
+ def test_manual_readiness_timeout_identifies_one_missing_board(self):
+  snapshot=SimpleNamespace(host_stale=False,host_age_s=0.0,received_monotonic_ns=5_001_000_000,
+   record_sequence=9,board_638=None,board_1550=self._ready_board(77),
+   link_flags_638=4,link_flags_1550=0)
+  fake,error=self._manual_readiness_timeout(snapshot)
+  self.assertEqual(str(error),'Manual readiness timed out: 638 link unavailable; 1550 ready')
+  self.assertTrue(error.diagnostics['boards'][638]['temperature_valid'] is None)
+  self.assertEqual(error.diagnostics['boards'][638]['link_flags'],4)
+  self.assertEqual(error.diagnostics['boards'][1550]['snapshot_tick_ms'],77)
+  self.assertTrue(error.diagnostics['boards'][1550]['temperature_valid'])
+  self.assertFalse(error.diagnostics['snapshot_missing'])
+  self.assertFalse(error.diagnostics['snapshot_stale'])
+  self.assertEqual(error.diagnostics['adc'],{'samples_total':120,'samples_since_power':0,
+   'stream_fatal':False,'stream_ready':False,'device_lost':False,'stream_format':1})
+  self.assertFalse(fake.system_manual_active)
+
+ def test_manual_readiness_timeout_reports_whole_snapshot_stale(self):
+  snapshot=SimpleNamespace(host_stale=True,host_age_s=.6,received_monotonic_ns=4_400_000_000,
+   record_sequence=8,board_638=self._ready_board(),board_1550=self._ready_board(),
+   link_flags_638=0,link_flags_1550=0)
+  _,error=self._manual_readiness_timeout(snapshot)
+  self.assertEqual(str(error),'Manual readiness timed out: ADC telemetry stale')
+  self.assertFalse(error.diagnostics['snapshot_missing'])
+  self.assertTrue(error.diagnostics['snapshot_stale'])
+  self.assertEqual(error.diagnostics['snapshot_record_sequence'],8)
+  for target in (638,1550):
+   self.assertEqual(error.diagnostics['boards'][target]['temperature_age_ms'],602)
+   self.assertLess(error.diagnostics['boards'][target]['post_power_receipt_delay_ms'],0)
+
  def test_restart_stops_and_observes_dwell(self):
   f=Fake()
   with patch('ultracoustics.system_control.time.monotonic_ns',return_value=1_050_000_000),patch('ultracoustics.system_control.time.sleep') as sleep:
@@ -176,13 +238,26 @@ class SystemControlTests(unittest.TestCase):
  def test_live_scan_capture_alignment_and_loss_rejection(self):
   import struct
   import numpy as np
-  from ultracoustics.system_control import FPScanError
+  from ultracoustics.system_control import FPScanError, SlaveCommandRejected
   clock=[0.0]
   class LiveFake(Fake):
-   def __init__(self,fail=False):
+   def __init__(self,fail=False,arm_busy=0,ambiguous=False):
     super().__init__();self.streaming=True;self.fail=fail
+    self.arm_busy=arm_busy;self.ambiguous=ambiguous;self.arm_attempts=0
+    self.scan_origin=None;self.scan_started=None
     self.values[1550,2]=1000;self.values[638,7]=44000
     self.buffer_capacity=20_000_000;self.buffer=np.full(self.buffer_capacity,1234,dtype=np.uint16)
+   def manual_command(self,target,opcode,channel,value=0,timeout_s=1):
+    if target==638 and opcode==MANUAL_SET and channel==9 and value==1:
+     self.arm_attempts+=1
+     if self.ambiguous:raise TimeoutError('ambiguous command response')
+     if self.arm_busy:
+      self.arm_busy-=1
+      reply=SimpleNamespace(target=638,transaction=self.arm_attempts,opcode=opcode,
+       channel=channel,status=10,owner=1,applied_value=0,raw_ack=b'busy-ack')
+      raise SlaveCommandRejected(target,channel,10,opcode,reply)
+     self.scan_origin=self.samples_received;self.scan_started=clock[0]
+    return super().manual_command(target,opcode,channel,value,timeout_s)
    @property
    def samples_received(self):return (int(clock[0]*10_000_000)//8192+1)*8192
    @property
@@ -191,10 +266,12 @@ class SystemControlTests(unittest.TestCase):
    def telemetry(self):
     total=self.samples_received
     data=None
-    if clock[0]>.003:
-     data=bytearray(54);data[0]=1;data[1]=3 if clock[0]>1.01 else 1
+    if self.scan_origin is not None and clock[0]-self.scan_started>.003:
+     data=bytearray(54);data[0]=1;data[1]=3 if clock[0]-self.scan_started>1.01 else 1
      struct.pack_into('<I',data,4,1)
-     for off,point in zip((8,14,20,26),(20000,21000,10020000,10021000)):
+     for off,point in zip((8,14,20,26),
+       (self.scan_origin+20000,self.scan_origin+21000,
+        self.scan_origin+10020000,self.scan_origin+10021000)):
       struct.pack_into('<IH',data,off,point//8192,point%8192)
     return SimpleNamespace(host_stale=False,stream_epoch=1,scan_sync=data,
                            record_sequence=total//8192-1,received_sample_end=total)
@@ -214,6 +291,34 @@ class SystemControlTests(unittest.TestCase):
      self.assertTrue(any(u['new_rows'] for u in updates))
      self.assertLess(clock[0],1.5)
    self.assertIn((638,MANUAL_RELEASE,3,0),f.calls)
+
+  clock[0]=0;f=LiveFake(arm_busy=3);updates=[]
+  with patch('ultracoustics.system_control.time.monotonic',side_effect=lambda:clock[0]), \
+       patch('ultracoustics.system_control.time.sleep',side_effect=lambda dt:clock.__setitem__(0,clock[0]+dt)):
+   result=f.capture_fp_scan(on_progress=updates.append)
+  self.assertEqual(f.arm_attempts,4)
+  self.assertEqual(len(result['arm_rejections']),3)
+  self.assertEqual(result['arm_rejections'][0]['raw_ack_hex'],b'busy-ack'.hex())
+  self.assertTrue(any(update['state']=='Waiting for 638 readiness' for update in updates))
+  self.assertEqual(len(result['raw_adc']),10_000_000)
+
+  clock[0]=0;f=LiveFake(arm_busy=1000);f.values[638,7]=52400
+  f.buffer_capacity=100_000;f.buffer=np.full(f.buffer_capacity,1234,dtype=np.uint16)
+  with patch('ultracoustics.system_control.time.monotonic',side_effect=lambda:clock[0]), \
+       patch('ultracoustics.system_control.time.sleep',side_effect=lambda dt:clock.__setitem__(0,clock[0]+dt)):
+   with self.assertRaises(FPScanError) as caught:f.capture_fp_scan(timeout_s=2.0)
+  self.assertLessEqual(clock[0],2.0)
+  self.assertEqual(f.arm_attempts,len(caught.exception.arm_rejections))
+  self.assertLess(f.arm_attempts,50)
+  self.assertIn((638,MANUAL_RENEW,3,0),f.calls)
+  self.assertIn((1550,MANUAL_RENEW,2,0),f.calls)
+
+  clock[0]=0;f=LiveFake(ambiguous=True);f.values[638,7]=52400
+  with patch('ultracoustics.system_control.time.monotonic',side_effect=lambda:clock[0]), \
+       patch('ultracoustics.system_control.time.sleep',side_effect=lambda dt:clock.__setitem__(0,clock[0]+dt)):
+   with self.assertRaisesRegex(FPScanError,'ambiguous command response'):
+    f.capture_fp_scan()
+  self.assertEqual(f.arm_attempts,1)
  def test_close_releases_usb_even_if_stop_is_unconfirmed(self):
   from ultracoustics import Controller
   from unittest.mock import Mock
