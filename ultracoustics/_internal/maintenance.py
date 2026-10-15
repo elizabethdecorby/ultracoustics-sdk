@@ -12,7 +12,8 @@ Classes:
     DiagnosticsManager
         Firmware version queries and override-mode control for the Master
         Board and its slave laser boards.  Provides query_firmware_info(),
-        query_slave_version(), enter_override(), exit_override(),
+        query_slave_version(), read_identity(), write_identity(),
+        read_system_info(), enter_override(), exit_override(),
         set_power(), set_trigger(), program_1550(),
         start_probe_characterization(), stop_probe_characterization().
 
@@ -41,8 +42,10 @@ from .protocol import (
     CMD_FLASH_1550, CMD_FLASH_638, CMD_IAP,
     CMD_OVERRIDE_ENTER, CMD_POWER, CMD_TRIGGER, CMD_PROGRAM_1550,
     CMD_BOOT_VERSION, CMD_BOOT_VERSION_638, CMD_FWINFO, CMD_PROBE_CHAR,
-    TARGET_1550, TARGET_638,
+    CMD_IDENTITY_READ, CMD_IDENTITY_WRITE,
+    TARGET_1550, TARGET_638, TARGET_MAIN,
 )
+from .. import identity as _identity
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +87,9 @@ class Programmer:
     SLAVE_MAX_FW = 128 * 1024 - 8  # 131 064 bytes
 
     MASTER_PAGE_SIZE = 512
-    MASTER_MAX_FW = 65536  # 64 KB
+    # Sector 7 (the last 8 KB) holds the board identity record and is never
+    # erased by IAP, so master images are limited to sectors 0-6.
+    MASTER_MAX_FW = 56 * 1024
 
     # ---- Master IAP magic header (must match Boot/Core/Inc/firmware_info.h)
     MASTER_MAGIC_BYTES         = b"UCBT"   # FW_MAGIC_BYTES
@@ -373,6 +378,98 @@ class DiagnosticsManager:
         time.sleep(0.5)
         return self._read_slave_version(timeout_ms)
 
+    # -- Board identity (docs/BOARD_IDENTITY.md) ------------------------------
+
+    def read_identity(self, target=TARGET_MAIN, timeout_ms=8000):
+        """Read the identity record stored on one board.
+
+        Parameters
+        ----------
+        target : int
+            ``TARGET_MAIN`` (0), ``TARGET_1550`` or ``TARGET_638``. Slave
+            reads power-cycle that board into its bootloader, like
+            :meth:`query_slave_version`.
+
+        Returns
+        -------
+        ultracoustics.identity.IdentityResult
+            ``status`` is ``STATUS_OK`` with ``record`` set, or ``EMPTY``,
+            ``NO_RESPONSE`` (no board / bootloader without identity support),
+            etc. A missing reply raises ``TimeoutError``.
+        """
+        _check_identity_target(target)
+        self._conn.send_command(CMD_IDENTITY_READ, wIndex=target)
+        return self._read_identity_reply(_identity.OP_READ, target, timeout_ms)
+
+    def write_identity(self, target, identity, timeout_ms=12000):
+        """Store a new identity record on one board and read it back.
+
+        The board keeps its previous records; the newest one is returned by
+        later reads. ``identity.board`` must match *target*. If
+        ``identity.programmed_at`` is unset it is filled with the current time.
+
+        Returns
+        -------
+        ultracoustics.identity.IdentityResult
+            ``ok`` is True only if the board verified the stored record. The
+            returned ``record`` is what the board holds after the write.
+        """
+        _check_identity_target(target)
+        expected_board = _identity.BOARD_FOR_TARGET[target]
+        if identity.board != expected_board:
+            raise ValueError(
+                f"identity is for board type {identity.board}, target {target} "
+                f"is board type {expected_board}")
+        if identity.programmed_at is None:
+            identity.programmed_at = int(time.time())
+        record = _identity.build_record(identity)
+        self._conn.send_command(CMD_IDENTITY_WRITE, wIndex=target, extra=record)
+        result = self._read_identity_reply(_identity.OP_WRITE, target, timeout_ms)
+        # The firmware checks bytes; this also catches a reply for another write.
+        sent = _identity.parse_record(record).identity
+        if result.ok and (result.record is None
+                          or result.record.identity.details() != sent.details()
+                          or result.record.identity.report_id != sent.report_id):
+            result.status = _identity.STATUS_VERIFY_FAIL
+        return result
+
+    def read_system_info(self):
+        """Firmware versions and identity records for all three boards.
+
+        Every query is attempted; a failure is recorded as a string under
+        ``errors`` instead of aborting the rest.
+
+        Returns
+        -------
+        dict
+            ``master_fw``, ``fw_1550``, ``fw_638`` (version dicts or None),
+            ``identity`` (``{"main"|"1550"|"638": IdentityResult or None}``)
+            and ``errors`` (``{name: message}``).
+        """
+        info = {"master_fw": None, "fw_1550": None, "fw_638": None,
+                "identity": {"main": None, "1550": None, "638": None},
+                "errors": {}}
+        queries = [
+            ("master_fw", lambda: self.query_firmware_info()),
+            ("fw_1550", lambda: self.query_slave_version(TARGET_1550)),
+            ("fw_638", lambda: self.query_slave_version(TARGET_638)),
+        ]
+        for name, target in (("main", TARGET_MAIN), ("1550", TARGET_1550),
+                             ("638", TARGET_638)):
+            queries.append((f"identity_{name}",
+                            lambda t=target: self.read_identity(t)))
+        for name, query in queries:
+            try:
+                value = query()
+            except Exception as exc:  # keep going; report per item
+                info["errors"][name] = str(exc)
+                continue
+            if name.startswith("identity_"):
+                info["identity"][name[len("identity_"):]] = value
+            else:
+                info[name] = value
+        return info
+
     # -- Override mode --------------------------------------------------------
 
     def enter_override(self):
@@ -510,6 +607,20 @@ class DiagnosticsManager:
             }
         raise TimeoutError("No firmware info response received.")
 
+    def _read_identity_reply(self, op, target, timeout_ms):
+        """Wait for the 140-byte UTID reply matching *op* and *target*."""
+        deadline = time.time() + timeout_ms / 1000.0
+        while time.time() < deadline:
+            remaining = max(100, int((deadline - time.time()) * 1000))
+            chunk = self._conn.receive(512, timeout_ms=min(remaining, 500))
+            if (chunk is None or len(chunk) != _identity.REPLY_SIZE
+                    or bytes(chunk[:4]) != _identity.REPLY_MAGIC):
+                continue
+            result = _identity.parse_reply(chunk)
+            if result.op == op and result.target == target:
+                return result
+        raise TimeoutError("No identity response received.")
+
     def _read_slave_version(self, timeout_ms):
         """Read and parse the 80-byte bootloader + app version response.
 
@@ -548,6 +659,12 @@ class DiagnosticsManager:
                 "app": {"version": app_ver, "build_date": app_dt, "hardware_rev": app_hw},
                 }
         raise TimeoutError("No version response received.")
+
+
+def _check_identity_target(target):
+    if target not in _identity.BOARD_FOR_TARGET:
+        raise ValueError(f"unknown identity target {target!r}; "
+                         "use TARGET_MAIN, TARGET_1550 or TARGET_638")
 
 
 # ---------------------------------------------------------------------------

@@ -28,10 +28,13 @@ CMD_STREAM_CAPABILITIES = ord('c')  # IDLE-only negotiated stream capability que
 CMD_STREAM_FORMAT = ord('x')        # IDLE-only exact stream format selection (0/1)
 CMD_RUNTIME_METRICS = ord('r')      # IDLE-only fixed runtime snapshot
 CMD_MANUAL_CONTROL = ord('j')       # Leased manual command relay
+CMD_IDENTITY_READ = ord('n')        # Read a board identity record (wIndex=target)
+CMD_IDENTITY_WRITE = ord('N')       # Write + read back a board identity record
 
 # Target IDs for Manual Control
 TARGET_1550 = 1550
 TARGET_638 = 638
+TARGET_MAIN = 0  # Board identity commands only: the mainboard itself
 
 def pack_command(cmd_byte, wValue=0, wIndex=0):
     """
