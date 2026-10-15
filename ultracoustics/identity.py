@@ -62,11 +62,12 @@ _FIELDS = {
     "serial":         (0x01, _STR, 24, _ALL),
     "pcb_rev":        (0x02, _STR, 12, _ALL),
     "pd_pcb_rev":     (0x03, _STR, 12, (BOARD_MAIN,)),
+    "circ_sn":        (0x04, _STR, 24, (BOARD_MAIN,)),
     "driver_pot_ohm": (0x10, _F32, 0, _LASERS),
     "lpf_pot_ohm":    (0x11, _F32, 0, _LASERS),
     "pd_pot_ohm":     (0x12, _F32, 0, _LASERS),
     "programmed_at":  (0x20, _U32, 0, _ALL),
-    "report_id":      (0x21, _STR, 36, _ALL),
+    "report_id":      (0x21, _STR, 24, _ALL),
 }
 _BY_TAG = {spec[0]: (name, spec) for name, spec in _FIELDS.items()}
 # Limits are chosen so a record with every field at maximum length fits.
@@ -95,6 +96,7 @@ class BoardIdentity:
     serial: Optional[str] = None
     pcb_rev: Optional[str] = None
     pd_pcb_rev: Optional[str] = None
+    circ_sn: Optional[str] = None
     driver_pot_ohm: Optional[float] = None
     lpf_pot_ohm: Optional[float] = None
     pd_pot_ohm: Optional[float] = None

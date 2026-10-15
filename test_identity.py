@@ -8,7 +8,7 @@ from ultracoustics.identity import BoardIdentity, IdentityError
 def laser(**overrides):
     values = dict(board=ident.BOARD_638, serial="2630054005", pcb_rev="R202510",
                   driver_pot_ohm=1234.5, lpf_pot_ohm=47000.0, pd_pot_ohm=10000.0,
-                  programmed_at=1_790_000_000, report_id="DIAG_20261015_120000_ABCD1234")
+                  programmed_at=1_790_000_000, report_id="20261015_120000_ABCD1234")
     values.update(overrides)
     return BoardIdentity(**values)
 
@@ -57,10 +57,13 @@ class RecordTests(unittest.TestCase):
     def test_every_field_at_max_length_fits(self):
         for board in (ident.BOARD_1550, ident.BOARD_638):
             ident.build_record(laser(board=board, serial="S" * 24, pcb_rev="P" * 12,
-                                     report_id="R" * 36))
-        ident.build_record(BoardIdentity(board=ident.BOARD_MAIN, serial="S" * 24,
-                                         pcb_rev="P" * 12, pd_pcb_rev="Q" * 12,
-                                         programmed_at=1, report_id="R" * 36))
+                                     report_id="R" * 24))
+        main = ident.build_record(BoardIdentity(
+            board=ident.BOARD_MAIN, serial="S" * 24, pcb_rev="P" * 12,
+            pd_pcb_rev="Q" * 12, circ_sn="C" * 24, programmed_at=1,
+            report_id="R" * 24))
+        self.assertEqual(struct.unpack_from("<H", main, 6)[0], ident.PAYLOAD_MAX)
+        self.assertEqual(ident.parse_record(main).identity.circ_sn, "C" * 24)
 
     def test_oversize_payload_rejected(self):
         with self.assertRaises(IdentityError):
@@ -71,6 +74,8 @@ class RecordTests(unittest.TestCase):
             ident.build_record(laser(serial="x" * 25))
         with self.assertRaises(IdentityError):
             ident.build_record(laser(pd_pcb_rev="R1"))
+        with self.assertRaises(IdentityError):
+            ident.build_record(laser(circ_sn="C1"))
         with self.assertRaises(IdentityError):
             ident.build_record(BoardIdentity(board=ident.BOARD_MAIN, lpf_pot_ohm=1.0))
 

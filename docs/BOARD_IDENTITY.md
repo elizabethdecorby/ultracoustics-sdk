@@ -41,11 +41,12 @@ and floats are IEEE-754 float32.
 | `0x01` | `serial`: main board S/N or laser S/N | str ≤ 24 | all |
 | `0x02` | `pcb_rev`: CPU PCB on the main board, laser board PCB on the slaves | str ≤ 12 | all |
 | `0x03` | `pd_pcb_rev`: photodetector PCB | str ≤ 12 | main |
+| `0x04` | `circ_sn`: circulator S/N | str ≤ 24 | main |
 | `0x10` | `driver_pot_ohm` | f32 Ω | 1550, 638 |
 | `0x11` | `lpf_pot_ohm` | f32 Ω | 1550, 638 |
 | `0x12` | `pd_pot_ohm` | f32 Ω | 1550, 638 |
 | `0x20` | `programmed_at`: unix seconds | u32 | all |
-| `0x21` | `report_id`: diagnostics report folder name | str ≤ 36 | all |
+| `0x21` | `report_id`: diagnostics session (timestamp + short UID) | str ≤ 24 | all |
 
 A field that was never recorded is simply absent. The length limits guarantee
 that a record with every field at its maximum length still fits in 112 bytes.
