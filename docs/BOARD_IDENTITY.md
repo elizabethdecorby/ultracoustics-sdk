@@ -114,7 +114,13 @@ restart the boot window.
 | Opcode | Request | Reply |
 |---|---|---|
 | `0x15 GET_IDENTITY` | `[0x15,0,0,0,0,crc8]` | 131 B `[0xA1][record 128][free slots u8][crc8]` |
-| `0x16 PUT_IDENTITY` | `[0x16,0,0,0,0,crc8]`, then 129 B `[record 128][crc8]` | 1 B ACK `0xA1` or NACK `0xA2` |
+| `0x16 PUT_IDENTITY` | `[0x16,0,0,0,0,crc8]`; poll for ACK `0xA1` ("ready"); then send 129 B `[record 128][crc8]` | poll for ACK `0xA1` (stored and verified) or NACK `0xA2` |
+
+`PUT_IDENTITY` uses the same handshake as `FLASH_BEGIN` / `FLASH_PAGE`. After
+each ACK or NACK, the slave loads `0xFF` (idle) so a later poll can't read a
+stale ACK. A normal store takes milliseconds. A ping-pong migration erases up
+to two 16 KB sectors, so the master should poll for the final ACK for at
+least 3 s.
 
 The bootloader assigns the sequence number and computes the record CRC. It
 keeps the board type the mainboard stamped, because the bootloader itself
