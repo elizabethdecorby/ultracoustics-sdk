@@ -64,6 +64,15 @@ class ReadIdentityTests(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             DiagnosticsManager(FakeConnection([])).read_identity(protocol.TARGET_638)
 
+    @mock.patch("ultracoustics._internal.maintenance.time.time",
+                side_effect=[0.0] + [0.0, 0.0] * 3 + [100.0] * 10)
+    def test_timeout_clears_the_out_endpoint_stall(self, _time):
+        conn = FakeConnection([])
+        conn.dev = mock.Mock()
+        with self.assertRaises(TimeoutError):
+            DiagnosticsManager(conn).read_identity(protocol.TARGET_MAIN)
+        conn.dev.clear_halt.assert_called_once_with(protocol.BULK_OUT_EP)
+
     def test_unknown_target_rejected(self):
         with self.assertRaises(ValueError):
             DiagnosticsManager(FakeConnection([])).read_identity(1234)

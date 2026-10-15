@@ -42,7 +42,7 @@ from .protocol import (
     CMD_FLASH_1550, CMD_FLASH_638, CMD_IAP,
     CMD_OVERRIDE_ENTER, CMD_POWER, CMD_TRIGGER, CMD_PROGRAM_1550,
     CMD_BOOT_VERSION, CMD_BOOT_VERSION_638, CMD_FWINFO, CMD_PROBE_CHAR,
-    CMD_IDENTITY_READ, CMD_IDENTITY_WRITE,
+    CMD_IDENTITY_READ, CMD_IDENTITY_WRITE, BULK_OUT_EP,
     TARGET_1550, TARGET_638, TARGET_MAIN,
 )
 from .. import identity as _identity
@@ -619,7 +619,20 @@ class DiagnosticsManager:
             result = _identity.parse_reply(chunk)
             if result.op == op and result.target == target:
                 return result
-        raise TimeoutError("No identity response received.")
+        # The master answers every identity command it accepts, so silence
+        # means it rejected this one (busy finishing another maintenance
+        # command, or firmware without identity support). A rejection stalls
+        # BULK OUT; clear it so the next command, on this or a later
+        # connection, is not refused with PIPE.
+        dev = getattr(self._conn, "dev", None)
+        if dev is not None:
+            try:
+                dev.clear_halt(BULK_OUT_EP)
+            except Exception:
+                pass
+        raise TimeoutError(
+            "No identity response received; the master was busy or its "
+            "firmware does not support board identity.")
 
     def _read_slave_version(self, timeout_ms):
         """Read and parse the 80-byte bootloader + app version response.
