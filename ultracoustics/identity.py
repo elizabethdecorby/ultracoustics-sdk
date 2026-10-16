@@ -53,7 +53,11 @@ STATUS_NAMES = {
     STATUS_BAD_STATE: "BAD_STATE",
 }
 
-_STR, _F32, _U32 = "str", "f32", "u32"
+_STR, _U32 = "str", "u32"
+# Pot resistances: u16 counts of 1/scale ohm. Records written before this
+# change used float32 (4 bytes); decode still accepts that length.
+_OHM_X10, _OHM = "ohm_x10", "ohm"
+_OHM_SCALE = {_OHM_X10: 10, _OHM: 1}
 _ALL = (BOARD_MAIN, BOARD_1550, BOARD_638)
 _LASERS = (BOARD_1550, BOARD_638)
 
@@ -63,9 +67,9 @@ _FIELDS = {
     "pcb_rev":        (0x02, _STR, 12, _ALL),
     "pd_pcb_rev":     (0x03, _STR, 12, (BOARD_MAIN,)),
     "circ_sn":        (0x04, _STR, 24, (BOARD_MAIN,)),
-    "driver_pot_ohm": (0x10, _F32, 0, _LASERS),
-    "lpf_pot_ohm":    (0x11, _F32, 0, _LASERS),
-    "pd_pot_ohm":     (0x12, _F32, 0, _LASERS),
+    "driver_pot_ohm": (0x10, _OHM_X10, 0, _LASERS),  # 0.1 ohm, <= 6553.5
+    "lpf_pot_ohm":    (0x11, _OHM, 0, _LASERS),      # 1 ohm, <= 65535
+    "pd_pot_ohm":     (0x12, _OHM, 0, _LASERS),      # 1 ohm, <= 65535
     "programmed_at":  (0x20, _U32, 0, _ALL),
     "report_id":      (0x21, _STR, 24, _ALL),
 }
@@ -155,8 +159,13 @@ def encode_payload(identity: BoardIdentity) -> bytes:
             data = str(value).encode("utf-8")
             if len(data) > max_len:
                 raise IdentityError(f"{name} is {len(data)} bytes; max {max_len}")
-        elif kind == _F32:
-            data = struct.pack("<f", float(value))
+        elif kind in _OHM_SCALE:
+            scale = _OHM_SCALE[kind]
+            counts = round(float(value) * scale)
+            if not 0 <= counts <= 0xFFFF:
+                raise IdentityError(
+                    f"{name} = {value} ohm is outside 0-{0xFFFF / scale:g} ohm")
+            data = struct.pack("<H", counts)
         else:
             data = struct.pack("<I", int(value))
         out += bytes((tag, len(data))) + data
@@ -185,7 +194,9 @@ def decode_payload(board: int, payload: bytes) -> BoardIdentity:
         name, (_tag, kind, _max, _boards) = known
         if kind == _STR:
             setattr(identity, name, value.decode("utf-8", errors="replace"))
-        elif kind == _F32 and length == 4:
+        elif kind in _OHM_SCALE and length == 2:
+            setattr(identity, name, struct.unpack("<H", value)[0] / _OHM_SCALE[kind])
+        elif kind in _OHM_SCALE and length == 4:  # float32 from before u16
             setattr(identity, name, struct.unpack("<f", value)[0])
         elif kind == _U32 and length == 4:
             setattr(identity, name, struct.unpack("<I", value)[0])

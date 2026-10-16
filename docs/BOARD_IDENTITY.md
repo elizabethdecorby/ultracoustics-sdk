@@ -33,8 +33,11 @@ change.
 ### Payload TLVs
 
 The payload is a sequence of `[tag u8][len u8][value]` entries. Readers keep
-unknown tags and otherwise ignore them. Strings are UTF-8 with no terminator,
-and floats are IEEE-754 float32.
+unknown tags and otherwise ignore them. Strings are UTF-8 with no terminator.
+Pot resistances are u16 counts: tenths of an ohm for the driver pot (up to
+6553.5 Ω), whole ohms for the LPF and PD pots (up to 65 535 Ω). Readers also
+accept a 4-byte float32 value for these tags, the format of the earliest
+records.
 
 | Tag | Name | Type | Boards |
 |---|---|---|---|
@@ -42,9 +45,9 @@ and floats are IEEE-754 float32.
 | `0x02` | `pcb_rev`: CPU PCB on the main board, laser board PCB on the slaves | str ≤ 12 | all |
 | `0x03` | `pd_pcb_rev`: photodetector PCB | str ≤ 12 | main |
 | `0x04` | `circ_sn`: circulator S/N | str ≤ 24 | main |
-| `0x10` | `driver_pot_ohm` | f32 Ω | 1550, 638 |
-| `0x11` | `lpf_pot_ohm` | f32 Ω | 1550, 638 |
-| `0x12` | `pd_pot_ohm` | f32 Ω | 1550, 638 |
+| `0x10` | `driver_pot_ohm` | u16, 0.1 Ω | 1550, 638 |
+| `0x11` | `lpf_pot_ohm` | u16, 1 Ω | 1550, 638 |
+| `0x12` | `pd_pot_ohm` | u16, 1 Ω | 1550, 638 |
 | `0x20` | `programmed_at`: unix seconds | u32 | all |
 | `0x21` | `report_id`: diagnostics session (timestamp + short UID) | str ≤ 24 | all |
 

@@ -7,7 +7,7 @@ from ultracoustics.identity import BoardIdentity, IdentityError
 
 def laser(**overrides):
     values = dict(board=ident.BOARD_638, serial="2630054005", pcb_rev="R202510",
-                  driver_pot_ohm=1234.5, lpf_pot_ohm=47000.0, pd_pot_ohm=10000.0,
+                  driver_pot_ohm=19.8, lpf_pot_ohm=9080.0, pd_pot_ohm=8000.0,
                   programmed_at=1_790_000_000, report_id="20261015_120000_ABCD1234")
     values.update(overrides)
     return BoardIdentity(**values)
@@ -35,11 +35,34 @@ class RecordTests(unittest.TestCase):
         got = stored.identity
         self.assertEqual(got.serial, source.serial)
         self.assertEqual(got.pcb_rev, source.pcb_rev)
-        self.assertAlmostEqual(got.driver_pot_ohm, 1234.5)
-        self.assertAlmostEqual(got.lpf_pot_ohm, 47000.0)
-        self.assertAlmostEqual(got.pd_pot_ohm, 10000.0)
+        self.assertEqual(got.driver_pot_ohm, 19.8)
+        self.assertEqual(got.lpf_pot_ohm, 9080.0)
+        self.assertEqual(got.pd_pot_ohm, 8000.0)
         self.assertEqual(got.programmed_at, source.programmed_at)
         self.assertEqual(got.report_id, source.report_id)
+
+    def test_pots_are_u16_counts(self):
+        payload = ident.encode_payload(BoardIdentity(
+            board=ident.BOARD_1550, driver_pot_ohm=15.04, lpf_pot_ohm=9079.6,
+            pd_pot_ohm=0.0))
+        self.assertIn(bytes((0x10, 2)) + struct.pack("<H", 150), payload)  # 0.1 ohm
+        self.assertIn(bytes((0x11, 2)) + struct.pack("<H", 9080), payload)  # 1 ohm
+        self.assertIn(bytes((0x12, 2)) + struct.pack("<H", 0), payload)
+        got = ident.decode_payload(ident.BOARD_1550, payload)
+        self.assertEqual((got.driver_pot_ohm, got.lpf_pot_ohm, got.pd_pot_ohm),
+                         (15.0, 9080.0, 0.0))
+
+    def test_pot_range_limits(self):
+        ident.encode_payload(laser(driver_pot_ohm=6553.5, lpf_pot_ohm=65535))
+        for bad in (dict(driver_pot_ohm=6553.6), dict(driver_pot_ohm=-0.1),
+                    dict(lpf_pot_ohm=65536), dict(pd_pot_ohm=-1)):
+            with self.assertRaises(IdentityError, msg=str(bad)):
+                ident.encode_payload(laser(**bad))
+
+    def test_float32_pots_from_older_records_still_decode(self):
+        payload = bytes((0x10, 4)) + struct.pack("<f", 19.8)
+        got = ident.decode_payload(ident.BOARD_638, payload)
+        self.assertAlmostEqual(got.driver_pot_ohm, 19.8, places=5)
 
     def test_mainboard_round_trip_and_unused_bytes_erased(self):
         source = BoardIdentity(board=ident.BOARD_MAIN, serial="2507180076",
