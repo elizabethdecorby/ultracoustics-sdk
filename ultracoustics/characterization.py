@@ -1,17 +1,15 @@
 """
-Probe characterization helpers – ramp binning and post-analysis.
+Probe sweep result type and post-analysis.
 
-This module holds the pure-computation half of the probe-characterization
-workflow used by :meth:`ultracoustics.controller.Controller.run_probe_characterization`.
-Splitting it out keeps the acquisition logic (which owns the USB device) in
-the :class:`Controller` and the analysis logic (which only touches numpy /
-scipy) here, where it can be unit-tested and reused on saved data without
-any hardware connected.
+This module holds the pure-computation half of the probe sweep run by
+:meth:`ultracoustics.controller.Controller.run_probe_sweep`. Splitting it out
+keeps the acquisition logic (which owns the USB device) in the
+:class:`Controller` and the analysis logic (which only touches numpy / scipy)
+here, where it can be unit-tested and reused on saved data without any
+hardware connected.
 
 Functions
 ---------
-bin_ramp(ramp, sample_rate, ...)
-    Time-bin a captured ramp waveform into (DAC setpoint -> mean PD) pairs.
 load_laser_calibration(path)
     Load a laser current -> optical power calibration CSV.
 apply_laser_calibration(probe_data, laser_cal)
@@ -24,8 +22,7 @@ analyze_dips(optical_power_mw, photodetector, dip_indices)
 Classes
 -------
 ProbeCharacterizationResult
-    Structured return type of
-    :meth:`Controller.run_probe_characterization`.
+    Structured return type of :meth:`Controller.run_probe_sweep`.
 """
 
 from dataclasses import dataclass, field
@@ -36,8 +33,6 @@ import numpy as np
 from scipy.interpolate import interp1d
 from scipy.signal import find_peaks
 
-from .config import SAMPLE_RATE, ADC_MAX_VALUE
-
 
 # ---------------------------------------------------------------------------
 # Result type
@@ -45,26 +40,31 @@ from .config import SAMPLE_RATE, ADC_MAX_VALUE
 
 @dataclass
 class ProbeCharacterizationResult:
-    """Outcome of a bulk-only probe-characterization sweep.
+    """Outcome of a probe sweep.
 
     Attributes
     ----------
     current : list[int]
-        DAC setpoints swept (e.g. 0, 100, ..., 44000).
+        638 DAC values applied, as the board confirmed them (0, 100, ...).
     photodetector : list[float]
-        Mean photodetector reading (ADC counts) for each setpoint, in the
-        same order as ``current``.
+        Mean photodetector reading (ADC counts) at each DAC, in the same
+        order as ``current``.
     saturated : bool
-        ``True`` if the photodetector saturated mid-ramp and the sweep was
-        aborted early (the curve is trimmed to end at the saturation point).
+        ``True`` if the photodetector saturated and the sweep stopped early
+        (the curve ends at the saturated point).
     sample_rate : int
-        ADC sample rate in Hz the binning was performed at.
+        ADC sample rate in Hz.
     bin_seconds : float
-        Width of each time bin in seconds (one firmware ramp tick).
+        Time the DAC was held at each value (the dwell).
     step_size : int
-        DAC increment per bin.
+        DAC increment between points.
     max_current : int
-        DAC setpoint the ramp tops out at (matches firmware PROBE_RAMP_MAX).
+        Highest DAC the sweep was asked to reach (the board's cap by default).
+    settle_seconds : float or None
+        Start of each average after the step; the average covers
+        ``settle_seconds`` to ``bin_seconds`` after the board applied it.
+    temperature_c : list[float] or None
+        638 TEC temperature at each point, from telemetry.
     """
 
     current: List[int]
@@ -74,6 +74,8 @@ class ProbeCharacterizationResult:
     bin_seconds: float
     step_size: int
     max_current: int
+    settle_seconds: Optional[float] = None
+    temperature_c: Optional[List[float]] = None
 
     def as_dict(self) -> Dict[str, Any]:
         """Return a plain-dict view (JSON-serializable)."""
@@ -85,104 +87,10 @@ class ProbeCharacterizationResult:
             "bin_seconds": self.bin_seconds,
             "step_size": self.step_size,
             "max_current": self.max_current,
+            "settle_seconds": self.settle_seconds,
+            "temperature_c": (None if self.temperature_c is None
+                              else list(self.temperature_c)),
         }
-
-
-# ---------------------------------------------------------------------------
-# Ramp binning
-# ---------------------------------------------------------------------------
-
-def bin_ramp(
-    ramp,
-    sample_rate: int = SAMPLE_RATE,
-    bin_seconds: float = 0.025,
-    step_size: int = 100,
-    max_current: int = 44000,
-    saturated: bool = False,
-    saturation_limit: Optional[int] = None,
-    start_offset_samples: int = 0,
-) -> Dict[str, list]:
-    """Time-bin a captured ramp waveform into setpoint -> mean-PD pairs.
-
-    Forward-bins from the ramp origin: ``ramp`` is assumed to be exactly the
-    samples captured from the moment the start command was issued (array
-    index 0 == T0), so bin ``k`` covers samples
-    ``[start_offset + k*bin_samples, start_offset + (k+1)*bin_samples)`` and
-    is labelled setpoint ``k * step_size``.
-
-    This is independent of the PD amplitude shape (no edge/threshold
-    detection), which matters because resonance-dip probes do not produce a
-    large stop transition to anchor against.
-
-    Parameters
-    ----------
-    ramp : array-like
-        Captured uint16 PD samples spanning [T0, end-of-capture].
-    sample_rate : int
-        ADC sample rate in Hz.
-    bin_seconds : float
-        Width of one bin in seconds (one firmware ramp tick, 25 ms at 40 Hz).
-    step_size : int
-        DAC increment per bin.
-    max_current : int
-        DAC setpoint the ramp tops out at; ``n_steps = max_current // step_size``.
-    saturated : bool
-        If ``True``, trailing bins at or above ``saturation_limit`` are
-        trimmed so the curve ends cleanly at the saturation point.
-    saturation_limit : int, optional
-        ADC count treated as saturation; required when ``saturated`` is True.
-    start_offset_samples : int
-        Sample offset for the first bin (calibration fudge for the unknown
-        40 Hz tick phase vs the host start command). Default 0 is correct
-        within ~1 bin.
-
-    Returns
-    -------
-    dict
-        ``{"current": [...], "photodetector": [...]}`` with one entry per
-        non-empty bin.
-
-    Raises
-    ------
-    RuntimeError
-        If the ramp is flat (ramp did not run / PD dead) or binning produces
-        no points.
-    """
-    ramp = np.asarray(ramp)
-    if float(ramp.max()) - float(ramp.min()) <= 0:
-        raise RuntimeError("PD signal is flat — ramp did not run or PD is dead.")
-
-    bin_samples = int(sample_rate * bin_seconds)   # 250_000 samples / 25 ms
-    n_steps = max_current // step_size
-
-    setpoints: List[int] = []
-    pd_vals: List[float] = []
-
-    # Forward: k=0 -> setpoint 0, ..., k=n_steps -> setpoint max_current.
-    for k in range(n_steps + 1):
-        a = start_offset_samples + k * bin_samples
-        b = a + bin_samples
-        if b > ramp.size:
-            break  # captured ramp ended early (e.g. saturation abort)
-        seg = ramp[a:b]
-        setpoints.append(k * step_size)
-        pd_vals.append(float(np.mean(seg)))
-
-    if not setpoints:
-        raise RuntimeError("Binning produced no points — check ramp/PD signal.")
-
-    # If we aborted for saturation, trim any trailing bins beyond the
-    # saturation point so the curve ends cleanly at saturation.
-    if saturated:
-        if saturation_limit is None:
-            saturation_limit = int(ADC_MAX_VALUE * 0.95)
-        for i, pd in enumerate(pd_vals):
-            if pd >= saturation_limit:
-                setpoints = setpoints[:i + 1]
-                pd_vals = pd_vals[:i + 1]
-                break
-
-    return {"current": setpoints, "photodetector": pd_vals}
 
 
 # ---------------------------------------------------------------------------

@@ -489,7 +489,10 @@ def reader_main(
                         delivery = {**delivery, "transport_status": "failed",
                                     "error": str(exc)}
                     else:
-                        delivery = {**delivery, "firmware_response": response}
+                        # Transfers on one endpoint complete in order, so this
+                        # is where the reply sits among the ADC records.
+                        delivery = {**delivery, "firmware_response": response,
+                                    "stream_sample": total}
                     if command_ack_queue is not None:
                         command_ack_queue.put((request_id, delivery, time.monotonic_ns()))
                     pending_control = None

@@ -435,6 +435,8 @@ class ReentrantControlResponseTests(unittest.TestCase):
             first = acknowledgements.get_nowait()
             second = acknowledgements.get_nowait()
             self.assertEqual(first[1]["firmware_response"].stream_epoch, 9)
+            # No ADC record has arrived yet, so the reply sits at sample 0.
+            self.assertEqual(first[1]["stream_sample"], 0)
             self.assertEqual(second[1]["firmware_response"],
                              {"accepted_format": 1, "stream_epoch": 10})
             self.assertEqual(read_sidecar(sidecar)[1]["active_format"], 1)

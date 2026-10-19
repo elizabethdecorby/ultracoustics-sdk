@@ -14,8 +14,7 @@ Classes:
         Board and its slave laser boards.  Provides query_firmware_info(),
         query_slave_version(), read_identity(), write_identity(),
         read_system_info(), enter_override(), exit_override(),
-        set_power(), set_trigger(), program_1550(),
-        start_probe_characterization(), stop_probe_characterization().
+        set_power(), set_trigger(), program_1550().
 
     LaserSerialController
         Serial link to a slave laser board for direct current control.
@@ -41,7 +40,7 @@ from .comms import USBBulkConnection, SerialConnection
 from .protocol import (
     CMD_FLASH_1550, CMD_FLASH_638, CMD_IAP,
     CMD_OVERRIDE_ENTER, CMD_POWER, CMD_TRIGGER, CMD_PROGRAM_1550,
-    CMD_BOOT_VERSION, CMD_BOOT_VERSION_638, CMD_FWINFO, CMD_PROBE_CHAR,
+    CMD_BOOT_VERSION, CMD_BOOT_VERSION_638, CMD_FWINFO,
     CMD_IDENTITY_READ, CMD_IDENTITY_WRITE, BULK_OUT_EP,
     TARGET_1550, TARGET_638, TARGET_MAIN,
 )
@@ -535,41 +534,6 @@ class DiagnosticsManager:
             16-bit DAC value (0–65535) controlling the laser drive level.
         """
         self._conn.send_command(CMD_PROGRAM_1550, wValue=dac_val)
-
-    # -- Probe characterization (638 self-ramp over SPI command_id) -----------
-
-    def start_probe_characterization(self):
-        """Begin the 638 probe-characterization self-ramp.
-
-        Stamps ``CMD_PROBE_RAMP_START`` (0x40) into byte[1] of the master's
-        SPI2 packets. The 638 edge-detects the 0x33 -> 0x40 transition in its
-        EXTI handler and starts its 0 -> 44000 DAC ramp at 40 Hz. Photodetector
-        samples are read continuously over the bulk stream and time-binned by
-        the host.
-
-        Requires override mode (the firmware refuses the start otherwise) and
-        the 638 must be powered and idle:
-
-            diag.enter_override()
-            diag.set_power(TARGET_638, True)
-            diag.set_trigger(TARGET_638, False)   # ensure 638 stays IDLE
-            diag.start_probe_characterization()
-
-        Note: the 638 boots into IDLE on its own; ``set_trigger(TARGET_638,
-        False)`` is insurance so the master does not push it into CALIBRATING
-        (which would seize the DAC and block the ramp).
-        """
-        self._conn.send_command(CMD_PROBE_CHAR, wValue=1)
-
-    def stop_probe_characterization(self):
-        """Stop the 638 probe-characterization ramp.
-
-        Restores ``CMD_PSSI_DATA`` (0x33) in byte[1]; the 638 edge-detects the
-        0x40 -> 0x33 transition and aborts the ramp to DAC 0. Safe to call
-        even if not in override (the firmware restores 0x33 unconditionally),
-        so this is suitable for a ``finally:`` block.
-        """
-        self._conn.send_command(CMD_PROBE_CHAR, wValue=0)
 
     # -- Internals ------------------------------------------------------------
 

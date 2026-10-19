@@ -21,7 +21,6 @@ from .nep import (
 )
 from .characterization import (
     ProbeCharacterizationResult,
-    bin_ramp,
     load_laser_calibration,
     apply_laser_calibration,
     detect_resonance_dips,
@@ -52,7 +51,6 @@ __all__ = [
     "spl_db_per_rthz",
     # Probe characterization
     "ProbeCharacterizationResult",
-    "bin_ramp",
     "load_laser_calibration",
     "apply_laser_calibration",
     "detect_resonance_dips",

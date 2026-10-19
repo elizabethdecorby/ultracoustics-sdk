@@ -225,23 +225,58 @@ power_uw = adc_to_uw(samples, baseline=samples.mean(),
 
 ---
 
-## Probe Characterization
+## Test mode (manual sessions)
 
-`Controller.run_probe_characterization(...)` runs the bulk-only probe-characterization ramp over the master USB bulk connection (no USB-serial connection to the 638 required) and returns the binned LI curve. Override / power / trigger sequencing is handled internally and is **not** exposed.
+Every bench test that drives a laser DAC runs in one mode: the master in
+override, and the laser boards' 1-second leases on each channel the PC owns.
+`docs/TEST_MODE.md` has the design. Each laser is either off, PC-controlled
+(START low, leased channels) or automatic (START high, its own firmware).
 
-The capture must fit in the ring buffer in one piece, so construct the `Controller` with a large enough `ring_seconds` (the method raises a clear `RuntimeError` quoting the required value if it is too small).
+- `begin_system_manual(timeout_s=1.0, optical_diagnostics=False,
+  keepalive_ms=2000)` powers both boards with START low and both DACs taken
+  at 0. Its last step arms the master keepalive (command `K`): if the PC then
+  sends nothing for `keepalive_ms`, the master powers everything down
+  (white ×4). A master without `K` refuses the session.
+- `renew_system_manual()` renews every lease, which also feeds the
+  keepalive. Call it at least every 0.5 s.
+- `start_1550_automatic(warmup_s=10.0)` hands the 1550 back to its own
+  firmware inside the session. While its START is high the master watches
+  the 1550 and the probe signal, and refuses manual commands to the 1550.
+- `take_over_638(dac)` turns a box locked in RUN into a session: override in
+  place, the 638 START lowered, and the 638 DAC taken at `dac`. The 1550 keeps
+  running on its own.
+- `wait_tec_lock(target)` waits for a TEC to hold within ±0.3 °C for 1 s.
+- `finish_system_manual()` ends any session with a confirmed STOP.
+  `last_master_fault` then names the master fault that ended it, if any (for
+  example `"probe signal lost"` or `"PC keepalive expired"`).
+
+Each `ManualReply` carries `stream_sample`: the number of samples received
+when the reply arrived. The master sends the reply after the board applied
+the value, on the same endpoint as the ADC records, so it marks the change in
+the sample stream. `round_trip_ns` is the host time from request to reply.
+`examples/measure_manual_timing.py` measures both on the bench.
+
+## Probe Sweep
+
+`Controller.run_probe_sweep(...)` steps the 638 DAC from 0 to the board's cap
+over the master USB connection and averages the photodetector at each step.
+It opens and always closes its own test-mode session: the 1550 runs on its
+own firmware at its stored setpoint, and each 638 SET must come back with the
+requested value. The average at each step covers `settle_s` to `dwell_s`
+after the reply's stream position.
 
 ```python
 from ultracoustics import Controller
 
-ctrl = Controller(verbose=True, ring_seconds=12)  # >= ramp (~9 s) + margin
+ctrl = Controller(ring_seconds=2.0)
 ctrl.connect()
 ctrl.begin_stream()
 
-result = ctrl.run_probe_characterization()
-# result.current          -> [0, 100, ..., 44000]  (DAC setpoints)
-# result.photodetector     -> mean ADC counts per setpoint
-# result.saturated         -> True if the PD saturated mid-ramp (curve trimmed)
+result = ctrl.run_probe_sweep()
+# result.current          -> [0, 100, ..., 52400]  (applied 638 DAC)
+# result.photodetector     -> mean ADC counts per DAC
+# result.saturated         -> True if the PD saturated (curve ends there)
+# result.temperature_c     -> 638 TEC temperature per point
 
 ctrl.end_stream()
 ctrl.close()
@@ -249,23 +284,24 @@ ctrl.close()
 
 | Parameter | Default | Description |
 |---|---|---|
-| `max_current` | `44000` | DAC setpoint the ramp tops out at (must match firmware `PROBE_RAMP_MAX`). |
-| `step_size` | `100` | DAC increment per bin (must match firmware; host cannot change it). |
-| `bin_seconds` | `0.025` | One ramp tick in seconds (25 ms at the firmware 40 Hz rate). |
-| `start_offset_s` | `0.0` | Forward-bin offset (s) for the unknown 40 Hz tick phase; correct within ~1 bin. |
-| `laser_warmup_s` | `10.0` | 1550 turn-on transient settle time before the 638 ramp begins. |
-| `boot_settle_s` | `10.0` | 638 boot / rail settle time after power-on. |
-| `capture_guard_s` | `0.7` | Extra capture beyond the ramp for startup + stop latency. |
-| `saturation_threshold` | `0.95` | Fraction of `ADC_MAX_VALUE` treated as PD saturation; aborts + trims. |
-| `verbose` | `Controller.verbose` | Per-call verbose override. |
+| `step` | `100` | DAC increment. The top is always included. |
+| `dwell_s` | `0.025` | Time at each DAC. |
+| `settle_s` | `0.005` | Start of the average after the step. |
+| `top` | board cap | Highest DAC (never above the cap read from channel 7). |
+| `warmup_s` | `10.0` | 1550 warm-up after its TEC locks. |
+| `saturation_threshold` | `0.95` | Fraction of `ADC_MAX_VALUE` that stops the sweep. |
+| `cancel`, `on_progress` | `None` | Polled between points / called after each point. |
 
-Returns a `ProbeCharacterizationResult` (`current`, `photodetector`, `saturated`, `sample_rate`, `bin_seconds`, `step_size`, `max_current`; `.as_dict()` for a JSON-friendly view).
+Returns a `ProbeCharacterizationResult` (`current`, `photodetector`,
+`saturated`, `sample_rate`, `bin_seconds` (the dwell), `step_size`,
+`max_current`, `settle_seconds`, `temperature_c`; `.as_dict()` for a
+JSON-friendly view). With a 25 ms dwell a full sweep takes about 15–40 s plus
+the warm-up, depending on the command round trip.
 
 **Post-analysis helpers** (pure functions, no hardware needed — operate on a `ProbeCharacterizationResult` or a saved curve):
 
 | Function | Description |
 |---|---|
-| `bin_ramp(ramp, ...)` | Time-bin a captured ramp array into setpoint → mean-PD pairs. |
 | `load_laser_calibration(path)` | Load a laser current → optical power (mW) calibration CSV; `None` if missing. |
 | `apply_laser_calibration(probe_data, laser_cal)` | Interpolate laser current → optical power (mW). |
 | `detect_resonance_dips(optical_power_mw, photodetector, ...)` | Find resonance dips via `scipy.signal.find_peaks`. |
@@ -281,8 +317,10 @@ Run examples from the repository root after installation:
 python examples/basic_capture.py
 python examples/offline_psd.py
 python examples/probe_characterization.py
+python examples/measure_manual_timing.py
 
-`probe_characterization.py` produces a CSV + plot; the plot needs the optional `plot` extra:
+`probe_characterization.py` runs a probe sweep and produces a CSV + plot; the
+plot needs the optional `plot` extra:
 
 ```bash
 pip install -e ".[plot]"
@@ -297,7 +335,7 @@ before entering manual override. The standard manual setup sets both lasers to
 zero, so explicitly command a nonzero 1550 DAC for illumination before the
 scan. The SDK checks the acknowledged 1550 readback; it transfers the 638 zero
 DAC lease to optical control, runs the firmware-paced scan, and returns the 638
-to zero/IDLE. It never widens the older manual DAC limit of 44000.
+to zero/IDLE. The scan ramps to the board's cap (channel 7, at most 52400).
 
 ```python
 ctrl.begin_system_manual(optical_diagnostics=True)
@@ -308,13 +346,15 @@ rows = result["rows"]  # commanded_dac and main_pd_adc_counts
 
 The `MANUAL_SET` and `CHANNEL_LASER_DAC` constants are available from
 `ultracoustics._internal.control`. `capture_fp_scan` accepts a 75-second
-maximum deadline and keeps manual leases alive. Each returned row pairs a
-fresh FAST feedback sample with the preceding SPI5 DAC command; the first
-feedback sample is excluded because it has no preceding scan command. The
-command is not an analog DAC readback. The result includes capture ID, raw
-clock rate, record count, duration, DAC cap, and quality flags. A canceled or
-failed scan raises `FPScanError` with any adjacent paired rows in `.rows`,
-sorted by scan index even when early trace pages were missed.
+maximum deadline and keeps manual leases alive. The firmware steps the DAC
+every 1 ms (1000 steps) and marks the start and end of the ramp in the
+stream; the SDK places those markers on the ADC samples (to within 300 µs),
+splits the samples between them into 1000 equal bins, and labels bin `i`
+with `cap * i / 999`. That label is an estimate from the firmware timing,
+not an analog DAC readback, and `raw_adc` keeps the full-rate samples. The
+result includes capture ID, sample rate, duration, DAC cap, the marker
+bounds and quality flags. A canceled or failed scan raises `FPScanError`
+with any rows already binned in `.rows`.
 
 `read_optical_cap_638`, `read_controller_timing_638`,
 `set_controller_timing_638(divider, held)`, and `read_fp_scan_638` expose the

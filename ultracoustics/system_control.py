@@ -7,12 +7,17 @@ import math
 import struct
 import numpy as np
 import time
+from ._internal.comms import TransportUncertainError
 from ._internal.control import (
     MANUAL_GET, MANUAL_TAKE, MANUAL_SET, MANUAL_RELEASE, MANUAL_RENEW,
     CHANNEL_TEMPERATURE, CHANNEL_LASER_DAC,
 )
-from ._internal.protocol import CMD_BOOT, CMD_OVERRIDE_ENTER, CMD_POWER, CMD_TRIGGER
+from ._internal.protocol import (
+    CMD_BOOT, CMD_KEEPALIVE, CMD_OVERRIDE_ENTER, CMD_POWER, CMD_TRIGGER,
+)
 from ._internal.optical_diagnostics import OpticalTrace
+from .characterization import ProbeCharacterizationResult
+from .config import ADC_MAX_VALUE, SAMPLE_RATE
 
 CHANNEL_OPTICAL = 3
 CHANNEL_KP = 4
@@ -35,6 +40,13 @@ GAIN_SCALE = 1_000_000
 OPTICAL_STATES = ('IDLE', 'CALIBRATING', 'ROOT_FINDING', 'LOCKED', 'ERROR', 'MEASURE_SLOPE')
 OPTICAL_ACTIONS = {'abort': 0, 'start': 1, 'reacquire': 2, 'retune': 3,
                    'trace': 4, 'identify': 5}
+#: Master keepalive armed for every manual session (firmware command K). Any
+#: command feeds it; sessions renew leases every 0.2-0.5 s.
+KEEPALIVE_MS = 2000
+#: Lease renewal period for the SDK's own waits.
+RENEW_INTERVAL_S = 0.5
+#: Stream counters that must not move while a sweep is binning samples.
+STREAM_HEALTH_KEYS = ('drops_seq', 'transfer_errors', 'transfer_timeouts', 'malformed')
 
 
 def require_applied(reply):
@@ -438,17 +450,66 @@ class SystemControlMixin:
         return bool(getattr(self, '_system_manual_active', False))
 
     def stop_system_confirmed(self, timeout_s=1.0):
-        """Request global IDLE and verify firmware state; never infer it from UI."""
+        """Request global IDLE and verify firmware state; never infer it from UI.
+
+        ``last_master_fault`` names the master fault that ended the window
+        this STOP closed (a safety check in override, say), or is ``None``.
+        """
         self._system_manual_active = False
         self._system_manual_owned = set()
+        self._keepalive_ms = 0
+        self._auto_1550 = False
         self._ensure_connected()
         self.begin_stream()
         delivered = self.stop_confirmed(timeout_s=timeout_s)
         self._last_manual_rail_off_ns = delivered['bulk_write_completed_monotonic_ns']
         metrics = self.runtime_metrics(timeout_s=timeout_s)
+        self.last_master_fault = getattr(metrics, 'fault', None)
         if metrics.current_state != 0:
             raise RuntimeError(f'Global STOP did not reach IDLE: state {metrics.current_state}')
         return metrics
+
+    def _stop_after(self, original, timeout_s):
+        """Confirmed STOP after *original*; return the error to raise."""
+        try:
+            self.stop_system_confirmed(timeout_s=max(.5, timeout_s))
+        except Exception as cleanup:
+            return RuntimeError(f'{original}; STOP unconfirmed: {cleanup}')
+        fault = getattr(self, 'last_master_fault', None)
+        if fault:
+            return RuntimeError(f'{original} (master fault: {fault})')
+        return None
+
+    def _arm_keepalive(self, keepalive_ms, timeout_s):
+        """Arm the master's override keepalive; refuse firmware without it."""
+        if not keepalive_ms:
+            self._keepalive_ms = 0
+            return
+        if type(keepalive_ms) is not int or not 200 <= keepalive_ms <= 65535:
+            raise ValueError('keepalive_ms must be 0 or 200..65535')
+        try:
+            self._send_confirmed(CMD_KEEPALIVE, wValue=keepalive_ms, timeout_s=timeout_s)
+        except TransportUncertainError as exc:
+            if getattr(exc, 'halt_cleared', False):
+                raise RuntimeError('Master firmware rejected the test-mode keepalive (K); '
+                                   'update the master firmware') from exc
+            raise
+        self._keepalive_ms = keepalive_ms
+
+    def _renew_if_due(self):
+        now = time.monotonic()
+        if now >= getattr(self, '_next_renew', 0.0):
+            self.renew_system_manual()
+            self._next_renew = now + RENEW_INTERVAL_S
+
+    def _dwell(self, seconds, cancel=None):
+        """Wait *seconds* while renewing the session's leases."""
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if cancel is not None and cancel():
+                raise RuntimeError('canceled')
+            self._renew_if_due()
+            time.sleep(.01)
 
     def start_confirmed(self, timeout_s=1.0):
         """Recover via confirmed IDLE, then submit BOOT; does not promise a lock."""
@@ -461,8 +522,15 @@ class SystemControlMixin:
         self._last_manual_rail_off_ns = None
         return result
 
-    def begin_system_manual(self, timeout_s=1.0, optical_diagnostics=False):
-        """Power both boards with START low and take both laser DACs at zero."""
+    def begin_system_manual(self, timeout_s=1.0, optical_diagnostics=False,
+                            keepalive_ms=KEEPALIVE_MS):
+        """Power both boards with START low and take both laser DACs at zero.
+
+        The last step arms the master's keepalive: if the host then sends
+        nothing for *keepalive_ms*, the master powers everything down.
+        ``renew_system_manual`` feeds it. A master without the keepalive
+        rejects the session.
+        """
         if self.system_manual_active:
             return self.system_manual_readback(timeout_s)
         self.stop_system_confirmed(timeout_s)
@@ -507,6 +575,8 @@ class SystemControlMixin:
                     self.system_manual_command(target, MANUAL_TAKE, CHANNEL_LASER_DAC, 0, timeout_s)
                 except Exception as exc:
                     raise RuntimeError(f'Board {target} zero-DAC takeover failed: {exc}') from exc
+            self._arm_keepalive(keepalive_ms, timeout_s)
+            self._next_renew = time.monotonic() + RENEW_INTERVAL_S
             return self.system_manual_readback(timeout_s)
         except Exception as original:
             try:
@@ -515,11 +585,235 @@ class SystemControlMixin:
                 raise RuntimeError(f'{original}; global shutdown unconfirmed: {cleanup}') from original
             raise
 
+    def take_over_638(self, dac, timeout_s=1.0, keepalive_ms=KEEPALIVE_MS,
+                      idle_timeout_s=2.0):
+        """Turn a locked box in RUN into a manual session holding the 638 at *dac*.
+
+        The master enters override without changing any rail or START line,
+        so the 1550 keeps running on its own firmware and the master's
+        override checks keep watching it and the probe signal. Only the 638
+        START drops: the 638 goes to IDLE (its DAC passes through 0) and is
+        then taken at *dac*. The 1550 cannot be commanded in this session.
+        ``finish_system_manual`` ends it with a confirmed STOP.
+        """
+        if self.system_manual_active:
+            raise RuntimeError('A manual session is already open')
+        if not getattr(self, 'streaming', False):
+            raise RuntimeError('An active stream is required for take-over')
+        cap = self.read_optical_cap_638(timeout_s)['max_dac']
+        if type(dac) is not int or not 0 <= dac <= cap:
+            raise ValueError(f'638 DAC must be an integer 0..{cap}')
+        self._system_manual_owned = set()
+        try:
+            self._send_confirmed(CMD_OVERRIDE_ENTER, wValue=1, timeout_s=timeout_s)
+            self._running = False
+            self._system_manual_active = True
+            self._auto_1550 = True
+            self._arm_keepalive(keepalive_ms, timeout_s)
+            self._send_confirmed(CMD_TRIGGER, wValue=0, wIndex=638, timeout_s=timeout_s)
+            self._wait_optical_idle(idle_timeout_s)
+            reply = require_applied(self.system_manual_command(
+                638, MANUAL_TAKE, CHANNEL_LASER_DAC, dac, timeout_s))
+            if reply.applied_value != dac:
+                raise RuntimeError(f'638 applied DAC {reply.applied_value}, not {dac}')
+            self._next_renew = time.monotonic() + RENEW_INTERVAL_S
+            return reply
+        except Exception as original:
+            error = self._stop_after(original, timeout_s)
+            if error is not None:
+                raise error from original
+            raise
+
+    def start_1550_automatic(self, timeout_s=1.0, lock_timeout_s=60.0,
+                             warmup_s=10.0, cancel=None):
+        """Hand the 1550 back to its own firmware inside a manual session.
+
+        The 1550 then runs at its stored setpoint with its START high, which
+        arms the master's override checks on the 1550 and the probe signal.
+        Returns once its TEC has locked and *warmup_s* has passed. The master
+        refuses manual commands to the 1550 until the session ends.
+        """
+        if not self.system_manual_active:
+            raise RuntimeError('Open a system manual session first')
+        if getattr(self, '_auto_1550', False):
+            return
+        target_c = require_applied(self.system_manual_command(
+            1550, MANUAL_GET, CHANNEL_TEMPERATURE, timeout_s=timeout_s)).applied_value / 1000.0
+        for channel in (CHANNEL_LASER_DAC, CHANNEL_TEMPERATURE):
+            if (1550, channel) in self._system_manual_owned:
+                if channel == CHANNEL_LASER_DAC:
+                    self.system_manual_command(1550, MANUAL_SET, channel, 0, timeout_s)
+                self.system_manual_command(1550, MANUAL_RELEASE, channel, timeout_s=timeout_s)
+        self._send_confirmed(CMD_TRIGGER, wValue=1, wIndex=1550, timeout_s=timeout_s)
+        self._auto_1550 = True
+        self.wait_tec_lock(1550, target_c=target_c, timeout_s=lock_timeout_s, cancel=cancel)
+        self._dwell(warmup_s, cancel)
+
+    def wait_tec_lock(self, target, target_c=None, band_c=0.3, hold_s=1.0,
+                      timeout_s=60.0, cancel=None):
+        """Wait until *target*'s TEC holds within *band_c* of its target.
+
+        Reads temperature from telemetry and renews the session's leases while
+        it waits. Returns the target temperature in °C.
+        """
+        if target_c is None:
+            target_c = require_applied(self.system_manual_command(
+                target, MANUAL_GET, CHANNEL_TEMPERATURE)).applied_value / 1000.0
+        started = time.monotonic()
+        in_band_since = None
+        while True:
+            if cancel is not None and cancel():
+                raise RuntimeError('canceled')
+            self._renew_if_due()
+            snapshot = self.telemetry
+            now = time.monotonic()
+            board = (None if snapshot is None or snapshot.host_stale
+                     else getattr(snapshot, f'board_{target}'))
+            if (board is not None and not getattr(snapshot, f'link_flags_{target}') and
+                    board.temperature_valid and not board.temperature_stale and
+                    abs(board.temperature_mdegc / 1000.0 - target_c) <= band_c):
+                in_band_since = in_band_since or now
+                if now - in_band_since >= hold_s:
+                    return target_c
+            else:
+                in_band_since = None
+            if now - started > timeout_s:
+                raise TimeoutError(f'{target} nm TEC did not lock within ±{band_c} °C '
+                                   f'of {target_c:.2f} °C in {timeout_s:.0f} s')
+            time.sleep(.02)
+
+    def _stream_health(self):
+        stats = self.stream_stats or {}
+        return {key: stats.get(key, 0) for key in STREAM_HEALTH_KEYS}
+
+    def read_samples(self, start, end, timeout_s=2.0):
+        """Samples [start, end) by absolute stream position (``samples_received``).
+
+        Waits for them to arrive, then copies them out of the ring; raises if
+        the ring has already overwritten any of them.
+        """
+        if not 0 <= start < end or end - start > self.buffer_capacity:
+            raise ValueError('need 0 <= start < end and a span the ring can hold')
+        return self._ring_window(int(start), int(end), timeout_s)
+
+    def read_after_reply(self, reply, n_samples, settle_s=0.0, timeout_s=2.0):
+        """*n_samples* starting *settle_s* after a manual reply's stream position.
+
+        The reply arrives after the board applied the value, so these samples
+        all follow the change, whatever the host latency was.
+        """
+        if getattr(reply, 'stream_sample', None) is None:
+            raise RuntimeError('Manual reply has no stream position')
+        start = reply.stream_sample + round(settle_s * SAMPLE_RATE)
+        return self.read_samples(start, start + int(n_samples), timeout_s + settle_s)
+
+    def _ring_window(self, start, end, timeout_s=2.0):
+        """Wait for samples [start, end) and copy them out of the ring."""
+        deadline = time.monotonic() + timeout_s
+        while self.samples_received < end:
+            if time.monotonic() > deadline:
+                raise TimeoutError('ADC samples stopped arriving')
+            time.sleep(.001)
+        capacity = self.buffer_capacity
+        if self.samples_received - start > capacity:
+            raise RuntimeError('ADC ring overwritten before the window was read')
+        index, count = start % capacity, end - start
+        buffer = self.buffer
+        chunk = (buffer[index:index + count].copy() if index + count <= capacity else
+                 np.concatenate((buffer[index:], buffer[:index + count - capacity])))
+        if self.samples_received - start > capacity:
+            raise RuntimeError('ADC ring overwritten while the window was copied')
+        return chunk
+
+    def run_probe_sweep(self, step=100, dwell_s=0.025, settle_s=0.005, top=None,
+                        warmup_s=10.0, saturation_threshold=0.95, timeout_s=1.0,
+                        cancel=None, on_progress=None):
+        """Step the 638 DAC from 0 to its cap and average the photodetector.
+
+        Opens its own manual session and always ends it with a confirmed
+        STOP. The 1550 runs automatically at its stored setpoint (so the
+        master watches it and the probe signal), and the 638 is stepped by
+        confirmed SETs: each must come back with the requested value. Each
+        reply's ``stream_sample`` marks the step in the ADC stream, and the
+        average covers *settle_s* to *dwell_s* after it. The sweep stops at
+        the first point whose mean reaches *saturation_threshold* of full
+        scale.
+
+        *on_progress* receives ``{'index', 'count', 'dac', 'photodetector'}``
+        after each point; *cancel* is polled between points.
+        """
+        if type(step) is not int or not 1 <= step <= 10000:
+            raise ValueError('step must be an integer 1..10000')
+        if not 0 <= settle_s < dwell_s <= 1.0:
+            raise ValueError('need 0 <= settle_s < dwell_s <= 1 s')
+        if self.system_manual_active:
+            raise RuntimeError('Close the open manual session before a probe sweep')
+        if not getattr(self, 'streaming', False):
+            raise RuntimeError('An active stream is required for a probe sweep')
+        settle_n = round(settle_s * SAMPLE_RATE)
+        dwell_n = round(dwell_s * SAMPLE_RATE)
+        if dwell_n > self.buffer_capacity // 2:
+            raise ValueError('dwell_s needs a larger ring_seconds')
+        limit = saturation_threshold * ADC_MAX_VALUE
+        current, means, temps = [], [], []
+        saturated = False
+        self.begin_system_manual(timeout_s)
+        try:
+            cap = self.read_optical_cap_638(timeout_s)['max_dac']
+            top = cap if top is None else min(int(top), cap)
+            values = list(range(0, top + 1, step))
+            if values[-1] != top:
+                values.append(top)
+            target_638 = require_applied(self.system_manual_command(
+                638, MANUAL_GET, CHANNEL_TEMPERATURE, timeout_s=timeout_s)).applied_value / 1000.0
+            self.start_1550_automatic(timeout_s=timeout_s, warmup_s=warmup_s, cancel=cancel)
+            self.wait_tec_lock(638, target_c=target_638, cancel=cancel)
+            health = self._stream_health()
+            for index, dac in enumerate(values):
+                if cancel is not None and cancel():
+                    raise RuntimeError('canceled')
+                reply = require_applied(self.system_manual_command(
+                    638, MANUAL_SET, CHANNEL_LASER_DAC, dac, timeout_s))
+                if reply.applied_value != dac:
+                    raise RuntimeError(f'638 applied DAC {reply.applied_value}, not {dac}; '
+                                       'its TEC may have left lock')
+                if reply.stream_sample is None:
+                    raise RuntimeError('Manual reply has no stream position')
+                window = self._ring_window(reply.stream_sample + settle_n,
+                                           reply.stream_sample + dwell_n)
+                if self._stream_health() != health:
+                    raise RuntimeError('ADC discontinuity during the probe sweep')
+                mean = float(window.mean())
+                snapshot = self.telemetry
+                board = None if snapshot is None else snapshot.board_638
+                current.append(dac)
+                means.append(mean)
+                temps.append(float('nan') if board is None else board.temperature_mdegc / 1000.0)
+                if on_progress is not None:
+                    on_progress({'index': index, 'count': len(values), 'dac': dac,
+                                 'photodetector': mean})
+                if mean >= limit:
+                    saturated = True
+                    break
+            self.system_manual_command(638, MANUAL_SET, CHANNEL_LASER_DAC, 0, timeout_s)
+        except Exception as original:
+            error = self._stop_after(original, timeout_s)
+            if error is not None:
+                raise error from original
+            raise
+        self.finish_system_manual(timeout_s)
+        return ProbeCharacterizationResult(
+            current=current, photodetector=means, saturated=saturated,
+            sample_rate=SAMPLE_RATE, bin_seconds=dwell_s, step_size=step,
+            max_current=top, settle_seconds=settle_s, temperature_c=temps)
+
     def system_manual_command(self, target, opcode, channel, value=0, timeout_s=1.0):
         if not self.system_manual_active:
             raise RuntimeError('Open a system manual session first')
         if target not in (638, 1550):
             raise ValueError('Unknown laser board')
+        if target == 1550 and getattr(self, '_auto_1550', False):
+            raise RuntimeError('The 1550 runs on its own firmware in this session')
         if channel >= CHANNEL_OPTICAL and target != 638:
             raise ValueError('Optical locking controls are available only on 638')
         owned = self._system_manual_owned
@@ -542,16 +836,23 @@ class SystemControlMixin:
         return reply
 
     def renew_system_manual(self, timeout_s=.25):
+        """Renew every owned lease; that also feeds the master keepalive.
+
+        With no lease to renew, the keepalive is re-armed instead.
+        """
         if not self.system_manual_active:
             return []
         try:
-            return [self.system_manual_command(t, MANUAL_RENEW, ch, timeout_s=timeout_s)
-                    for t, ch in sorted(self._system_manual_owned)]
+            replies = [self.system_manual_command(t, MANUAL_RENEW, ch, timeout_s=timeout_s)
+                       for t, ch in sorted(self._system_manual_owned)]
+            keepalive_ms = getattr(self, '_keepalive_ms', 0)
+            if not replies and keepalive_ms:
+                self._send_confirmed(CMD_KEEPALIVE, wValue=keepalive_ms, timeout_s=max(.5, timeout_s))
+            return replies
         except Exception as original:
-            try:
-                self.stop_system_confirmed(timeout_s=max(.5, timeout_s))
-            except Exception as cleanup:
-                raise RuntimeError(f'Lease renewal failed: {original}; STOP unconfirmed: {cleanup}') from original
+            error = self._stop_after(f'Lease renewal failed: {original}', timeout_s)
+            if error is not None:
+                raise error from original
             raise RuntimeError(f'Lease renewal failed; system stopped: {original}') from original
 
     def finish_system_manual(self, timeout_s=1.0):
@@ -560,7 +861,7 @@ class SystemControlMixin:
 
     def system_manual_readback(self, timeout_s=1.0):
         result = {}
-        for target in (638, 1550):
+        for target in ((638,) if getattr(self, '_auto_1550', False) else (638, 1550)):
             result[target] = {
                 'temperature': self.system_manual_command(target, MANUAL_GET, CHANNEL_TEMPERATURE, timeout_s=timeout_s),
                 'laser': self.system_manual_command(target, MANUAL_GET, CHANNEL_LASER_DAC, timeout_s=timeout_s),

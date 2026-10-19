@@ -56,6 +56,12 @@ class ManualReply:
     owner: Optional[int]
     applied_value: Optional[int]
     raw_ack: bytes
+    #: Samples the reader had received when this reply arrived. The master
+    #: sends the reply after the slave applied the value, on the same bulk
+    #: endpoint as the ADC records, so this marks the change in the stream.
+    stream_sample: Optional[int] = None
+    #: Host bound from queueing the request to receiving the reply.
+    round_trip_ns: Optional[int] = None
 
     def require_transport(self):
         if self.transport_status:
@@ -83,6 +89,31 @@ def parse_manual_response(raw: bytes) -> ManualReply:
         raise ControlProtocolError("manual ACK CRC mismatch")
     return ManualReply(target, 0, txn, opcode, channel, ack[4], ack[5],
                        int.from_bytes(ack[6:9], "big", signed=True), ack)
+
+
+#: Master ``BootState_t`` value for FAULT.
+BOOT_STATE_FAULT = 6
+
+#: Master fault codes, ``BootFaultCode_t`` in the master's boot_sequencer.h.
+MASTER_FAULT_NAMES = {
+    1: "probe signal never seen",
+    2: "probe signal lost while waiting for the 638",
+    3: "probe signal lost",
+    4: "1550 never reported ready",
+    5: "638 never locked",
+    6: "1550 dropped ready",
+    7: "fan stall",
+    8: "slave refused the DAC write",
+    9: "slave DAC programming timed out",
+    10: "slave version query failed",
+    11: "slave flash relay failed",
+    12: "IAP image has a bad header",
+    13: "IAP image CRC mismatch",
+    14: "IAP flash write failed",
+    15: "boot state machine reached an undefined state",
+    16: "1550 startup DAC not confirmed",
+    17: "PC keepalive expired",
+}
 
 
 @dataclass(frozen=True)
@@ -118,6 +149,13 @@ class RuntimeMetrics:
     @property
     def idle_percent(self):
         return self.idle_basis_points / 100.0 if self.active_cycles_valid else None
+
+    @property
+    def fault(self) -> Optional[str]:
+        """Why the last window ended in FAULT, or ``None``."""
+        if self.terminal_state != BOOT_STATE_FAULT or not self.fault_code:
+            return None
+        return MASTER_FAULT_NAMES.get(self.fault_code, f"fault {self.fault_code}")
 
 
 def parse_runtime_metrics(raw: bytes) -> RuntimeMetrics:

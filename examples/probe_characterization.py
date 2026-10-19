@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Probe Characterization example for the Ultracoustics Python SDK.
+Probe sweep example for the Ultracoustics Python SDK.
 
-Runs the bulk-only probe-characterization ramp via
-:meth:`ultracoustics.Controller.run_probe_characterization`, saves the
-resulting LI curve to CSV, optionally applies a laser-power calibration, and
-plots it (with resonance-dip analysis if a calibration file is present).
+Runs the host-stepped probe sweep via
+:meth:`ultracoustics.Controller.run_probe_sweep` (master USB only: the 1550
+runs on its own firmware and the PC steps the 638 DAC), saves the resulting
+curve to CSV, optionally applies a laser-power calibration, and plots it
+(with resonance-dip analysis if a calibration file is present).
 
 This is the *opinionated* layer: serial-number prompt, output paths, CSV
 format, and plotting all live here. The acquisition and binning logic is in
@@ -50,8 +51,9 @@ except ImportError:  # pragma: no cover
 # Configuration — edit these to match your setup.
 # ----------------------------------------------------------------------------
 
-# Ring buffer must hold the whole ~9 s sweep in one piece (see SDK docs).
-RING_SECONDS = 12.0
+# The sweep reads each step's samples as soon as they arrive, so the default
+# ring is enough; it only has to hold one dwell plus host latency.
+RING_SECONDS = 2.0
 
 # Output directories / files.
 PROBE_DATA_DIR = Path("probe_data")
@@ -71,12 +73,13 @@ def save_csv(result, probe_serial):
     filename = PROBE_DATA_DIR / f"probe_char_{probe_serial}_{timestamp}.csv"
 
     with open(filename, "w") as f:
-        f.write("# Probe Characterization (bulk-only)\n")
+        f.write("# Probe sweep (host-stepped)\n")
         f.write(f"# Probe Serial: {probe_serial}\n")
         f.write(f"# Date: {datetime.now().isoformat()}\n")
         f.write(f"# Max Current: {result.max_current}\n")
         f.write(f"# Step Size: {result.step_size}\n")
-        f.write(f"# Bin: {result.bin_seconds*1e3:.0f} ms "
+        f.write(f"# Dwell: {result.bin_seconds*1e3:.0f} ms, averaged from "
+                f"{result.settle_seconds*1e3:.0f} ms "
                 f"@ {result.sample_rate/1e6:.0f} MSPS\n")
         f.write("#\n")
         f.write("current_setpoint,photodetector_avg\n")
@@ -183,7 +186,7 @@ def plot_characterization(result, probe_serial, optical_power_mw, csv_filename):
 
 def main():
     print("\n" + "=" * 60)
-    print("PROBE CHARACTERIZATION SYSTEM (BULK-ONLY)")
+    print("PROBE SWEEP (MASTER USB ONLY)")
     print("=" * 60 + "\n")
 
     probe_serial = input("Enter Probe Serial Number: ").strip()
@@ -199,8 +202,13 @@ def main():
         ctrl.begin_stream()
         print("Streaming PD data.")
 
-        # One SDK call does override/power/trigger/ramp/binning.
-        result = ctrl.run_probe_characterization()
+        # One SDK call runs the session, the 1550 warm-up and the sweep, and
+        # always ends with a confirmed STOP.
+        def progress(point):
+            if point["index"] % 50 == 0:
+                print(f"  DAC {point['dac']:>5}: {point['photodetector']:8.1f} counts")
+
+        result = ctrl.run_probe_sweep(on_progress=progress)
 
         csv_file = save_csv(result, probe_serial)
 
