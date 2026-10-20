@@ -1,11 +1,14 @@
 # Single closed-box test mode
 
-Status: **built, not bench-tested.** Planned and approved on 2026-10-19 (all
+Status: **built and bench-tested.** Planned and approved on 2026-10-19 (all
 eight decisions at the end), then implemented the same day on a `test-mode`
 branch in four repos: `Photodetector-PSSIandUSBHS` (master firmware),
 `ultracoustics-sdk`, `Ultracoustics-Internal_Software` (diagnostics app) and
-`638-Laser-Firmware`. Nothing is committed or flashed yet. The bench
-checklist near the end is what is left.
+`638-Laser-Firmware`, and committed locally (not pushed). The user reported
+it working on the bench on 2026-10-20.
+
+The separate mainboard for the 638 noise test runs a variant master build
+with no 1550 and no fans: see `VISIBLE_PD_BOARD.md`.
 
 ## Goal
 

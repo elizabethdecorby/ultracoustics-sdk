@@ -254,6 +254,7 @@ class SystemControlMixin:
         The plotted DAC axis estimates the known1ms ramp staircase; full-rate
         ADC is retained in raw_adc. Old firmware fails explicitly without markers.
         """
+        self._require_system_board('The FP scan')
         if not 1.0 <= timeout_s <= 75.0:
             raise ValueError('scan timeout must be between 1 and 75 seconds')
         if not self.system_manual_active:
@@ -449,6 +450,49 @@ class SystemControlMixin:
     def system_manual_active(self):
         return bool(getattr(self, '_system_manual_active', False))
 
+    @property
+    def visible_pd_board(self):
+        """True when the master runs the visible-PD build (638 only, no 1550
+        or fans), False for the system build, None until a capability
+        response has been read (docs/VISIBLE_PD_BOARD.md)."""
+        capabilities = getattr(self, '_capabilities', None)
+        return None if capabilities is None else capabilities.visible_pd_board
+
+    @property
+    def laser_boards(self):
+        """The laser boards this master drives: ``(638,)`` or ``(638, 1550)``."""
+        return (638,) if self.visible_pd_board else (638, 1550)
+
+    def _require_system_board(self, what, query=True):
+        """Refuse *what* on the visible-PD build.
+
+        With the profile not yet known and the master IDLE, asks once. If it
+        cannot be learned, *what* goes ahead and the firmware's own refusals
+        still apply.
+        """
+        if (self.visible_pd_board is None and query
+                and not getattr(self, '_running', False)
+                and hasattr(self, 'telemetry_capabilities')):
+            try:
+                self.telemetry_capabilities()
+            except Exception:
+                pass
+        if self.visible_pd_board:
+            raise RuntimeError(f'{what} needs the system mainboard; this master '
+                               f'runs the visible-PD build (638 only)')
+
+    def _session_boards_for(self, boards):
+        """The laser boards a manual session powers."""
+        visible = self.visible_pd_board
+        if boards is None:
+            return (638,) if visible else (638, 1550)
+        boards = tuple(sorted({int(board) for board in boards}))
+        if not boards or not set(boards) <= {638, 1550}:
+            raise ValueError('boards must be a non-empty subset of (638, 1550)')
+        if visible and 1550 in boards:
+            raise RuntimeError('This master runs the visible-PD build; it has no 1550')
+        return boards
+
     def stop_system_confirmed(self, timeout_s=1.0):
         """Request global IDLE and verify firmware state; never infer it from UI.
 
@@ -457,6 +501,7 @@ class SystemControlMixin:
         """
         self._system_manual_active = False
         self._system_manual_owned = set()
+        self._session_boards = None
         self._keepalive_ms = 0
         self._auto_1550 = False
         self._ensure_connected()
@@ -514,6 +559,7 @@ class SystemControlMixin:
     def start_confirmed(self, timeout_s=1.0):
         """Recover via confirmed IDLE, then submit BOOT; does not promise a lock."""
         self.stop_system_confirmed(timeout_s)
+        self._require_system_board('Starting the box')
         remaining = .2 - (time.monotonic_ns() - self._last_manual_rail_off_ns) / 1e9
         if remaining > 0:
             time.sleep(remaining)
@@ -523,13 +569,16 @@ class SystemControlMixin:
         return result
 
     def begin_system_manual(self, timeout_s=1.0, optical_diagnostics=False,
-                            keepalive_ms=KEEPALIVE_MS):
-        """Power both boards with START low and take both laser DACs at zero.
+                            keepalive_ms=KEEPALIVE_MS, boards=None):
+        """Power the laser boards with START low and take their DACs at zero.
 
-        The last step arms the master's keepalive: if the host then sends
-        nothing for *keepalive_ms*, the master powers everything down.
-        ``renew_system_manual`` feeds it. A master without the keepalive
-        rejects the session.
+        *boards* is ``None`` (every board this master drives: both on the
+        system build, the 638 alone on the visible-PD build) or an explicit
+        tuple; asking a visible-PD master for the 1550 raises before
+        override. The last step arms the master's keepalive: if the host
+        then sends nothing for *keepalive_ms*, the master powers everything
+        down. ``renew_system_manual`` feeds it. A master without the
+        keepalive rejects the session.
         """
         if self.system_manual_active:
             return self.system_manual_readback(timeout_s)
@@ -538,16 +587,18 @@ class SystemControlMixin:
             self.enable_optical_diagnostics(timeout_s)
         else:
             self.enable_telemetry(timeout_s)
+        boards = self._session_boards_for(boards)
         remaining = .2 - (time.monotonic_ns() - self._last_manual_rail_off_ns) / 1e9
         if remaining > 0:
             time.sleep(remaining)
         self._system_manual_owned = set()
         try:
             self._send_confirmed(CMD_OVERRIDE_ENTER, wValue=1, timeout_s=timeout_s)
+            # START low on both, whatever the build (both accept it).
             for target in (638, 1550):
                 self._send_confirmed(CMD_TRIGGER, wValue=0, wIndex=target, timeout_s=timeout_s)
             power_times = {}
-            for target in (638, 1550):
+            for target in boards:
                 ack = self._send_confirmed(CMD_POWER, wValue=1, wIndex=target, timeout_s=timeout_s)
                 power_times[target] = ack['bulk_write_completed_monotonic_ns']
             time.sleep(1.25)
@@ -556,7 +607,7 @@ class SystemControlMixin:
                 snapshot = self.telemetry
                 if snapshot is not None and not snapshot.host_stale:
                     ready = True
-                    for target in (638, 1550):
+                    for target in boards:
                         b = getattr(snapshot, f'board_{target}')
                         age = b.temperature_age_ms + snapshot.host_age_s * 1000
                         elapsed = (time.monotonic_ns() - power_times[target]) / 1e6
@@ -568,9 +619,12 @@ class SystemControlMixin:
                         break
                 time.sleep(.01)
             else:
-                raise TimeoutError('Both boards did not produce fresh post-power temperatures')
+                names = ' and '.join(f'{target}' for target in boards)
+                raise TimeoutError(f'The {names} board{"s" if len(boards) > 1 else ""} '
+                                   f'did not produce fresh post-power temperatures')
             self._system_manual_active = True
-            for target in (638, 1550):
+            self._session_boards = boards
+            for target in boards:
                 try:
                     self.system_manual_command(target, MANUAL_TAKE, CHANNEL_LASER_DAC, 0, timeout_s)
                 except Exception as exc:
@@ -600,6 +654,7 @@ class SystemControlMixin:
             raise RuntimeError('A manual session is already open')
         if not getattr(self, 'streaming', False):
             raise RuntimeError('An active stream is required for take-over')
+        self._require_system_board('Take-over of a locked box', query=False)
         cap = self.read_optical_cap_638(timeout_s)['max_dac']
         if type(dac) is not int or not 0 <= dac <= cap:
             raise ValueError(f'638 DAC must be an integer 0..{cap}')
@@ -608,6 +663,7 @@ class SystemControlMixin:
             self._send_confirmed(CMD_OVERRIDE_ENTER, wValue=1, timeout_s=timeout_s)
             self._running = False
             self._system_manual_active = True
+            self._session_boards = (638, 1550)
             self._auto_1550 = True
             self._arm_keepalive(keepalive_ms, timeout_s)
             self._send_confirmed(CMD_TRIGGER, wValue=0, wIndex=638, timeout_s=timeout_s)
@@ -637,6 +693,7 @@ class SystemControlMixin:
             raise RuntimeError('Open a system manual session first')
         if getattr(self, '_auto_1550', False):
             return
+        self._require_system_board('Running the 1550', query=False)
         target_c = require_applied(self.system_manual_command(
             1550, MANUAL_GET, CHANNEL_TEMPERATURE, timeout_s=timeout_s)).applied_value / 1000.0
         for channel in (CHANNEL_LASER_DAC, CHANNEL_TEMPERATURE):
@@ -750,6 +807,7 @@ class SystemControlMixin:
             raise RuntimeError('Close the open manual session before a probe sweep')
         if not getattr(self, 'streaming', False):
             raise RuntimeError('An active stream is required for a probe sweep')
+        self._require_system_board('The probe sweep')
         settle_n = round(settle_s * SAMPLE_RATE)
         dwell_n = round(dwell_s * SAMPLE_RATE)
         if dwell_n > self.buffer_capacity // 2:
@@ -812,6 +870,9 @@ class SystemControlMixin:
             raise RuntimeError('Open a system manual session first')
         if target not in (638, 1550):
             raise ValueError('Unknown laser board')
+        boards = getattr(self, '_session_boards', None)
+        if boards is not None and target not in boards:
+            raise RuntimeError(f'The {target} board is not part of this session')
         if target == 1550 and getattr(self, '_auto_1550', False):
             raise RuntimeError('The 1550 runs on its own firmware in this session')
         if channel >= CHANNEL_OPTICAL and target != 638:
@@ -861,7 +922,10 @@ class SystemControlMixin:
 
     def system_manual_readback(self, timeout_s=1.0):
         result = {}
-        for target in ((638,) if getattr(self, '_auto_1550', False) else (638, 1550)):
+        boards = getattr(self, '_session_boards', None) or (638, 1550)
+        for target in boards:
+            if target == 1550 and getattr(self, '_auto_1550', False):
+                continue
             result[target] = {
                 'temperature': self.system_manual_command(target, MANUAL_GET, CHANNEL_TEMPERATURE, timeout_s=timeout_s),
                 'laser': self.system_manual_command(target, MANUAL_GET, CHANNEL_LASER_DAC, timeout_s=timeout_s),

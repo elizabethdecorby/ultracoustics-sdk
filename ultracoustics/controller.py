@@ -286,9 +286,13 @@ class Controller(SystemControlMixin):
         if self._stream is None or not self._stream.running:
             raise RuntimeError("call begin_stream() before querying capabilities")
         from ._internal.protocol import pack_command
-        return self._stream.query_stream_capabilities(
+        capabilities = self._stream.query_stream_capabilities(
             pack_command(CMD_STREAM_CAPABILITIES, 0, 0), timeout_s=timeout_s,
         )
+        # Kept: which build the master runs (visible_pd_board) decides what
+        # a manual session powers and which tests may run at all.
+        self._capabilities = capabilities
+        return capabilities
 
     def enable_telemetry(self, timeout_s: float = 1.0):
         """Explicitly negotiate stream format 1 and return its first snapshot.
@@ -427,6 +431,8 @@ class Controller(SystemControlMixin):
         metrics = self.runtime_metrics(timeout_s=timeout_s)
         if metrics.current_state != 0:
             raise RuntimeError(f"master did not confirm IDLE (state={metrics.current_state})")
+        if target == TARGET_1550:
+            self._require_system_board("Manual control of the 1550")
         # The 1550 slave does not reliably reset across an immediate rail
         # off/on transition.  Preserve the programmer-proven minimum physical
         # off interval before any override or power-on command.
@@ -517,6 +523,8 @@ class Controller(SystemControlMixin):
         self._ensure_connected()
         if not self._streaming:
             self.begin_stream()
+        # From the cached profile only; otherwise the firmware refuses S.
+        self._require_system_board("Starting the box", query=False)
         if self._last_manual_rail_off_ns is not None:
             elapsed_ns = max(
                 0, time.monotonic_ns() - self._last_manual_rail_off_ns)

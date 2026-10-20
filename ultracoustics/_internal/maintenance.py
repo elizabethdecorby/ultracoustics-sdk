@@ -94,6 +94,9 @@ class Programmer:
     MASTER_MAGIC_BYTES         = b"UCBT"   # FW_MAGIC_BYTES
     MASTER_MAGIC_HEADER_VER    = 1         # FW_MAGIC_HEADER_VERSION
     MASTER_TARGET_ID           = 0x0001    # FW_TARGET_MASTER_BOOT_H7RS
+    #: Master builds by IAP target id (firmware_info.h). The visible-PD build
+    #: runs the separate 638 noise-test mainboard (docs/VISIBLE_PD_BOARD.md).
+    MASTER_TARGET_IDS          = {0x0001: "system", 0x0002: "visible_pd"}
     MASTER_MAGIC_SCAN_BYTES    = 4096      # FW_MAGIC_SCAN_BYTES
     MASTER_MAGIC_STRUCT_SIZE   = 16        # sizeof(fw_magic_t)
 
@@ -111,6 +114,11 @@ class Programmer:
         Scans the first ``MASTER_MAGIC_SCAN_BYTES`` of the image on a
         4-byte alignment for the ``UCBT`` tag, then checks header version
         and target id.
+
+        Returns
+        -------
+        str
+            The image's build: ``"system"`` or ``"visible_pd"``.
 
         Raises
         ------
@@ -137,18 +145,18 @@ class Programmer:
                     f"supported by this SDK (expected "
                     f"{cls.MASTER_MAGIC_HEADER_VER})."
                 )
-            if target_id != cls.MASTER_TARGET_ID:
+            if target_id not in cls.MASTER_TARGET_IDS:
                 raise ValueError(
                     f"Firmware target_id=0x{target_id:04X} does not match "
-                    f"this device (expected 0x{cls.MASTER_TARGET_ID:04X} "
-                    f"= master Boot for STM32H7RS)."
+                    f"this device (expected 0x0001 = master Boot for "
+                    f"STM32H7RS, or 0x0002 = its visible-PD build)."
                 )
             if image_size != 0 and image_size != len(firmware):
                 raise ValueError(
                     f"Firmware magic image_size={image_size} disagrees with "
                     f"file size {len(firmware)}."
                 )
-            return  # valid
+            return cls.MASTER_TARGET_IDS[target_id]
 
         raise ValueError(
             "No 'UCBT' magic header found in the first "
@@ -179,15 +187,29 @@ class Programmer:
 
     # -- Board 1: Master (IAP) ------------------------------------------------
 
-    def flash_master(self, firmware: bytes, progress_callback=None):
+    def _running_profile(self):
+        """The connected master's build (``"system"``/``"visible_pd"``), or
+        ``None`` if it does not answer."""
+        try:
+            return DiagnosticsManager(self._conn).query_firmware_info().get("profile")
+        except Exception:
+            return None
+
+    def flash_master(self, firmware: bytes, progress_callback=None,
+                     allow_profile_change=False):
         """Flash firmware to Board 1 (Master) via In-Application Programming.
 
         The device will reset after a successful commit; the USB connection
         will be lost.
 
+        A visible-PD image goes only onto a board already running the
+        visible-PD build (a system board's firmware refuses it too). A system
+        image goes onto a visible-PD board only with *allow_profile_change*.
+
         Args:
             firmware: Raw .bin contents (≤ 64 KB).
             progress_callback: Optional ``callback(page_num, total_pages)``.
+            allow_profile_change: Allow a system image onto a visible-PD board.
         """
         fw = bytearray(firmware)
         fw_size = len(fw)
@@ -200,7 +222,20 @@ class Programmer:
         # the wrong product, etc.) BEFORE we touch the device.  See
         # Boot/Core/Src/iap_receiver.c::iap_validate_magic for the device-side
         # check that backs this up.
-        self._validate_master_magic(bytes(fw))
+        image_profile = self._validate_master_magic(bytes(fw))
+        running = self._running_profile()
+        if image_profile == "visible_pd" and running != "visible_pd":
+            raise ValueError(
+                "This is the visible-PD master build and the connected board "
+                + ("runs the system build" if running == "system"
+                   else "did not report its build")
+                + ". Install it on the visible-PD board over SWD first "
+                "(docs/VISIBLE_PD_BOARD.md).")
+        if (image_profile == "system" and running == "visible_pd"
+                and not allow_profile_change):
+            raise ValueError(
+                "The connected board runs the visible-PD build. Pass "
+                "allow_profile_change=True to put the system build on it.")
 
         # Pad to 16-byte alignment (quad-word flash programming unit)
         pad = (16 - (fw_size % 16)) % 16
@@ -442,19 +477,31 @@ class DiagnosticsManager:
         -------
         dict
             ``master_fw``, ``fw_1550``, ``fw_638`` (version dicts or None),
-            ``identity`` (``{"main"|"1550"|"638": IdentityResult or None}``)
-            and ``errors`` (``{name: message}``).
+            ``identity`` (``{"main"|"1550"|"638": IdentityResult or None}``),
+            ``errors`` (``{name: message}``) and ``skipped`` (queries not
+            sent: the 1550 ones on a visible-PD master).
         """
         info = {"master_fw": None, "fw_1550": None, "fw_638": None,
                 "identity": {"main": None, "1550": None, "638": None},
-                "errors": {}}
-        queries = [
-            ("master_fw", lambda: self.query_firmware_info()),
-            ("fw_1550", lambda: self.query_slave_version(TARGET_1550)),
-            ("fw_638", lambda: self.query_slave_version(TARGET_638)),
-        ]
+                "errors": {}, "skipped": {}}
+        try:
+            info["master_fw"] = self.query_firmware_info()
+        except Exception as exc:  # keep going; report per item
+            info["errors"]["master_fw"] = str(exc)
+        # The visible-PD build has no 1550 and refuses its queries.
+        visible = (info["master_fw"] or {}).get("profile") == "visible_pd"
+        queries = []
+        if visible:
+            info["skipped"]["fw_1550"] = "no 1550 on the visible-PD board"
+            info["skipped"]["identity_1550"] = "no 1550 on the visible-PD board"
+        else:
+            queries.append(("fw_1550",
+                            lambda: self.query_slave_version(TARGET_1550)))
+        queries.append(("fw_638", lambda: self.query_slave_version(TARGET_638)))
         for name, target in (("main", TARGET_MAIN), ("1550", TARGET_1550),
                              ("638", TARGET_638)):
+            if visible and target == TARGET_1550:
+                continue
             queries.append((f"identity_{name}",
                             lambda t=target: self.read_identity(t)))
         for name, query in queries:
@@ -562,12 +609,16 @@ class DiagnosticsManager:
             if chunk is None or len(chunk) != expected_len:
                 continue
             version_str = chunk[:32].rstrip(b"\x00\xff").decode("ascii", errors="replace")
-            build_date, hw_rev, _ = struct.unpack_from("<IHH", chunk, 32)
+            build_date, hw_rev, profile = struct.unpack_from("<IHH", chunk, 32)
             build_dt = datetime.fromtimestamp(build_date, tz=MST) if build_date else None
             return {
                 "version": version_str,
                 "build_date": build_dt,
                 "hardware_rev": hw_rev,
+                # Was padding (always 0), so older firmware reads as system.
+                "build_profile": profile,
+                "profile": {0: "system", 1: "visible_pd"}.get(
+                    profile, f"unknown({profile})"),
             }
         raise TimeoutError("No firmware info response received.")
 

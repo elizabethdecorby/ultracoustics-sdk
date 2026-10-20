@@ -42,6 +42,9 @@ LINK_OVERFLOW = 1 << 1
 LINK_DECODE_ERROR = 1 << 2
 LINK_IDENTITY_ERROR = 1 << 3
 LINK_UNAVAILABLE = 1 << 15
+#: UTCP capability bit 3: the master runs the visible-PD build (638 only, no
+#: 1550 or fans; docs/VISIBLE_PD_BOARD.md).
+CAP_VISIBLE_PD_BOARD = 1 << 3
 
 _CANONICAL = struct.Struct("<HHIIiIIHHHHIIHhHbBHH")
 assert _CANONICAL.size == CANONICAL_SNAPSHOT_BYTES
@@ -67,6 +70,11 @@ class StreamCapabilities:
     @property
     def supports_format2(self) -> bool:
         return bool(self.capability_flags & 4)
+
+    @property
+    def visible_pd_board(self) -> bool:
+        """The master runs the visible-PD build: 638 only, no 1550 or fans."""
+        return bool(self.capability_flags & CAP_VISIBLE_PD_BOARD)
 
 
 def parse_capabilities(raw) -> StreamCapabilities:

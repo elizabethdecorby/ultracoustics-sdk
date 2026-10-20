@@ -113,12 +113,10 @@ class PowerCalibration:
                         f"PD count {pd} has ambiguous meter readings")
                 continue
             collapsed.append((pd, mw))
-        for (pd0, mw0), (pd1, mw1) in zip(collapsed, collapsed[1:]):
-            if pd0 == pd1:
-                raise AssertionError("duplicate PD counts were not collapsed")
-            if mw1 <= mw0:
-                raise PowerCalibrationError(
-                    "measured power must increase strictly with PD counts")
+        # The meter reading need not rise with the PD counts: a mode hop can
+        # leave it flat or falling while the internal PD rises. Each PD count
+        # still maps to one measured power, and power_mw interpolates between
+        # the points as measured.
         if len(collapsed) < 2:
             raise PowerCalibrationError("at least two unique PD counts are required")
         return collapsed

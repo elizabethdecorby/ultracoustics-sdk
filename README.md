@@ -233,10 +233,16 @@ override, and the laser boards' 1-second leases on each channel the PC owns.
 (START low, leased channels) or automatic (START high, its own firmware).
 
 - `begin_system_manual(timeout_s=1.0, optical_diagnostics=False,
-  keepalive_ms=2000)` powers both boards with START low and both DACs taken
-  at 0. Its last step arms the master keepalive (command `K`): if the PC then
+  keepalive_ms=2000, boards=None)` powers the laser boards with START low
+  and their DACs taken at 0: both on the system mainboard, the 638 alone on
+  the visible-PD mainboard (`boards=None`), or an explicit `boards=(638,)`.
+  Its last step arms the master keepalive (command `K`): if the PC then
   sends nothing for `keepalive_ms`, the master powers everything down
   (white ×4). A master without `K` refuses the session.
+- The 638 noise test's separate visible-PD mainboard runs its own master
+  build (`docs/VISIBLE_PD_BOARD.md`). `visible_pd_board` and
+  `laser_boards` say which build is connected; starting the box, take-over,
+  the 1550, the probe sweep and the FP scan are refused on it.
 - `renew_system_manual()` renews every lease, which also feeds the
   keepalive. Call it at least every 0.5 s.
 - `start_1550_automatic(warmup_s=10.0)` hands the 1550 back to its own

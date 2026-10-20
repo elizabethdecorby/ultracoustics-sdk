@@ -39,6 +39,14 @@ class PowerCalibrationTests(unittest.TestCase):
         with self.assertRaisesRegex(PowerCalibrationError, "ambiguous"):
             value.power_mw(0)
 
+    def test_power_need_not_rise_with_pd_counts(self):
+        value = calibration()
+        value.points[6].measured_mw = 4.0    # below point 5's 5.0 mW
+        value.points[7].measured_mw = 4.0    # flat
+        self.assertTrue(value.complete)
+        self.assertAlmostEqual(value.power_mw(550), 4.5)
+        self.assertAlmostEqual(value.power_mw(650), 4.0)
+
     def test_incomplete_or_unsafe_points_never_make_curve(self):
         mutations = (lambda p: setattr(p[0], "measured_mw", None),
                      lambda p: setattr(p[0], "measured_mw", math.nan),
