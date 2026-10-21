@@ -14,9 +14,11 @@ from ._internal.control import (
 )
 from ._internal.protocol import (
     CMD_BOOT, CMD_KEEPALIVE, CMD_OVERRIDE_ENTER, CMD_POWER, CMD_TRIGGER,
-    CMD_STARTUP_1550, pack_command,
+    CMD_STARTUP_1550, CMD_IDENTITY_READ, CMD_IDENTITY_WRITE, pack_command,
 )
 from ._internal.optical_diagnostics import OpticalTrace
+from . import identity as _identity
+from . import tec_tuning as _tuning
 from .characterization import ProbeCharacterizationResult
 from .config import ADC_MAX_VALUE, SAMPLE_RATE
 
@@ -33,9 +35,8 @@ CHANNEL_PROFILE_ID = 12
 CHANNEL_TRACE_CONFIG = 13
 NORMALIZED_PI_VERSION = 1
 NORMALIZED_PI_MAX_KI_PER_S = 0x3fff / 10.0
-NORMALIZED_PI_INFO_MASKS = {1: 0x7ff, 2: 0x3fffff}  # contract version -> defined info bits
-NORMALIZED_PI_STORAGE = 1 << 17  # info: on-box gain storage (STORAGE_SPEC.md); bits 18-21 need it
-NORMALIZED_PI_COMMIT_S = 1.0     # store/clear: wait for the flash write (ms on the 638)
+NORMALIZED_PI_INFO_MASKS = {1: 0x7ff, 2: 0xfffff}  # contract version -> defined info bits
+NORMALIZED_PI_RECORD = 1 << 17  # info: lock gains read from the tuning record; bits 18-19 need it
 NORMALIZED_PI_V2_MAX_KP = 1023 * 5 / 1000.0      # 0.005 steps
 NORMALIZED_PI_V2_MAX_KI_PER_S = 0x3fff            # integer 1/s
 NORMALIZED_PI_V2_MAX_ZERO_HZ = 63
@@ -221,15 +222,15 @@ class SystemControlMixin:
         require_applied(reply)
         raw = reply.applied_value
         mask = NORMALIZED_PI_INFO_MASKS.get(raw & 255) if raw >= 0 else None
-        if mask is not None and not raw & NORMALIZED_PI_STORAGE:
-            mask &= 0x3ffff  # stored/pending bits are defined only with storage support
-        if mask is None or raw & ~mask:
+        if mask is not None and not raw & NORMALIZED_PI_RECORD:
+            mask &= 0x3ffff  # record active/rejected are defined only with record support
+        # A record's lock gains are either the box defaults or rejected, never both.
+        if mask is None or raw & ~mask or ((raw >> 18) & 3) == 3:
             raise RuntimeError(f'638 returned unsupported normalized PI contract {raw}')
         return {'version': raw & 255, 'active': bool(raw & 256),
                 'overridden': bool(raw & 512), 'slope_valid': bool(raw & 1024),
-                'zero_hz': (raw >> 11) & 63, 'storage_supported': bool(raw & NORMALIZED_PI_STORAGE),
-                'stored_active': bool(raw & 1 << 18), 'save_pending': bool(raw & 1 << 19),
-                'clear_pending': bool(raw & 1 << 20), 'last_write_failed': bool(raw & 1 << 21)}
+                'zero_hz': (raw >> 11) & 63, 'record_supported': bool(raw & NORMALIZED_PI_RECORD),
+                'record_active': bool(raw & 1 << 18), 'record_rejected': bool(raw & 1 << 19)}
 
     def read_normalized_pi_638(self, timeout_s=1.0):
         """Read the explicit symmetric normalized PI pair, second-integrator zero and law."""
@@ -286,67 +287,146 @@ class SystemControlMixin:
         return result
 
     def restore_normalized_pi_638(self, timeout_s=1.0):
-        """Restore the box defaults (stored record, else compiled profile); verify control stays active."""
+        """Restore the box defaults (tuning record lock gains over the compiled profile); verify control stays active."""
         info = self._normalized_pi_info_638(timeout_s)
         if not info['active'] or not info['slope_valid']:
             raise RuntimeError('638 normalized PI must be active with a valid slope before restore')
         require_applied(self._normalized_pi_command_638(
             MANUAL_SET, CHANNEL_NORMALIZED_PI_INFO, 0, timeout_s))
         result = self.read_normalized_pi_638(timeout_s)
-        # The compiled profile has no second integrator; a stored record may.
+        # The compiled profile has no second integrator; a tuning record may.
         if (not result['active'] or result['overridden'] or
-                (result['zero_hz'] and not result['stored_active'])):
+                (result['zero_hz'] and not result['record_active'])):
             raise RuntimeError('638 normalized PI verification failed after restore')
         return result
 
-    def _normalized_pi_storage_638(self, action, timeout_s):
-        info = self._normalized_pi_info_638(timeout_s)
-        if not info['storage_supported']:
-            raise RuntimeError('638 firmware does not support on-box normalized PI storage')
-        if not info['active'] or not info['slope_valid']:
-            raise RuntimeError('638 normalized PI must be active with a valid slope before storage changes')
-        require_applied(self._normalized_pi_command_638(
-            MANUAL_SET, CHANNEL_NORMALIZED_PI_INFO, action, timeout_s))
-        deadline = time.monotonic() + NORMALIZED_PI_COMMIT_S
-        while True:  # the 638 main loop writes the record right after the SET
-            info = self._normalized_pi_info_638(timeout_s)
-            if not (info['save_pending'] or info['clear_pending']) or time.monotonic() >= deadline:
-                break
-            time.sleep(0.02)
-        result = self.read_normalized_pi_638(timeout_s)
-        what = 'store' if action == 1 else 'clear'
-        if result['save_pending'] or result['clear_pending']:
-            raise RuntimeError(f'638 normalized PI {what} still pending after {NORMALIZED_PI_COMMIT_S:g} s')
-        if result['last_write_failed']:
-            raise RuntimeError(f'638 normalized PI {what}: flash write failed '
-                               '(no free record slot or write/read-back error); previous state kept')
-        if result['stored_active'] != (action == 1):
-            raise RuntimeError(f'638 normalized PI {what}: stored gains '
-                               + ('not active after the write' if action == 1 else 'still active after the write'))
-        if not result['active']:
-            raise RuntimeError(f'638 normalized PI verification failed after {what}')
-        return result
+    # -- Lock PI gains in the 638 tuning record (docs/TEC_TUNING.md) --------
 
-    def store_normalized_pi_638(self, timeout_s=1.0):
-        """Save the active gains (override or box defaults) on the box; see STORAGE_SPEC.md.
+    def _tuning_exchange_638(self, tuning=None, timeout_s=8.0):
+        """Read ('n') or write ('N') the 638 tuning record on this connection.
 
-        The 638 writes the record right away; this waits for save_pending to drop
-        and requires stored_active without last_write_failed (RuntimeError with the
-        reason otherwise). Returns the final readback: the gains written. After
-        STOP and START they are the box defaults (stored_active, not overridden).
-        Requires storage support and normalized PI active (LOCKED).
+        The stream owns the USB device, so the mainboard's reply comes back
+        through it. Returns the TuningResult (OK or EMPTY); RuntimeError
+        otherwise.
         """
-        return self._normalized_pi_storage_638(1, timeout_s)
+        what = 'read' if tuning is None else 'write'
+        if getattr(self, '_running', False):
+            raise RuntimeError('638 tuning record access needs the mainboard in IDLE; STOP first')
+        if self.system_manual_active:
+            raise RuntimeError('Finish the manual session before 638 tuning record access '
+                               '(the mainboard power-cycles the laser boards and returns to IDLE)')
+        if self._stream is None or not self._stream.running:
+            raise RuntimeError('call begin_stream() before 638 tuning record access')
+        command = CMD_IDENTITY_READ if tuning is None else CMD_IDENTITY_WRITE
+        record = b'' if tuning is None else _tuning.build_record(tuning)
+        try:
+            raw = self._stream._request_stream_control(
+                pack_command(command, _tuning.KIND, 638) + record, 'record',
+                timeout_s=timeout_s + 0.5, response_timeout_s=timeout_s)['firmware_response']
+        except TransportUncertainError:
+            raise
+        except RuntimeError as exc:
+            if 'response timed out' not in str(exc):
+                raise
+            raise RuntimeError(f'638 tuning record {what}: no reply; the mainboard refused the '
+                               'command (busy, or firmware without board records)') from exc
+        try:
+            result = _tuning.parse_reply(raw)
+        except _tuning.TuningError as exc:  # incl. an identity reply from older mainboard firmware
+            raise RuntimeError(f'638 tuning record {what}: {exc}') from exc
+        if (result.op, result.target) != (_identity.OP_READ if tuning is None else _identity.OP_WRITE, 638):
+            raise RuntimeError(f'638 tuning record {what}: the reply does not match the request')
+        if result.status in (_identity.STATUS_OK, _identity.STATUS_EMPTY):
+            return result
+        reason = {_identity.STATUS_NO_RESPONSE: 'the 638 did not answer (no board, or a '
+                                                'bootloader without tuning-record support)',
+                  _identity.STATUS_BAD_STATE: 'the mainboard is not in IDLE or OVERRIDE; STOP first',
+                  _identity.STATUS_BAD_KIND: 'the mainboard firmware does not support tuning records',
+                  }.get(result.status, 'failed')
+        raise RuntimeError(f'638 tuning record {what}: {reason} ({result.status_name})')
 
-    def clear_stored_normalized_pi_638(self, timeout_s=1.0):
-        """Forget the stored gains; see STORAGE_SPEC.md.
+    @staticmethod
+    def _tuning_readback(result):
+        stored = result.record
+        tuning = stored.tuning if stored is not None else _tuning.TecTuning(board=_tuning.BOARD_638)
+        rejected = [f'{group} fields rejected: {reason}' for group, reason in (
+            ('TEC', stored and stored.rejected), ('lock', stored and stored.lock_rejected)) if reason]
+        return dict({name: getattr(tuning, name) for name in
+                     _tuning.LOCK_FIELDS + _tuning.TEC_FIELDS + ('tuned_at', 'report_id')},
+                    stored=stored is not None, sequence=None if stored is None else stored.seq,
+                    rejected='; '.join(rejected) or None)
 
-        The 638 writes the tombstone right away; this waits for clear_pending to
-        drop and requires stored_active False without last_write_failed. From the
-        next STOP and START the box defaults are the compiled profile. Requires
-        storage support and normalized PI active (LOCKED).
+    def read_tuning_638(self, timeout_s=8.0):
+        """Read the 638's tuning record (lock PI gains and TEC fields) on this connection.
+
+        Needs the mainboard in IDLE (STOP first) and no manual session. The
+        mainboard power-cycles the 638 into its bootloader for the read and
+        pauses the ADC stream; no other command may run meanwhile. Returns
+        ``stored`` (a valid record is stored), ``lock_kp``, ``lock_ki_per_s``,
+        ``lock_zero_hz``, the TEC fields (``kp``, ``ki``, ``kd``,
+        ``integrator_limit``, ``setpoint_filter``,
+        ``conditional_integration``), ``tuned_at``, ``report_id``,
+        ``sequence`` and ``rejected``: None, or why the 638 would ignore the
+        record's TEC fields and/or its lock fields. None means "not set".
+        RuntimeError outside IDLE/OVERRIDE, without tuning support (older
+        mainboard firmware, or a 638 bootloader without the tuning opcodes)
+        and on any other failure.
         """
-        return self._normalized_pi_storage_638(2, timeout_s)
+        return self._tuning_readback(self._tuning_exchange_638(timeout_s=timeout_s))
+
+    def _write_lock_fields_638(self, lock, report_id, timeout_s):
+        tuning = _tuning.TecTuning(board=_tuning.BOARD_638, tuned_at=int(time.time()),
+                                   report_id=report_id, **lock)
+        _tuning.validate(tuning)  # before anything is sent
+        stored = self._tuning_exchange_638(timeout_s=timeout_s)
+        tuning = _tuning.keep_stored(tuning, stored.record, 'tec')
+        time.sleep(_tuning.RMW_GAP_S)
+        result = self._tuning_exchange_638(tuning, timeout_s)
+        sent = _tuning.parse_record(_tuning.build_record(tuning)).tuning
+        if (result.status != _identity.STATUS_OK or result.record is None
+                or not _tuning.same_record(result.record.tuning, sent)):
+            raise RuntimeError('638 tuning record write: the read-back record differs from '
+                               'the one written (VERIFY_FAIL)')
+        return self._tuning_readback(result)
+
+    def write_lock_tuning_638(self, kp, ki_per_s, zero_hz=0, report_id=None, timeout_s=15.0):
+        """Store lock PI gains in the 638's tuning record; return the read-back record.
+
+        Read-modify-write: the stored TEC fields are kept (a stored group the
+        firmware rejects is dropped; it ignores it either way). The gains must
+        lie on the normalized PI contract v2 wire grid (Kp 0..5.115 in 0.005
+        steps, Ki an integer 0..16383 per s, zero_hz an integer 0..63), so
+        channel 10 later reads back exactly these values; ValueError before
+        anything is sent otherwise. *report_id* (at most 24 bytes) and the
+        write time are stored for traceability. Same preconditions and errors
+        as :meth:`read_tuning_638`; *timeout_s* bounds each mainboard reply.
+
+        The 638 applies the gains as its box defaults at its next start-up:
+        after START, :meth:`read_normalized_pi_638` shows ``record_active``,
+        not ``overridden``, and these gains. Returns the dict of
+        :meth:`read_tuning_638` for the record as read back after the write.
+        """
+        for name, value, step, high in (('Kp', kp, 0.005, NORMALIZED_PI_V2_MAX_KP),
+                                        ('Ki', ki_per_s, 1, NORMALIZED_PI_V2_MAX_KI_PER_S)):
+            if (type(value) not in (int, float) or not math.isfinite(value) or
+                    not 0 <= value <= high or abs(value / step - round(value / step)) > 1e-6):
+                raise ValueError('Lock PI gains need Kp 0..5.115 in 0.005 steps and Ki an '
+                                 f'integer 0..16383 per second (the contract v2 wire grid); {name} {value!r}')
+        if type(zero_hz) is not int or not 0 <= zero_hz <= NORMALIZED_PI_V2_MAX_ZERO_HZ:
+            raise ValueError('Lock PI zero_hz must be an integer 0..63')
+        return self._write_lock_fields_638(
+            {'lock_kp': round(kp / 0.005) * 5 / 1000.0, 'lock_ki_per_s': float(round(ki_per_s)),
+             'lock_zero_hz': zero_hz}, report_id, timeout_s)
+
+    def clear_lock_tuning_638(self, report_id=None, timeout_s=15.0):
+        """Remove the lock PI gains from the 638's tuning record; return the read-back record.
+
+        Read-modify-write: the stored TEC fields are kept. From its next
+        start-up the 638 runs its compiled profile lock gains
+        (``record_active`` False). Same preconditions, errors and return value
+        as :meth:`write_lock_tuning_638`.
+        """
+        return self._write_lock_fields_638({}, report_id, timeout_s)
 
     def read_profile_638(self, timeout_s=1.0):
         """Read the compiled box profile identity from the 638 board."""

@@ -72,6 +72,7 @@ from .control import (ControlProtocolError, parse_manual_response,
                       parse_runtime_metrics)
 from .startup_illumination import (StartupIlluminationProtocolError,
                                    parse_startup_illumination)
+from ..identity import IdentityError, reply_header
 
 
 def parse_attached_record(raw, current_format, received_monotonic_ns):
@@ -404,8 +405,11 @@ def reader_main(
             if isinstance(item, tuple):
                 if len(item) == 2:
                     request_id, payload = item
-                elif len(item) == 4:
-                    request_id, payload, response_kind, requested_format = item
+                elif len(item) in (4, 5):
+                    request_id, payload, response_kind, requested_format = item[:4]
+                    # Board record commands take seconds (the master power-cycles
+                    # a laser board), so they bring their own response bound.
+                    response_s = item[4] if len(item) == 5 else 0.75
                     is_control = True
                 else:
                     raise ValueError("invalid outbound queue item")
@@ -429,7 +433,7 @@ def reader_main(
                     {"transport_status": "delivered",
                      "transferred_bytes": len(payload),
                      "halt_cleared": False, "error": None},
-                    time.monotonic() + 0.75,
+                    time.monotonic() + response_s,
                 )
             result = _write_outbound_once(handle, payload, timeout_ms)
             if is_control and pending_control is None:
@@ -465,7 +469,7 @@ def reader_main(
             if status == usb1.TRANSFER_COMPLETED:
                 length = transfer.getActualLength()
                 raw = transfer.getBuffer()[:length]
-                if pending_control is not None and length in (16, 24, 32, 72):
+                if pending_control is not None and length in (16, 24, 32, 72, 140):
                     request_id, response_kind, requested_format, delivery, _deadline = pending_control
                     try:
                         if response_kind == "capabilities":
@@ -487,10 +491,13 @@ def reader_main(
                             response = parse_runtime_metrics(bytes(raw))
                         elif response_kind == "startup_1550":
                             response = parse_startup_illumination(bytes(raw))
+                        elif response_kind == "record":  # 'n'/'N' UTID reply, decoded by the caller
+                            reply_header(bytes(raw))
+                            response = bytes(raw)
                         else:
                             raise TelemetryFormatError("unknown pending control response")
                     except (TelemetryFormatError, ControlProtocolError,
-                            StartupIlluminationProtocolError) as exc:
+                            StartupIlluminationProtocolError, IdentityError) as exc:
                         delivery = {**delivery, "transport_status": "failed",
                                     "error": str(exc)}
                     else:
@@ -612,6 +619,15 @@ def reader_main(
         while not terminate_event.is_set():
             if pending_control is not None and time.monotonic() > pending_control[4]:
                 request_id, _kind, _format, delivery, _deadline = pending_control
+                if _kind == "record":
+                    # The master answers every record command it accepts, so
+                    # silence means it rejected this one, which stalls BULK OUT
+                    # (docs/BOARD_IDENTITY.md). Clear it so the next command
+                    # is not refused with PIPE.
+                    try:
+                        handle.clearHalt(BULK_OUT_EP)
+                    except Exception:  # noqa: BLE001
+                        pass
                 if command_ack_queue is not None:
                     command_ack_queue.put((request_id, {**delivery,
                         "transport_status": "failed",

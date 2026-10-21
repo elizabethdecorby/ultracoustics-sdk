@@ -567,14 +567,22 @@ class USBStream:
 
     def _request_stream_control(self, payload: bytes, response_kind: str,
                                 stream_format: Optional[int] = None,
-                                timeout_s: float = 1.0) -> dict:
-        """Send one request and wait for its validated firmware IN response."""
+                                timeout_s: float = 1.0,
+                                response_timeout_s: Optional[float] = None) -> dict:
+        """Send one request and wait for its validated firmware IN response.
+
+        The reader waits 0.75 s for the response unless *response_timeout_s*
+        says otherwise (board record commands take seconds).
+        """
         if not self._running or self._cmd_queue is None or self._command_ack_queue is None:
             raise RuntimeError("USBStream is not running; cannot request stream control")
         request_id = self._next_command_request_id
         self._next_command_request_id += 1
         enqueued_ns = time.monotonic_ns()
-        self._cmd_queue.put((request_id, payload, response_kind, stream_format))
+        item = (request_id, payload, response_kind, stream_format)
+        if response_timeout_s is not None:
+            item += (response_timeout_s,)
+        self._cmd_queue.put(item)
         deadline = time.monotonic() + timeout_s
         while True:
             remaining = deadline - time.monotonic()

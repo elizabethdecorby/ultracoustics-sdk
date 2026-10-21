@@ -1,6 +1,10 @@
+import struct
 import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
+from ultracoustics import identity as ident
+from ultracoustics import tec_tuning as tn
+from ultracoustics._internal import protocol
 from ultracoustics.system_control import SystemControlMixin
 from ultracoustics._internal.control import *
 class Fake(SystemControlMixin):
@@ -17,42 +21,58 @@ class Fake(SystemControlMixin):
   if opcode in (MANUAL_SET,MANUAL_TAKE):self.values[target,channel]=value
   if opcode==MANUAL_RELEASE and channel==3:self.values[target,channel]=0
   return SimpleNamespace(target=target,status=0,channel=channel,owner=1,applied_value=self.values.get((target,channel),25000 if channel==1 else 0))
-class StorageFake(Fake):
- """STORAGE_SPEC firmware (contract v2, REVISION 2026-10-21): ch11 SET 0 restore / 1 save / 2 clear.
- The 638 main loop writes a save/clear right after the SET: the first ch11 read still shows it
- pending, then it is committed (fail_write: bit 21, previous state kept). SET 0 cancels a change
- not yet committed. The record survives STOP/START (the master powers the 638 off in IDLE)."""
- COMPILED=(97,450,0)  # belycomm 0.483/449.8 on the wire grid: (kp/0.005, ki 1/s, zero Hz)
- def __init__(self,stored=None,fail_write=False):
+class RecordPIFake(Fake):
+ """Contract v2 638 that takes its box-default lock gains from the tuning record (LOCK_TUNING_RECORD.md):
+ channel 11 bit 17 always, bit 18 when the record's lock gains are the box defaults, bit 19 when
+ they were rejected (profile in use). Channel 11 SET 0 restores the box defaults; anything else BAD_VALUE."""
+ PROFILE=(97,450,0)  # belycomm 0.483/449.8 on the wire grid: (kp/0.005, ki 1/s, zero Hz)
+ def __init__(self,record=None,rejected=False):
   super().__init__();self._system_manual_active=False;self._system_manual_owned=set()
-  self.stored,self.pending,self.locked,self.fail_write,self.failed=stored,None,True,fail_write,False
+  self.record,self.rejected=record,rejected
   self.gains,self.over=self.box_defaults(),False
- def box_defaults(self):return self.stored or self.COMPILED
- def commit(self):
-  if self.pending and self.fail_write:self.failed=True
-  elif self.pending:self.stored=self.pending[1]
-  self.pending=None
- def stop_start(self):  # power-off in IDLE loses RAM state; START reloads the box defaults
-  self.pending,self.failed=None,False;self.gains,self.over=self.box_defaults(),False
+ def box_defaults(self):return self.record if self.record and not self.rejected else self.PROFILE
  def manual_command(self,target,opcode,channel,value=0,timeout_s=1):
   self.calls.append((target,opcode,channel,value));status=0
-  if opcode==MANUAL_SET and not self.locked:status=6
-  elif opcode==MANUAL_SET and channel==11:
-   if value==0:self.pending=None;self.gains,self.over=self.box_defaults(),False
-   elif value in (1,2):self.pending,self.failed=(('save',self.gains) if value==1 else ('clear',None)),False
-   else:status=6
+  if opcode==MANUAL_SET and channel==11:
+   if value:status=6
+   else:self.gains,self.over=self.box_defaults(),False
   elif opcode==MANUAL_SET and channel==10:
    if value<0 or (value>>30)!=1:status=6
    else:self.gains,self.over=((value>>14)&1023,value&0x3fff,(value>>24)&63),True
-  kind=self.pending and self.pending[0]
   if channel==11:
-   raw=(2|self.locked<<8|self.over<<9|self.locked<<10|self.gains[2]<<11|1<<17|bool(self.stored)<<18|
-        (kind=='save')<<19|(kind=='clear')<<20|self.failed<<21)
-   if opcode==MANUAL_GET:self.commit()
-  else:
-   raw=self.gains[0]<<14|self.gains[1]
-   if raw&(1<<23):raw-=1<<24
+   used=bool(self.record) and not self.rejected
+   raw=2|256|self.over<<9|1024|self.gains[2]<<11|1<<17|used<<18|(bool(self.record) and self.rejected)<<19
+  else:raw=self.gains[0]<<14|self.gains[1]
   return SimpleNamespace(target=target,status=status,channel=channel,owner=0,applied_value=raw)
+def utid(op,status,record=b'\xff'*128,kind=1):
+ return ident.REPLY_MAGIC+struct.pack('<BBHBBBB',ident.REPLY_SCHEMA,op,638,status,255,kind,0)+record
+def raw_638_record(payload,seq):
+ """A stored 638 tuning record with any payload bytes, bypassing the encoder's checks."""
+ header=tn.MAGIC+struct.pack('<BBHI',1,tn.BOARD_638,len(payload),seq)
+ raw=header+struct.pack('<I',ident.crc32_mpeg2(header+payload))+payload
+ return raw+b'\xff'*(128-len(raw))
+class RecordFake(Fake):
+ """The mainboard's 'n'/'N' relay (record kind 1) to the 638 bootloader's tuning store, answered
+ through the stream (docs/TEC_TUNING.md). The store assigns the sequence. mode: None,
+ 'old_master' (identity reply), 'old_boot' (NO_RESPONSE), 'busy' (BAD_STATE), 'silent' (no
+ reply), 'corrupt' (stores Ki - 1)."""
+ def __init__(self,record=None,mode=None):
+  super().__init__();self._running=False;self._system_manual_active=False;self._system_manual_owned=set()
+  self.record,self.mode,self.requests=record,mode,[]
+  self.seq=tn.parse_record(record).seq if record else 0
+  self._stream=SimpleNamespace(running=True,_request_stream_control=self.request)
+ def request(self,payload,kind,stream_format=None,timeout_s=1.0,response_timeout_s=None):
+  self.requests.append((payload[:5],payload[5:],kind,timeout_s,response_timeout_s))
+  op=ident.OP_WRITE if payload[0]==protocol.CMD_IDENTITY_WRITE else ident.OP_READ
+  if self.mode=='silent':raise RuntimeError('stream-control request failed (firmware control response timed out)')
+  status={'old_boot':ident.STATUS_NO_RESPONSE,'busy':ident.STATUS_BAD_STATE}.get(self.mode,ident.STATUS_OK)
+  if status==ident.STATUS_OK and op==ident.OP_WRITE:
+   tuning=tn.parse_record(payload[5:]).tuning
+   if self.mode=='corrupt':tuning.lock_ki_per_s-=1
+   self.seq+=1;self.record=tn.build_record(tuning,seq=self.seq)
+  if status==ident.STATUS_OK and self.record is None:status=ident.STATUS_EMPTY
+  record=self.record if status==ident.STATUS_OK else b'\xff'*128
+  return {'firmware_response':utid(op,status,record,0 if self.mode=='old_master' else 1)}
 class SystemControlTests(unittest.TestCase):
  def _manual_readiness_timeout(self,snapshot):
   class Clock:
@@ -265,7 +285,7 @@ class SystemControlTests(unittest.TestCase):
     reply=super().manual_command(target,opcode,channel,value,timeout_s);self.zero=0;return reply
   with self.assertRaisesRegex(RuntimeError,'verification failed after SET'):
    DropsZero().set_normalized_pi_638(.5,1000,zero_hz=20)
-  for extra in (1<<18,1<<21,1<<23):  # bit 18 needs storage support (bit 17)
+  for extra in (1<<18,1<<19,1<<20,1<<23):  # bits 18-19 need record support (bit 17)
    g=V2Fake();g.info_extra=extra
    with self.assertRaisesRegex(RuntimeError,'unsupported normalized PI contract'):g.read_normalized_pi_638()
   class V3Fake(V2Fake):
@@ -283,87 +303,112 @@ class SystemControlTests(unittest.TestCase):
  def _info(self,raw):
   f=Fake();f._system_manual_active=False;f._system_manual_owned=set();f.values[638,11]=raw
   return f._normalized_pi_info_638()
- def test_normalized_pi_storage_info_decode(self):
-  keys=('storage_supported','stored_active','save_pending','clear_pending')
+ def test_normalized_pi_record_info_decode(self):
+  keys=('record_supported','record_active','record_rejected')
   v2=2|256|1024
-  for raw in (1|256|1024,v2,v2|20<<11):  # contract v1, v2 without storage: all False
-   self.assertEqual([self._info(raw)[k] for k in keys],[False]*4)
-  self.assertEqual([self._info(v2|1<<17)[k] for k in keys],[True,False,False,False])
-  for i,key in enumerate(keys[1:]):
-   info=self._info(v2|1<<17|1<<(18+i)|20<<11)
-   self.assertEqual([info[k] for k in keys],[True]+[k==key for k in keys[1:]])
-   self.assertEqual((info['version'],info['active'],info['slope_valid'],info['zero_hz']),(2,True,True,20))
-  self.assertTrue(self._info(v2|1<<17|1<<21)['last_write_failed'])
-  self.assertFalse(self._info(v2|1<<17)['last_write_failed'])
-  for raw in (v2|1<<18,v2|1<<19,v2|1<<20,v2|1<<21,v2|1<<17|1<<22,1|256|1024|1<<17):
+  for raw in (1|256|1024,v2,v2|20<<11):  # contract v1, v2 without the record: all False
+   self.assertEqual([self._info(raw)[k] for k in keys],[False]*3)
+  self.assertEqual([self._info(v2|1<<17)[k] for k in keys],[True,False,False])
+  info=self._info(v2|1<<17|1<<18|20<<11)
+  self.assertEqual([info[k] for k in keys],[True,True,False])
+  self.assertEqual((info['version'],info['active'],info['slope_valid'],info['zero_hz']),(2,True,True,20))
+  self.assertEqual([self._info(v2|1<<17|1<<19)[k] for k in keys],[True,False,True])
+  for gone in ('storage_supported','stored_active','save_pending','clear_pending','last_write_failed'):
+   self.assertNotIn(gone,info)
+  for raw in (v2|1<<18,v2|1<<19,v2|1<<17|1<<18|1<<19,v2|1<<17|1<<20,v2|1<<17|1<<21,1|256|1024|1<<17):
    with self.assertRaisesRegex(RuntimeError,'unsupported normalized PI contract'):self._info(raw)
- def test_normalized_pi_store_writes_now_survives_stop_restore_uses_it_and_clear_returns_to_compiled_profile(self):
-  f=StorageFake()
-  f.set_normalized_pi_638(2.6,5000,zero_hz=30)
-  r=f.store_normalized_pi_638()
-  get11,get10=(638,MANUAL_GET,11,0),(638,MANUAL_GET,10,0)
-  self.assertEqual(f.calls[-5:],[(638,MANUAL_SET,11,1),get11,get11,get11,get10])  # pending once, then written
-  self.assertEqual((r['save_pending'],r['clear_pending'],r['stored_active'],r['last_write_failed'],r['overridden']),
-                   (False,False,True,False,True))
-  self.assertEqual((r['kp'],r['ki_per_s'],r['zero_hz'],f.stored),(2.6,5000.0,30,(520,5000,30)))  # written before any STOP
-  f.stop_start()
+  self.assertFalse(hasattr(Fake(),'store_normalized_pi_638') or hasattr(Fake(),'clear_stored_normalized_pi_638'))
+ def test_restore_returns_to_the_record_box_defaults(self):
+  f=RecordPIFake(record=(520,5000,30))
   r=f.read_normalized_pi_638()
-  self.assertEqual((r['stored_active'],r['overridden'],r['kp'],r['ki_per_s'],r['zero_hz']),(True,False,2.6,5000.0,30))
+  self.assertEqual((r['record_active'],r['overridden'],r['kp'],r['ki_per_s'],r['zero_hz']),(True,False,2.6,5000.0,30))
   f.set_normalized_pi_638(.5,1000)
-  r=f.restore_normalized_pi_638()  # box defaults are the stored record, second integrator included
-  self.assertEqual((r['overridden'],r['stored_active'],r['kp'],r['ki_per_s'],r['zero_hz']),(False,True,2.6,5000.0,30))
-  f.set_normalized_pi_638(.7,2500)
-  self.assertEqual(f.store_normalized_pi_638()['kp'],.7)  # a new save replaces the record
-  self.assertEqual(f.stored,(140,2500,0))
-  r=f.clear_stored_normalized_pi_638()
-  self.assertEqual(f.calls[-5][:4],(638,MANUAL_SET,11,2))
-  self.assertEqual((r['clear_pending'],r['stored_active'],r['last_write_failed'],f.stored),(False,False,False,None))
-  f.stop_start()
-  r=f.read_normalized_pi_638()
-  self.assertEqual((r['stored_active'],r['overridden'],r['kp'],r['ki_per_s'],r['zero_hz']),(False,False,.485,450.0,0))
-  f.set_normalized_pi_638(.5,1000,zero_hz=20)
-  self.assertEqual(f.restore_normalized_pi_638()['zero_hz'],0)
-  r=f.store_normalized_pi_638()  # saving the defaults (not overridden) is allowed too
-  self.assertEqual((r['stored_active'],r['overridden'],r['kp']),(True,False,.485))
- def test_normalized_pi_storage_write_failure_lost_write_timeout_and_cancel(self):
-  f=StorageFake(stored=(120,1925,0),fail_write=True)
-  f.set_normalized_pi_638(.7,2500)
-  with self.assertRaisesRegex(RuntimeError,'store: flash write failed'):f.store_normalized_pi_638()
-  r=f.read_normalized_pi_638()
-  self.assertEqual((r['last_write_failed'],r['stored_active'],r['save_pending'],f.stored),(True,True,False,(120,1925,0)))
-  with self.assertRaisesRegex(RuntimeError,'clear: flash write failed'):f.clear_stored_normalized_pi_638()
-  f.fail_write=False
-  self.assertFalse(f.store_normalized_pi_638()['last_write_failed'])  # a new SET 1 clears bit 21
-  self.assertEqual(f.stored,(140,2500,0))
-  class LosesWrite(StorageFake):  # pending drops but nothing is written (the IDLE-commit symptom)
-   def commit(self):self.pending=None
-  with self.assertRaisesRegex(RuntimeError,'store: stored gains not active after the write'):
-   LosesWrite().store_normalized_pi_638()
-  with self.assertRaisesRegex(RuntimeError,'clear: stored gains still active after the write'):
-   LosesWrite(stored=(120,1925,0)).clear_stored_normalized_pi_638()
-  class NeverCommits(StorageFake):
-   def commit(self):pass
-  clock=[0.0]
-  with patch('ultracoustics.system_control.time.monotonic',side_effect=lambda:clock[0]), \
-       patch('ultracoustics.system_control.time.sleep',side_effect=lambda dt:clock.__setitem__(0,clock[0]+dt)):
-   g=NeverCommits()
-   with self.assertRaisesRegex(RuntimeError,'store still pending after 1 s'):g.store_normalized_pi_638()
-  self.assertGreaterEqual(clock[0],1.0);self.assertLess(clock[0],1.1)
-  self.assertGreater(sum(c==(638,MANUAL_GET,11,0) for c in g.calls),40)
-  h=StorageFake()  # SET 0 before the main loop commits cancels the change
-  h.manual_command(638,MANUAL_SET,11,1);h.manual_command(638,MANUAL_SET,11,0)
-  r=h.read_normalized_pi_638()
-  self.assertEqual((r['save_pending'],r['stored_active'],h.stored),(False,False,None))
- def test_normalized_pi_storage_refused_without_support_or_lock(self):
-  for raw in (1|256|1024,2|256|1024):  # contract v1; contract v2 without storage
-   f=Fake();f._system_manual_active=False;f._system_manual_owned=set();f.values[638,11]=raw
-   for call in (f.store_normalized_pi_638,f.clear_stored_normalized_pi_638):
-    with self.assertRaisesRegex(RuntimeError,'does not support on-box'):call()
-   self.assertFalse(any(c[1]==MANUAL_SET for c in f.calls))
-  f=StorageFake();f.locked=False
-  for call in (f.store_normalized_pi_638,f.clear_stored_normalized_pi_638):
-   with self.assertRaisesRegex(RuntimeError,'active with a valid slope'):call()
-  self.assertFalse(any(c[1]==MANUAL_SET for c in f.calls))
+  r=f.restore_normalized_pi_638()  # box defaults are the record's lock gains, second integrator included
+  self.assertEqual((r['overridden'],r['record_active'],r['kp'],r['ki_per_s'],r['zero_hz']),(False,True,2.6,5000.0,30))
+  self.assertFalse(any(c[1]==MANUAL_SET and c[2]==11 and c[3] for c in f.calls))  # only SET 0
+  r=RecordPIFake(record=(520,5000,30),rejected=True).restore_normalized_pi_638()
+  self.assertEqual((r['record_active'],r['record_rejected'],r['kp'],r['ki_per_s'],r['zero_hz']),(False,True,.485,450.0,0))
+  g=RecordPIFake();g.box_defaults=lambda:(97,450,20)  # a zero without a record is not the profile
+  with self.assertRaisesRegex(RuntimeError,'verification failed after restore'):g.restore_normalized_pi_638()
+ def test_lock_write_keeps_the_stored_tec_fields_and_returns_the_readback(self):
+  tec=tn.TecTuning(board=3,kp=.07,ki=.22,integrator_limit=1.36,setpoint_filter=True,report_id='TUNE_X')
+  f=RecordFake(tn.build_record(tec,seq=4))
+  with patch('ultracoustics.system_control.time.sleep') as sleep:
+   r=f.write_lock_tuning_638(.6,1925,report_id='LOCK_0056_DUSTIN')
+  sleep.assert_called_once_with(tn.RMW_GAP_S)
+  (read,_,kind,bound,response_s),(write,record,*_)=f.requests
+  self.assertEqual((read,kind,bound,response_s),(protocol.pack_command(protocol.CMD_IDENTITY_READ,1,638),'record',15.5,15.0))
+  self.assertEqual((write,len(record),record[6]),(protocol.pack_command(protocol.CMD_IDENTITY_WRITE,1,638),128,60))
+  self.assertEqual((r['stored'],r['sequence'],r['rejected']),(True,5,None))
+  self.assertEqual((r['lock_kp'],r['lock_ki_per_s'],r['lock_zero_hz'],r['report_id']),(.6,1925.0,0,'LOCK_0056_DUSTIN'))
+  self.assertAlmostEqual(r['kp'],.07,places=6);self.assertAlmostEqual(r['integrator_limit'],1.36,places=6)
+  self.assertEqual((r['setpoint_filter'],r['conditional_integration'],r['kd']),(True,None,None))
+  self.assertEqual(r,f.read_tuning_638())
+  self.assertEqual(set(r),{'stored','sequence','rejected','lock_kp','lock_ki_per_s','lock_zero_hz','kp','ki','kd',
+                           'integrator_limit','setpoint_filter','conditional_integration','tuned_at','report_id'})
+ def test_lock_clear_keeps_tec_fields_and_an_empty_board_reads_unset(self):
+  f=RecordFake()
+  r=f.read_tuning_638()
+  self.assertEqual((r['stored'],r['sequence'],r['lock_kp'],r['kp'],r['rejected']),(False,None,None,None,None))
+  self.assertEqual(f.requests[0][4],8.0)
+  with patch('ultracoustics.system_control.time.sleep'):
+   r=f.write_lock_tuning_638(2.6,5000,zero_hz=30)
+   self.assertEqual((r['lock_kp'],r['lock_ki_per_s'],r['lock_zero_hz'],r['kp'],r['sequence']),(2.6,5000.0,30,None,1))
+   f.record=tn.build_record(tn.TecTuning(board=3,kp=.08,lock_kp=2.6,lock_ki_per_s=5000.0,lock_zero_hz=30),seq=7);f.seq=7
+   r=f.clear_lock_tuning_638()
+  self.assertEqual((r['stored'],r['sequence'],r['lock_kp'],r['lock_ki_per_s'],r['lock_zero_hz']),(True,8,None,None,None))
+  self.assertAlmostEqual(r['kp'],.08,places=6)
+  self.assertEqual(f.record[6],48)  # no lock field left: a layout-v1 48-byte payload
+ def test_tuning_record_needs_idle_a_stream_no_manual_session_and_wire_grid_gains(self):
+  f=RecordFake();f._running=True
+  calls=(f.read_tuning_638,lambda:f.write_lock_tuning_638(.6,1925),f.clear_lock_tuning_638)
+  for call in calls:
+   with self.assertRaisesRegex(RuntimeError,'IDLE; STOP first'):call()
+  f._running=False;f._system_manual_active=True
+  for call in calls:
+   with self.assertRaisesRegex(RuntimeError,'Finish the manual session'):call()
+  f._system_manual_active=False;f._stream.running=False
+  for call in calls:
+   with self.assertRaisesRegex(RuntimeError,'begin_stream'):call()
+  f._stream.running=True
+  for args in ((.601,1925),(.6,1925.5),(5.12,1),(.6,16384),(-.005,1),(float('nan'),1),('0.6',1),(True,1),
+               (.6,1925,64),(.6,1925,True),(.6,1925,1.0),(.6,1925,-1)):
+   with self.assertRaises(ValueError):f.write_lock_tuning_638(*args)
+  with self.assertRaises(ValueError):f.write_lock_tuning_638(.6,1925,report_id='x'*25)
+  self.assertEqual(f.requests,[])
+  from ultracoustics import Controller
+  with self.assertRaisesRegex(RuntimeError,'begin_stream'):Controller().read_tuning_638()
+ def test_tuning_record_without_support_or_with_failures_raises_and_writes_nothing(self):
+  for mode,message in (('old_master','does not support TEC tuning records'),
+                       ('old_boot','bootloader without tuning-record support'),
+                       ('busy','not in IDLE or OVERRIDE'),('silent','no reply; the mainboard refused')):
+   f=RecordFake(mode=mode)
+   with self.assertRaisesRegex(RuntimeError,message):f.read_tuning_638()
+   with patch('ultracoustics.system_control.time.sleep'):
+    for call in (lambda:f.write_lock_tuning_638(.6,1925),f.clear_lock_tuning_638):
+     with self.assertRaisesRegex(RuntimeError,message):call()
+   self.assertEqual([q[0][0] for q in f.requests],[protocol.CMD_IDENTITY_READ]*3)  # the read failed: no write
+  f=RecordFake(mode='corrupt')
+  with patch('ultracoustics.system_control.time.sleep'):
+   with self.assertRaisesRegex(RuntimeError,'VERIFY_FAIL'):f.write_lock_tuning_638(.6,1925)
+  class Mismatch(RecordFake):
+   def request(self,*a,**k):
+    reply=super().request(*a,**k);reply['firmware_response']=utid(ident.OP_WRITE,ident.STATUS_EMPTY);return reply
+  with self.assertRaisesRegex(RuntimeError,'does not match the request'):Mismatch().read_tuning_638()
+ def test_rejected_groups_are_reported_and_a_rejected_tec_group_is_not_kept(self):
+  lock=struct.pack('<ff',.6,1925.0)+b'\x00\xff\xff\xff'
+  f=RecordFake(raw_638_record(struct.pack('<f',90.0)+b'\xff'*44+lock,3))
+  r=f.read_tuning_638()
+  self.assertEqual((r['kp'],r['lock_kp'],r['lock_ki_per_s']),(90.0,.6,1925.0))
+  self.assertEqual(r['rejected'],'TEC fields rejected: kp = 90.0 is outside [0, 1]')
+  with patch('ultracoustics.system_control.time.sleep'):
+   r=f.write_lock_tuning_638(.65,2000)
+  self.assertEqual((r['kp'],r['lock_kp'],r['lock_ki_per_s'],r['rejected']),(None,.65,2000.0,None))
+  r=RecordFake(raw_638_record(b'\xff'*48+struct.pack('<ff',6.0,1925.0)+b'\x40\xff\xff\xff',3)).read_tuning_638()
+  self.assertEqual(r['rejected'],'lock fields rejected: lock_kp = 6.0 is outside [0, 5.115]')
+  r=RecordFake(raw_638_record(struct.pack('<f',90.0)+b'\xff'*52+b'\x40',3)).read_tuning_638()
+  self.assertEqual(r['rejected'],'TEC fields rejected: kp = 90.0 is outside [0, 1]; '
+                                 'lock fields rejected: lock_zero_hz = 64 is outside 0..63')
  def test_renew_failure_stops_both(self):
   f=Fake()
   def fail(*a,**k):raise TimeoutError('ack')

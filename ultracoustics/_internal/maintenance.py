@@ -507,6 +507,13 @@ class DiagnosticsManager:
         before anything is sent). If ``tuning.tuned_at`` is unset it is filled
         with the current time.
 
+        On the 638 the write is read-modify-write: the stored record is read
+        first and its lock PI fields are stored again with the new TEC
+        fields, so a TEC write never changes the lock gains
+        (docs/TEC_TUNING.md, "Lock PI fields (638)"). ``tuning`` must leave
+        the lock fields unset. If that read does not return ``OK`` or
+        ``EMPTY``, its result is returned and nothing is written.
+
         Returns
         -------
         ultracoustics.tec_tuning.TuningResult
@@ -518,9 +525,18 @@ class DiagnosticsManager:
             raise ValueError(
                 f"tuning is for board type {tuning.board}, target {target} "
                 f"is board type {expected_board}")
+        if any(getattr(tuning, name) is not None for name in _tuning.LOCK_FIELDS):
+            raise ValueError("write_tec_tuning keeps the stored lock PI fields; "
+                             "lock gains are written with Controller.write_lock_tuning_638")
         if tuning.tuned_at is None:
             tuning.tuned_at = int(time.time())
         record = _tuning.build_record(tuning)  # validates
+        if target == TARGET_638:
+            stored = self.read_tec_tuning(target, timeout_ms)
+            if stored.status not in (_identity.STATUS_OK, _identity.STATUS_EMPTY):
+                return stored
+            time.sleep(_tuning.RMW_GAP_S)
+            record = _tuning.build_record(_tuning.keep_stored(tuning, stored.record, "lock"))
         self._conn.send_command(CMD_IDENTITY_WRITE, wValue=_tuning.KIND,
                                 wIndex=target, extra=record)
         result = _tuning.parse_reply(
@@ -534,7 +550,9 @@ class DiagnosticsManager:
     def clear_tec_tuning(self, target, report_id=None, timeout_ms=15000):
         """Return a laser board to its compiled TEC gains.
 
-        Slots are append-only, so this stores a record that sets nothing.
+        Slots are append-only, so this stores a record that sets no TEC
+        field. On the 638 it keeps the stored lock PI fields, as
+        :meth:`write_tec_tuning` does.
         """
         _check_tuning_target(target)
         tuning = _tuning.TecTuning(board=_tuning.BOARD_FOR_TARGET[target],

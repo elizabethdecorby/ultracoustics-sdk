@@ -184,7 +184,7 @@ class Fake:
     def __init__(self, clock, contract=2, previous=None, drop_rows=25, corrupt_capture=False, config_busy_s=0,
                  stored=None):
         self.clock, self.contract, self.device_serial = clock, contract, "0056004B3033511438323634"
-        self.stored = stored  # on-box record (STORAGE_SPEC.md): the box defaults instead of the compiled profile
+        self.stored = stored  # lock gains from the 638 tuning record: the box defaults instead of the compiled profile
         self.defaults = dict(stored or dict(kp=0.483, ki_per_s=449.8, zero_hz=0))
         self.pi = dict(active=True, overridden=False, slope_valid=True, **self.defaults)
         if previous:
@@ -275,7 +275,7 @@ class Fake:
         if channel == 11:
             raw = self.contract | pi["active"] << 8 | pi["overridden"] << 9 | pi["slope_valid"] << 10
             raw |= pi["zero_hz"] << 11 if v2 else 0
-            raw |= 1 << 17 | 1 << 18 if self.stored else 0  # storage supported, stored gains active
+            raw |= 1 << 17 | 1 << 18 if self.stored else 0  # record supported, record lock gains are the box defaults
         else:
             raw = (round(pi["kp"] / 0.005) << 14 | round(pi["ki_per_s"]) if v2
                    else round(pi["kp"] * 1000) << 14 | round(pi["ki_per_s"] * 10))
@@ -434,9 +434,9 @@ class CalibrateLockTests(unittest.TestCase):
         self.assertTrue(report["details"]["previous_gains_restored"])
         self.assertFalse(report["relock"]["relocked"])
 
-    def test_failure_after_apply_restores_stored_box_defaults(self):
+    def test_failure_after_apply_restores_record_box_defaults(self):
         clock = Clock()
-        stored = {"kp": 0.6, "ki_per_s": 1925, "zero_hz": 20}  # box defaults from an on-box record
+        stored = {"kp": 0.6, "ki_per_s": 1925, "zero_hz": 20}  # box defaults from the tuning record
         fake = Fake(clock, contract=2, stored=stored)
         original = fake.control_638
 
@@ -453,7 +453,7 @@ class CalibrateLockTests(unittest.TestCase):
         self.assertIn("restore_pi", fake.calls)
         self.assertTrue(report["details"]["previous_gains_restored"], report["message"])
         rb = fake.read_normalized_pi_638()
-        self.assertEqual((rb["kp"], rb["ki_per_s"], rb["zero_hz"], rb["overridden"], rb["stored_active"]),
+        self.assertEqual((rb["kp"], rb["ki_per_s"], rb["zero_hz"], rb["overridden"], rb["record_active"]),
                          (0.6, 1925.0, 20, False, True))
 
     def test_gate_rejection_leaves_gains(self):

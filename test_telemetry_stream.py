@@ -449,5 +449,156 @@ class ReentrantControlResponseTests(unittest.TestCase):
                 shm.unlink()
 
 
+
+class RecordReplyTests(unittest.TestCase):
+    """'n'/'N' board record replies (140-byte UTID) through the stream reader."""
+
+    def run_reader(self, items, reply=None, pump_s=0.0):
+        class FakeUSBError(Exception):
+            pass
+
+        fake_usb = SimpleNamespace(
+            TRANSFER_COMPLETED=0, TRANSFER_TIMED_OUT=1,
+            TRANSFER_NO_DEVICE=2, TRANSFER_CANCELLED=3,
+            USBError=FakeUSBError, USBErrorPipe=type("USBErrorPipe", (FakeUSBError,), {}),
+        )
+
+        class Transfer:
+            def setBulk(self, _endpoint, _size, callback, timeout):
+                self.callback = callback
+
+            def submit(self):
+                pass
+
+            def cancel(self):
+                pass
+
+            def getStatus(self):
+                return fake_usb.TRANSFER_COMPLETED
+
+            def getActualLength(self):
+                return len(self.buffer)
+
+            def getBuffer(self):
+                return self.buffer
+
+        class Handle:
+            def __init__(self):
+                self.transfers, self.writes, self.clears = [], [], 0
+
+            def kernelDriverActive(self, _interface):
+                return False
+
+            def claimInterface(self, _interface):
+                pass
+
+            def releaseInterface(self, _interface):
+                pass
+
+            def close(self):
+                pass
+
+            def getTransfer(self):
+                transfer = Transfer()
+                self.transfers.append(transfer)
+                return transfer
+
+            def bulkWrite(self, _endpoint, payload, timeout):
+                self.writes.append(bytes(payload))
+                return len(payload)
+
+            def clearHalt(self, endpoint):
+                self.clears += 1
+                self.cleared = endpoint
+
+        handle = Handle()
+
+        class Context:
+            def open(self):
+                pass
+
+            def openByVendorIDAndProductID(self, *_args, **_kwargs):
+                return handle
+
+            def handleEventsTimeout(self, _timeout):
+                if reply is not None and handle.writes and not getattr(handle, "answered", False):
+                    handle.answered = True  # the reply arrives while the event loop pumps
+                    transfer = handle.transfers[0]
+                    transfer.buffer = reply
+                    transfer.callback(transfer)
+                time.sleep(pump_s)
+
+            def close(self):
+                pass
+
+        fake_usb.USBContext = Context
+        ring = SharedMemory(create=True, size=64)
+        counters = SharedMemory(create=True, size=stream_proc._COUNTER_BYTES)
+        ring.buf[:] = b"\0" * len(ring.buf)
+        counters.buf[:] = b"\0" * len(counters.buf)
+        commands, acknowledgements = queue.Queue(), queue.Queue()
+        for item in items:
+            commands.put(item)
+        try:
+            with mock.patch.dict(sys.modules, {"usb1": fake_usb}):
+                stream_proc.reader_main(
+                    0x2E9D, 0x000A, ring.name, counters.name, 32, commands,
+                    threading.Event(), threading.Event(), acknowledgements)
+            acks = []
+            while not acknowledgements.empty():
+                acks.append(acknowledgements.get_nowait())
+            return handle, acks, stream_proc.read_counters(counters)
+        finally:
+            for shm in (ring, counters):
+                shm.close()
+                shm.unlink()
+
+    def test_utid_reply_is_returned_raw(self):
+        reply = b"UTID" + struct.pack("<BBHBBBB", 1, 0, 638, 1, 255, 1, 0) + b"\xff" * 128
+        request = pack_command(ord("n"), 1, 638)
+        handle, acks, counters = self.run_reader([(1, request, "record", None, 8.0), None], reply)
+        self.assertEqual(handle.writes, [request])
+        self.assertEqual(acks[0][0], 1)
+        self.assertEqual(acks[0][1]["firmware_response"], reply)
+        self.assertEqual((handle.clears, counters["malformed"]), (0, 0))
+
+    def test_a_non_utid_reply_fails_the_request(self):
+        reply = b"UTXX" + b"\0" * 136
+        _, acks, _ = self.run_reader([(1, pack_command(ord("n"), 1, 638), "record", None, 8.0), None],
+                                     reply)
+        self.assertEqual(acks[0][1]["transport_status"], "failed")
+        self.assertIn("not a UTID", acks[0][1]["error"])
+
+    def test_silence_times_out_on_the_request_bound_and_clears_the_stall(self):
+        handle, acks, _ = self.run_reader(
+            [(1, pack_command(ord("n"), 1, 638), "record", None, 0.05), None], pump_s=0.06)
+        self.assertEqual(acks[0][1]["error"], "firmware control response timed out")
+        self.assertEqual((handle.clears, handle.cleared), (1, stream_proc.BULK_OUT_EP))
+
+    def test_controls_without_a_bound_keep_the_fixed_wait(self):
+        handle, acks, _ = self.run_reader(
+            [(1, pack_command(ord("j")), "manual", None), None], pump_s=0.06)
+        self.assertEqual(acks, [])  # 0.75 s has not passed; a record bound would have
+        self.assertEqual(handle.clears, 0)
+
+    def test_stream_request_carries_the_response_bound(self):
+        from ultracoustics._internal.comms import USBStream
+        stream = USBStream.__new__(USBStream)
+        stream._running, stream._next_command_request_id = True, 1
+        stream._command_ack_queue = queue.Queue()
+        items = []
+
+        class Commands:
+            def put(self, item):
+                items.append(item)
+                stream._command_ack_queue.put((item[0], {"transport_status": "delivered",
+                                                         "firmware_response": b"ok"}, 5))
+
+        stream._cmd_queue = Commands()
+        stream._request_stream_control(b"n", "record", timeout_s=8.5, response_timeout_s=8.0)
+        stream._request_stream_control(b"j", "manual")
+        self.assertEqual(items, [(1, b"n", "record", None, 8.0), (2, b"j", "manual", None)])
+
+
 if __name__ == "__main__":
     unittest.main()
