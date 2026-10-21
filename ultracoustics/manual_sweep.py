@@ -9,7 +9,7 @@ from ._internal.control import (
 
 #: Default laser DAC ceilings. The 638 value is superseded by the board's own
 #: cap once ``Controller.read_optical_cap_638()`` has read it.
-CAPS = {638: 44000, 1550: 43253}
+CAPS = {638: 52400, 1550: 43253}
 STATUS_NAMES = {
     1: "bad start", 2: "bad CRC", 3: "bad opcode", 4: "bad channel",
     5: "bad reserved byte", 6: "bad value or thermal not LOCKED",

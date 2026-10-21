@@ -380,7 +380,8 @@ class Controller(SystemControlMixin):
         """Highest laser DAC this controller will send to *target*.
 
         For the 638 this is the board's own ``CALIBRATION_DAC_VALUE`` once
-        :meth:`read_optical_cap_638` has read it, else the historical 44000.
+        :meth:`read_optical_cap_638` has read it, else 52400 (the highest box
+        cap, Belycomm 0056004B; each 638 still enforces its own).
         The 1550 has no cap channel and stays at its hardware limit, 43253.
         """
         if target not in self._dac_caps:

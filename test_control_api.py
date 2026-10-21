@@ -167,15 +167,15 @@ class ControllerControlTests(unittest.TestCase):
         ctrl = Controller()
         reply = parse_manual_response(manual_response(txn=1))
         ctrl._stream = FakeStream(reply)
-        result = ctrl.manual_command(638, MANUAL_SET, CHANNEL_LASER_DAC, 44000)
+        result = ctrl.manual_command(638, MANUAL_SET, CHANNEL_LASER_DAC, 52400)
         self.assertEqual(result.applied_value, 33000)
         self.assertEqual(ctrl._stream.request[1], "manual")
         with self.assertRaises(ValueError):
-            ctrl.manual_command(638, MANUAL_SET, CHANNEL_LASER_DAC, 44001)
+            ctrl.manual_command(638, MANUAL_SET, CHANNEL_LASER_DAC, 52401)
 
     def test_board_reported_638_cap_replaces_default(self):
         ctrl = Controller()
-        self.assertEqual((ctrl.dac_cap(638), ctrl.dac_cap(1550)), (44000, 43253))
+        self.assertEqual((ctrl.dac_cap(638), ctrl.dac_cap(1550)), (52400, 43253))
         cap_reply = SimpleNamespace(status=0, applied_value=50000)
         with mock.patch.object(ctrl, "manual_command", return_value=cap_reply):
             self.assertEqual(ctrl.read_optical_cap_638()["max_dac"], 50000)
@@ -189,7 +189,7 @@ class ControllerControlTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ctrl.manual_command(1550, MANUAL_SET, CHANNEL_LASER_DAC, 43254)
         # A second controller has not read any board and keeps the default.
-        self.assertEqual(Controller().dac_cap(638), 44000)
+        self.assertEqual(Controller().dac_cap(638), 52400)
 
     def test_begin_manual_legacy_settle_covers_bootloader_and_poll_gate(self):
         events = []
@@ -300,7 +300,7 @@ class ControllerControlTests(unittest.TestCase):
             rows = run_manual_sweep(ctrl, 638, points=2,
                                     on_point=emitted.append)
         self.assertEqual(rows, emitted)
-        self.assertEqual([row["dac_requested"] for row in rows], [0, 44000])
+        self.assertEqual([row["dac_requested"] for row in rows], [0, 52400])
         self.assertEqual(rows[0]["pd_full_scale_counts"], 4095)
         self.assertFalse(rows[0]["saturated"])
         self.assertEqual(rows[0]["sample_tick_ms"], 1)
@@ -334,7 +334,7 @@ class ControllerControlTests(unittest.TestCase):
         self.assertEqual((rows[0]["dac_requested"], rows[-1]["dac_requested"]),
                          (0, 12000))
         with self.assertRaises(ValueError):
-            run_manual_sweep(SweepController(), 638, max_dac=44001)
+            run_manual_sweep(SweepController(), 638, max_dac=52401)
 
     def test_fresh_pd_returns_as_soon_as_causality_is_proven(self):
         board = SimpleNamespace(pd_sample_tick_ms=2, pd_valid=True,

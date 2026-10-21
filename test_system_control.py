@@ -221,14 +221,14 @@ class SystemControlTests(unittest.TestCase):
   f.streaming=True;f.stream_stats={'stream_format':2}
   with self.assertRaisesRegex(RuntimeError,'nonzero 1550'):
    f.capture_fp_scan(timeout_s=75)
- def test_scan_protocol_channels_are_packable_without_relaxing_old_dac_cap(self):
+ def test_scan_protocol_channels_are_packable_with_the_manual_dac_cap_enforced(self):
   from ultracoustics._internal.control import pack_manual_request
   for channel in (7,8,9):
    self.assertEqual(pack_manual_request(MANUAL_GET,channel,0,3)[2],channel)
   from ultracoustics import Controller
   c=Controller()
-  with self.assertRaisesRegex(ValueError,'44000'):
-   c.manual_command(638,MANUAL_SET,CHANNEL_LASER_DAC,50000)
+  with self.assertRaisesRegex(ValueError,'52400'):
+   c.manual_command(638,MANUAL_SET,CHANNEL_LASER_DAC,52401)
  def test_fp_scan_status_decoder(self):
   f=Fake();f.values[638,9]=(1000<<8)|(1<<4)|4
   self.assertEqual(f.read_fp_scan_638()['state'],'complete')

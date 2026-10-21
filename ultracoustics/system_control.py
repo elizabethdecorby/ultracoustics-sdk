@@ -283,7 +283,7 @@ class SystemControlMixin:
         if not 0 < reply.applied_value <= 65535:
             raise RuntimeError('638 reported an invalid optical DAC cap')
         # The board's cap is authoritative; manual laser SETs are bounded by
-        # it from now on instead of the historical 44000.
+        # it from now on instead of the 52400 default.
         caps = getattr(self, '_dac_caps', None)
         if caps is not None:
             caps[638] = reply.applied_value
