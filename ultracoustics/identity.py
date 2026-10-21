@@ -33,6 +33,10 @@ BOARD_FOR_TARGET = {TARGET_MAIN: BOARD_MAIN, TARGET_1550: BOARD_1550, TARGET_638
 OP_READ = 0
 OP_WRITE = 1
 
+# 'n' / 'N' wValue and reply byte 10 (docs/TEC_TUNING.md for kind 1).
+KIND_IDENTITY = 0
+KIND_TEC_TUNING = 1
+
 STATUS_OK = 0
 STATUS_EMPTY = 1
 STATUS_NO_RESPONSE = 2
@@ -41,6 +45,7 @@ STATUS_WRITE_FAIL = 4
 STATUS_VERIFY_FAIL = 5
 STATUS_BAD_RECORD = 6
 STATUS_BAD_STATE = 7
+STATUS_BAD_KIND = 8
 
 STATUS_NAMES = {
     STATUS_OK: "OK",
@@ -51,6 +56,7 @@ STATUS_NAMES = {
     STATUS_VERIFY_FAIL: "VERIFY_FAIL",
     STATUS_BAD_RECORD: "BAD_RECORD",
     STATUS_BAD_STATE: "BAD_STATE",
+    STATUS_BAD_KIND: "BAD_KIND",
 }
 
 _STR, _U32 = "str", "u32"
@@ -135,6 +141,7 @@ class IdentityResult:
     slots_free: int
     record: Optional[StoredRecord]
     raw: bytes
+    kind: int = KIND_IDENTITY
 
     @property
     def ok(self) -> bool:
@@ -238,14 +245,23 @@ def parse_record(raw: bytes) -> Optional[StoredRecord]:
     return StoredRecord(board=board, seq=seq, identity=decode_payload(board, payload), raw=raw)
 
 
-def parse_reply(raw: bytes) -> IdentityResult:
-    """Decode the mainboard's 140-byte 'UTID' reply to 'n' or 'N'."""
+def reply_header(raw: bytes) -> tuple:
+    """(op, target, status, slots_free, kind) of a 140-byte 'UTID' reply."""
     raw = bytes(raw)
     if len(raw) != REPLY_SIZE or raw[:4] != REPLY_MAGIC:
         raise IdentityError("not a UTID identity reply")
-    schema, op, target, status, slots_free = struct.unpack_from("<BBHBB", raw, 4)
+    schema, op, target, status, slots_free, kind = struct.unpack_from("<BBHBBB", raw, 4)
     if schema != REPLY_SCHEMA:
         raise IdentityError(f"unsupported reply schema {schema}")
+    return op, target, status, slots_free, kind
+
+
+def parse_reply(raw: bytes) -> IdentityResult:
+    """Decode the mainboard's 140-byte 'UTID' reply to 'n' or 'N'."""
+    raw = bytes(raw)
+    op, target, status, slots_free, kind = reply_header(raw)
+    if kind != KIND_IDENTITY:
+        raise IdentityError(f"reply carries record kind {kind}, not identity")
     record = None
     if status == STATUS_OK:
         record = parse_record(raw[12:12 + RECORD_SIZE])
@@ -255,4 +271,4 @@ def parse_reply(raw: bytes) -> IdentityResult:
         except IdentityError:
             record = None
     return IdentityResult(op=op, target=target, status=status,
-                          slots_free=slots_free, record=record, raw=raw)
+                          slots_free=slots_free, record=record, raw=raw, kind=kind)

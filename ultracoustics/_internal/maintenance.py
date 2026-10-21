@@ -13,6 +13,7 @@ Classes:
         Firmware version queries and override-mode control for the Master
         Board and its slave laser boards.  Provides query_firmware_info(),
         query_slave_version(), read_identity(), write_identity(),
+        read_tec_tuning(), write_tec_tuning(), clear_tec_tuning(),
         read_system_info(), enter_override(), exit_override(),
         set_power(), set_trigger(), program_1550().
 
@@ -45,6 +46,7 @@ from .protocol import (
     TARGET_1550, TARGET_638, TARGET_MAIN,
 )
 from .. import identity as _identity
+from .. import tec_tuning as _tuning
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +469,74 @@ class DiagnosticsManager:
             result.status = _identity.STATUS_VERIFY_FAIL
         return result
 
+    # -- TEC tuning records (docs/TEC_TUNING.md) ------------------------------
+
+    def read_tec_tuning(self, target, timeout_ms=8000):
+        """Read the TEC tuning record stored on one laser board.
+
+        Parameters
+        ----------
+        target : int
+            ``TARGET_1550`` or ``TARGET_638``. Like :meth:`read_identity`,
+            this power-cycles the board into its bootloader.
+
+        Returns
+        -------
+        ultracoustics.tec_tuning.TuningResult
+            ``status`` is ``STATUS_OK`` with ``record`` set, or ``EMPTY``,
+            ``NO_RESPONSE`` (no board / bootloader without tuning support),
+            etc. Raises ``TuningError`` if the mainboard firmware predates
+            tuning records, and ``TimeoutError`` if no reply arrives.
+        """
+        _check_tuning_target(target)
+        self._conn.send_command(CMD_IDENTITY_READ, wValue=_tuning.KIND, wIndex=target)
+        return _tuning.parse_reply(
+            self._read_utid_reply(_identity.OP_READ, target, timeout_ms))
+
+    def write_tec_tuning(self, target, tuning, timeout_ms=15000):
+        """Store a new TEC tuning record on one laser board and read it back.
+
+        The laser app applies the newest record at its next start-up; the
+        write itself power-cycles the board. Fields left as ``None`` keep the
+        firmware's compiled defaults. ``tuning.board`` must match *target*, and
+        the values must pass the firmware bounds (``TuningError`` otherwise,
+        before anything is sent). If ``tuning.tuned_at`` is unset it is filled
+        with the current time.
+
+        Returns
+        -------
+        ultracoustics.tec_tuning.TuningResult
+            ``ok`` is True only if the board verified the stored record.
+        """
+        _check_tuning_target(target)
+        expected_board = _tuning.BOARD_FOR_TARGET[target]
+        if tuning.board != expected_board:
+            raise ValueError(
+                f"tuning is for board type {tuning.board}, target {target} "
+                f"is board type {expected_board}")
+        if tuning.tuned_at is None:
+            tuning.tuned_at = int(time.time())
+        record = _tuning.build_record(tuning)  # validates
+        self._conn.send_command(CMD_IDENTITY_WRITE, wValue=_tuning.KIND,
+                                wIndex=target, extra=record)
+        result = _tuning.parse_reply(
+            self._read_utid_reply(_identity.OP_WRITE, target, timeout_ms))
+        sent = _tuning.parse_record(record).tuning
+        if result.ok and (result.record is None
+                          or not _tuning.same_record(result.record.tuning, sent)):
+            result.status = _identity.STATUS_VERIFY_FAIL
+        return result
+
+    def clear_tec_tuning(self, target, report_id=None, timeout_ms=15000):
+        """Return a laser board to its compiled TEC gains.
+
+        Slots are append-only, so this stores a record that sets nothing.
+        """
+        _check_tuning_target(target)
+        tuning = _tuning.TecTuning(board=_tuning.BOARD_FOR_TARGET[target],
+                                   report_id=report_id)
+        return self.write_tec_tuning(target, tuning, timeout_ms)
+
     def read_system_info(self):
         """Firmware versions and identity records for all three boards.
 
@@ -623,7 +693,14 @@ class DiagnosticsManager:
         raise TimeoutError("No firmware info response received.")
 
     def _read_identity_reply(self, op, target, timeout_ms):
-        """Wait for the 140-byte UTID reply matching *op* and *target*."""
+        """Wait for the identity reply matching *op* and *target*."""
+        return _identity.parse_reply(self._read_utid_reply(op, target, timeout_ms))
+
+    def _read_utid_reply(self, op, target, timeout_ms):
+        """Wait for the 140-byte UTID reply matching *op* and *target*.
+
+        Returns the raw reply; identity and tuning replies share the format.
+        """
         deadline = time.time() + timeout_ms / 1000.0
         while time.time() < deadline:
             remaining = max(100, int((deadline - time.time()) * 1000))
@@ -631,9 +708,9 @@ class DiagnosticsManager:
             if (chunk is None or len(chunk) != _identity.REPLY_SIZE
                     or bytes(chunk[:4]) != _identity.REPLY_MAGIC):
                 continue
-            result = _identity.parse_reply(chunk)
-            if result.op == op and result.target == target:
-                return result
+            reply_op, reply_target, _status, _free, _kind = _identity.reply_header(chunk)
+            if reply_op == op and reply_target == target:
+                return bytes(chunk)
         # The master answers every identity command it accepts, so silence
         # means it rejected this one (busy finishing another maintenance
         # command, or firmware without identity support). A rejection stalls
@@ -693,6 +770,12 @@ def _check_identity_target(target):
     if target not in _identity.BOARD_FOR_TARGET:
         raise ValueError(f"unknown identity target {target!r}; "
                          "use TARGET_MAIN, TARGET_1550 or TARGET_638")
+
+
+def _check_tuning_target(target):
+    if target not in _tuning.BOARD_FOR_TARGET:
+        raise ValueError(f"no TEC tuning record on target {target!r}; "
+                         "use TARGET_1550 or TARGET_638")
 
 
 # ---------------------------------------------------------------------------

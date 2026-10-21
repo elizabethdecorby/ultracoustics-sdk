@@ -77,8 +77,10 @@ old record readable.
 ## Mainboard USB commands
 
 The commands use the standard 5-byte frame `[cmd][wValue u16][wIndex u16]`,
-with `wIndex` as the target: `0` mainboard, `1550`, `638`. Both are accepted
-only in IDLE or OVERRIDE.
+with `wIndex` as the target: `0` mainboard, `1550`, `638`. `wValue` is the
+record kind: `0` for identity records. Kind `1` carries TEC tuning records on
+the same commands ([TEC_TUNING.md](TEC_TUNING.md)). Both commands are
+accepted only in IDLE or OVERRIDE.
 
 | Cmd | Meaning | Payload |
 |---|---|---|
@@ -95,7 +97,8 @@ The mainboard **always** answers both commands with a 140-byte reply:
 | 6 | 2 | target (`0`, `1550` or `638`) |
 | 8 | 1 | status |
 | 9 | 1 | free slots left |
-| 10 | 2 | reserved |
+| 10 | 1 | record kind: `0` identity, `1` TEC tuning (was reserved; older firmware sends `0`) |
+| 11 | 1 | reserved |
 | 12 | 128 | record as read back (all `0xFF` if empty) |
 
 | Status | Name | Meaning |
@@ -108,6 +111,7 @@ The mainboard **always** answers both commands with a 140-byte reply:
 | 5 | `VERIFY_FAIL` | the readback after a write does not match |
 | 6 | `BAD_RECORD` | the host record failed header or length checks |
 | 7 | `BAD_STATE` | the mainboard was not in IDLE or OVERRIDE |
+| 8 | `BAD_KIND` | `wValue` is not a known record kind, or the kind is not stored on that target |
 
 ## Slave bootloader opcodes (mainboard ↔ `1550_boot` over SPI)
 
