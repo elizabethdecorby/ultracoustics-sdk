@@ -33,6 +33,12 @@ CHANNEL_PROFILE_ID = 12
 CHANNEL_TRACE_CONFIG = 13
 NORMALIZED_PI_VERSION = 1
 NORMALIZED_PI_MAX_KI_PER_S = 0x3fff / 10.0
+NORMALIZED_PI_INFO_MASKS = {1: 0x7ff, 2: 0x3fffff}  # contract version -> defined info bits
+NORMALIZED_PI_STORAGE = 1 << 17  # info: on-box gain storage (STORAGE_SPEC.md); bits 18-21 need it
+NORMALIZED_PI_COMMIT_S = 1.0     # store/clear: wait for the flash write (ms on the 638)
+NORMALIZED_PI_V2_MAX_KP = 1023 * 5 / 1000.0      # 0.005 steps
+NORMALIZED_PI_V2_MAX_KI_PER_S = 0x3fff            # integer 1/s
+NORMALIZED_PI_V2_MAX_ZERO_HZ = 63
 FP_SCAN_STATES = ('idle', 'armed', 'qualifying', 'active', 'complete', 'aborted')
 FP_SCAN_RESULTS = ('none', 'complete', 'explicit_abort', 'invalid_or_fault')
 FP_SCAN_MIN_RECORDS = 500
@@ -214,58 +220,133 @@ class SystemControlMixin:
             raise RuntimeError('638 firmware does not support normalized PI runtime controls')
         require_applied(reply)
         raw = reply.applied_value
-        if raw < 0 or raw & ~0x7ff or (raw & 255) != NORMALIZED_PI_VERSION:
+        mask = NORMALIZED_PI_INFO_MASKS.get(raw & 255) if raw >= 0 else None
+        if mask is not None and not raw & NORMALIZED_PI_STORAGE:
+            mask &= 0x3ffff  # stored/pending bits are defined only with storage support
+        if mask is None or raw & ~mask:
             raise RuntimeError(f'638 returned unsupported normalized PI contract {raw}')
         return {'version': raw & 255, 'active': bool(raw & 256),
-                'overridden': bool(raw & 512), 'slope_valid': bool(raw & 1024)}
+                'overridden': bool(raw & 512), 'slope_valid': bool(raw & 1024),
+                'zero_hz': (raw >> 11) & 63, 'storage_supported': bool(raw & NORMALIZED_PI_STORAGE),
+                'stored_active': bool(raw & 1 << 18), 'save_pending': bool(raw & 1 << 19),
+                'clear_pending': bool(raw & 1 << 20), 'last_write_failed': bool(raw & 1 << 21)}
 
     def read_normalized_pi_638(self, timeout_s=1.0):
-        """Read the explicit symmetric normalized PI pair and active law."""
+        """Read the explicit symmetric normalized PI pair, second-integrator zero and law."""
         info = self._normalized_pi_info_638(timeout_s)
         reply = require_applied(self._normalized_pi_command_638(
             MANUAL_GET, CHANNEL_NORMALIZED_PI, timeout_s=timeout_s))
         packed = reply.applied_value & 0xffffff  # ACK is signed 24-bit.
+        if info['version'] == 2:  # kp in 0.005 units, ki in integer 1/s
+            return dict(info, kp=(packed >> 14) * 5 / 1000.0, ki_per_s=float(packed & 0x3fff),
+                        packed=packed)
         kp_milli, ki_deci = packed >> 14, packed & 0x3fff
         if kp_milli > 1000:
             raise RuntimeError(f'638 returned out-of-range normalized PI pair {packed}')
         return dict(info, kp=kp_milli / 1000.0, ki_per_s=ki_deci / 10.0,
                     packed=packed)
 
-    def set_normalized_pi_638(self, kp, ki_per_s, timeout_s=1.0):
-        """Commit Kp and Ki/s together; verify the applied pair and law.
+    def set_normalized_pi_638(self, kp, ki_per_s, zero_hz=0, timeout_s=1.0):
+        """Commit Kp, Ki/s and the second-integrator zero together; verify the applied law.
 
-        The existing 14-bit Ki field permits 0..1638.3/s. Older firmware
-        may reject values above 1000/s; propagate that rejection without retries.
+        Contract v1 firmware: 14-bit Ki field 0..1638.3/s, Kp 0..1, no second
+        integrator (zero_hz must be 0). Older firmware may reject values above
+        1000/s; propagate that rejection without retries. Contract v2 firmware:
+        Kp 0..5.115 in 0.005 steps, Ki 0..16383 integer 1/s, zero_hz integer 0..63.
         Runtime overrides do not change the compiled profile defaults.
         """
         if (type(kp) not in (int, float) or type(ki_per_s) not in (int, float) or
                 not math.isfinite(kp) or not math.isfinite(ki_per_s) or
-                not 0 <= kp <= 1 or not 0 <= ki_per_s <= NORMALIZED_PI_MAX_KI_PER_S):
-            raise ValueError('Normalized PI requires finite Kp 0..1 and Ki 0..1638.3 per second')
+                not 0 <= kp <= NORMALIZED_PI_V2_MAX_KP or
+                not 0 <= ki_per_s <= NORMALIZED_PI_V2_MAX_KI_PER_S):
+            raise ValueError('Normalized PI requires finite Kp 0..5.115 and Ki 0..16383 per second')
+        if type(zero_hz) is not int or not 0 <= zero_hz <= NORMALIZED_PI_V2_MAX_ZERO_HZ:
+            raise ValueError('Normalized PI zero_hz must be an integer 0..63')
         info = self._normalized_pi_info_638(timeout_s)
+        if info['version'] == 1:
+            if zero_hz:
+                raise ValueError('638 normalized PI contract v1 has no second integrator (zero_hz must be 0)')
+            if not 0 <= kp <= 1 or not 0 <= ki_per_s <= NORMALIZED_PI_MAX_KI_PER_S:
+                raise ValueError('Normalized PI contract v1 requires Kp 0..1 and Ki 0..1638.3 per second')
         if not info['active'] or not info['slope_valid']:
             raise RuntimeError('638 normalized PI must be active with a valid slope before tuning')
-        packed = (round(kp * 1000) << 14) | round(ki_per_s * 10)
+        if info['version'] == 2:
+            packed = (round(kp / 0.005) << 14) | round(ki_per_s)
+            word = (1 << 30) | (zero_hz << 24) | packed
+        else:
+            packed = word = (round(kp * 1000) << 14) | round(ki_per_s * 10)
         reply = require_applied(self._normalized_pi_command_638(
-            MANUAL_SET, CHANNEL_NORMALIZED_PI, packed, timeout_s))
+            MANUAL_SET, CHANNEL_NORMALIZED_PI, word, timeout_s))
         if (reply.applied_value & 0xffffff) != packed:
             raise RuntimeError('638 normalized PI applied pair differs from request')
         result = self.read_normalized_pi_638(timeout_s)
-        if not result['active'] or not result['overridden'] or result['packed'] != packed:
+        if (not result['active'] or not result['overridden'] or result['packed'] != packed or
+                result['zero_hz'] != zero_hz or result['version'] != info['version']):
             raise RuntimeError('638 normalized PI verification failed after SET')
         return result
 
     def restore_normalized_pi_638(self, timeout_s=1.0):
-        """Restore profile defaults and verify normalized control remains active."""
+        """Restore the box defaults (stored record, else compiled profile); verify control stays active."""
         info = self._normalized_pi_info_638(timeout_s)
         if not info['active'] or not info['slope_valid']:
             raise RuntimeError('638 normalized PI must be active with a valid slope before restore')
         require_applied(self._normalized_pi_command_638(
             MANUAL_SET, CHANNEL_NORMALIZED_PI_INFO, 0, timeout_s))
         result = self.read_normalized_pi_638(timeout_s)
-        if not result['active'] or result['overridden']:
+        # The compiled profile has no second integrator; a stored record may.
+        if (not result['active'] or result['overridden'] or
+                (result['zero_hz'] and not result['stored_active'])):
             raise RuntimeError('638 normalized PI verification failed after restore')
         return result
+
+    def _normalized_pi_storage_638(self, action, timeout_s):
+        info = self._normalized_pi_info_638(timeout_s)
+        if not info['storage_supported']:
+            raise RuntimeError('638 firmware does not support on-box normalized PI storage')
+        if not info['active'] or not info['slope_valid']:
+            raise RuntimeError('638 normalized PI must be active with a valid slope before storage changes')
+        require_applied(self._normalized_pi_command_638(
+            MANUAL_SET, CHANNEL_NORMALIZED_PI_INFO, action, timeout_s))
+        deadline = time.monotonic() + NORMALIZED_PI_COMMIT_S
+        while True:  # the 638 main loop writes the record right after the SET
+            info = self._normalized_pi_info_638(timeout_s)
+            if not (info['save_pending'] or info['clear_pending']) or time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+        result = self.read_normalized_pi_638(timeout_s)
+        what = 'store' if action == 1 else 'clear'
+        if result['save_pending'] or result['clear_pending']:
+            raise RuntimeError(f'638 normalized PI {what} still pending after {NORMALIZED_PI_COMMIT_S:g} s')
+        if result['last_write_failed']:
+            raise RuntimeError(f'638 normalized PI {what}: flash write failed '
+                               '(no free record slot or write/read-back error); previous state kept')
+        if result['stored_active'] != (action == 1):
+            raise RuntimeError(f'638 normalized PI {what}: stored gains '
+                               + ('not active after the write' if action == 1 else 'still active after the write'))
+        if not result['active']:
+            raise RuntimeError(f'638 normalized PI verification failed after {what}')
+        return result
+
+    def store_normalized_pi_638(self, timeout_s=1.0):
+        """Save the active gains (override or box defaults) on the box; see STORAGE_SPEC.md.
+
+        The 638 writes the record right away; this waits for save_pending to drop
+        and requires stored_active without last_write_failed (RuntimeError with the
+        reason otherwise). Returns the final readback: the gains written. After
+        STOP and START they are the box defaults (stored_active, not overridden).
+        Requires storage support and normalized PI active (LOCKED).
+        """
+        return self._normalized_pi_storage_638(1, timeout_s)
+
+    def clear_stored_normalized_pi_638(self, timeout_s=1.0):
+        """Forget the stored gains; see STORAGE_SPEC.md.
+
+        The 638 writes the tombstone right away; this waits for clear_pending to
+        drop and requires stored_active False without last_write_failed. From the
+        next STOP and START the box defaults are the compiled profile. Requires
+        storage support and normalized PI active (LOCKED).
+        """
+        return self._normalized_pi_storage_638(2, timeout_s)
 
     def read_profile_638(self, timeout_s=1.0):
         """Read the compiled box profile identity from the 638 board."""

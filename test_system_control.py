@@ -17,6 +17,42 @@ class Fake(SystemControlMixin):
   if opcode in (MANUAL_SET,MANUAL_TAKE):self.values[target,channel]=value
   if opcode==MANUAL_RELEASE and channel==3:self.values[target,channel]=0
   return SimpleNamespace(target=target,status=0,channel=channel,owner=1,applied_value=self.values.get((target,channel),25000 if channel==1 else 0))
+class StorageFake(Fake):
+ """STORAGE_SPEC firmware (contract v2, REVISION 2026-10-21): ch11 SET 0 restore / 1 save / 2 clear.
+ The 638 main loop writes a save/clear right after the SET: the first ch11 read still shows it
+ pending, then it is committed (fail_write: bit 21, previous state kept). SET 0 cancels a change
+ not yet committed. The record survives STOP/START (the master powers the 638 off in IDLE)."""
+ COMPILED=(97,450,0)  # belycomm 0.483/449.8 on the wire grid: (kp/0.005, ki 1/s, zero Hz)
+ def __init__(self,stored=None,fail_write=False):
+  super().__init__();self._system_manual_active=False;self._system_manual_owned=set()
+  self.stored,self.pending,self.locked,self.fail_write,self.failed=stored,None,True,fail_write,False
+  self.gains,self.over=self.box_defaults(),False
+ def box_defaults(self):return self.stored or self.COMPILED
+ def commit(self):
+  if self.pending and self.fail_write:self.failed=True
+  elif self.pending:self.stored=self.pending[1]
+  self.pending=None
+ def stop_start(self):  # power-off in IDLE loses RAM state; START reloads the box defaults
+  self.pending,self.failed=None,False;self.gains,self.over=self.box_defaults(),False
+ def manual_command(self,target,opcode,channel,value=0,timeout_s=1):
+  self.calls.append((target,opcode,channel,value));status=0
+  if opcode==MANUAL_SET and not self.locked:status=6
+  elif opcode==MANUAL_SET and channel==11:
+   if value==0:self.pending=None;self.gains,self.over=self.box_defaults(),False
+   elif value in (1,2):self.pending,self.failed=(('save',self.gains) if value==1 else ('clear',None)),False
+   else:status=6
+  elif opcode==MANUAL_SET and channel==10:
+   if value<0 or (value>>30)!=1:status=6
+   else:self.gains,self.over=((value>>14)&1023,value&0x3fff,(value>>24)&63),True
+  kind=self.pending and self.pending[0]
+  if channel==11:
+   raw=(2|self.locked<<8|self.over<<9|self.locked<<10|self.gains[2]<<11|1<<17|bool(self.stored)<<18|
+        (kind=='save')<<19|(kind=='clear')<<20|self.failed<<21)
+   if opcode==MANUAL_GET:self.commit()
+  else:
+   raw=self.gains[0]<<14|self.gains[1]
+   if raw&(1<<23):raw-=1<<24
+  return SimpleNamespace(target=target,status=status,channel=channel,owner=0,applied_value=raw)
 class SystemControlTests(unittest.TestCase):
  def _manual_readiness_timeout(self,snapshot):
   class Clock:
@@ -158,7 +194,12 @@ class SystemControlTests(unittest.TestCase):
   for invalid in (1638.31, -0.1, float('inf'), float('nan')):
    before=len(f.calls)
    with self.assertRaises(ValueError):f.set_normalized_pi_638(.2,invalid)
-   self.assertEqual(len(f.calls),before)
+   # v1 limits need the contract version: at most the info GET, never a SET
+   self.assertEqual(f.calls[before:],[(638,MANUAL_GET,11,0)] if invalid==1638.31 else [])
+  before=len(f.calls)
+  with self.assertRaisesRegex(ValueError,'no second integrator'):f.set_normalized_pi_638(.2,90,zero_hz=20)
+  self.assertFalse(any(c[1]==MANUAL_SET for c in f.calls[before:]))
+  self.assertEqual(f.read_normalized_pi_638()['zero_hz'],0)
   self.assertFalse(f.restore_normalized_pi_638()['overridden'])
   with self.assertRaises(ValueError):f.set_normalized_pi_638(1.1,95)
   self.assertFalse(any(c[1]==MANUAL_SET and c[2] in (4,5,6) for c in f.calls))
@@ -185,6 +226,144 @@ class SystemControlTests(unittest.TestCase):
     return super().manual_command(target,opcode,channel,value,timeout_s)
   with self.assertRaisesRegex(RuntimeError,'capability probe failed; check master/638 firmware support'):
    OldMasterFake().read_normalized_pi_638()
+ def test_normalized_pi_contract_v2_word_echo_zero_and_restore(self):
+  class V2Fake(Fake):
+   """V2_SPEC firmware: 32-bit SET word, 24-bit signed echo, zero_hz in info bits 11-16."""
+   def __init__(self):
+    super().__init__();self._system_manual_active=False;self._system_manual_owned=set()
+    self.kp,self.ki,self.zero,self.over,self.info_extra=.483,449.8,0,False,0
+   def manual_command(self,target,opcode,channel,value=0,timeout_s=1):
+    self.calls.append((target,opcode,channel,value));status=0
+    if opcode==MANUAL_SET and channel==11:self.kp,self.ki,self.zero,self.over=.483,449.8,0,False
+    if opcode==MANUAL_SET and channel==10:
+     kp5,ki,zero=(value>>14)&1023,value&0x3fff,(value>>24)&63
+     if value<0 or (value>>30)!=1:status=6
+     else:self.kp,self.ki,self.zero,self.over=kp5*.005,ki,zero,True
+    if channel==11:raw=2|256|(512 if self.over else 0)|1024|(self.zero<<11)|self.info_extra
+    else:
+     raw=(round(self.kp/.005)<<14)|round(self.ki)
+     if raw&(1<<23):raw-=1<<24
+    return SimpleNamespace(target=target,status=status,channel=channel,owner=0,applied_value=raw)
+  f=V2Fake()
+  r=f.read_normalized_pi_638()
+  self.assertEqual((r['version'],r['kp'],r['ki_per_s'],r['zero_hz'],r['overridden']),(2,.485,450.0,0,False))
+  r=f.set_normalized_pi_638(2.6,5000,zero_hz=30)
+  self.assertIn((638,MANUAL_SET,10,(1<<30)|(30<<24)|(520<<14)|5000),f.calls)
+  self.assertEqual((r['kp'],r['ki_per_s'],r['zero_hz'],r['packed']),(2.6,5000.0,30,(520<<14)|5000))
+  self.assertTrue(r['overridden'] and r['active'])
+  for kp,ki,zero in ((5.115,16383,63),(0,0,0),(.525,1637.5,20),(1.0,1638.3,0)):
+   r=f.set_normalized_pi_638(kp,ki,zero_hz=zero)
+   self.assertEqual((r['kp'],r['ki_per_s'],r['zero_hz']),(round(kp/.005)*5/1000,float(round(ki)),zero))
+  for args in ((5.12,100),(.5,16383.5),(.5,100,64),(.5,100,1.5),(.5,100,True),(.5,100,-1),(float('nan'),100)):
+   before=len(f.calls)
+   with self.assertRaises(ValueError):f.set_normalized_pi_638(*args)
+   self.assertEqual(len(f.calls),before)
+  r=f.restore_normalized_pi_638()
+  self.assertEqual((r['overridden'],r['zero_hz'],r['kp'],r['ki_per_s']),(False,0,.485,450.0))
+  class DropsZero(V2Fake):
+   def manual_command(self,target,opcode,channel,value=0,timeout_s=1):
+    reply=super().manual_command(target,opcode,channel,value,timeout_s);self.zero=0;return reply
+  with self.assertRaisesRegex(RuntimeError,'verification failed after SET'):
+   DropsZero().set_normalized_pi_638(.5,1000,zero_hz=20)
+  for extra in (1<<18,1<<21,1<<23):  # bit 18 needs storage support (bit 17)
+   g=V2Fake();g.info_extra=extra
+   with self.assertRaisesRegex(RuntimeError,'unsupported normalized PI contract'):g.read_normalized_pi_638()
+  class V3Fake(V2Fake):
+   def manual_command(self,target,opcode,channel,value=0,timeout_s=1):
+    reply=super().manual_command(target,opcode,channel,value,timeout_s)
+    if channel==11:reply.applied_value=(reply.applied_value&~255)|3
+    return reply
+  with self.assertRaisesRegex(RuntimeError,'unsupported normalized PI contract'):V3Fake().read_normalized_pi_638()
+  class V1ExtraBits(V2Fake):
+   def manual_command(self,target,opcode,channel,value=0,timeout_s=1):
+    reply=super().manual_command(target,opcode,channel,value,timeout_s)
+    if channel==11:reply.applied_value=1|256|1024|(20<<11)
+    return reply
+  with self.assertRaisesRegex(RuntimeError,'unsupported normalized PI contract'):V1ExtraBits().read_normalized_pi_638()
+ def _info(self,raw):
+  f=Fake();f._system_manual_active=False;f._system_manual_owned=set();f.values[638,11]=raw
+  return f._normalized_pi_info_638()
+ def test_normalized_pi_storage_info_decode(self):
+  keys=('storage_supported','stored_active','save_pending','clear_pending')
+  v2=2|256|1024
+  for raw in (1|256|1024,v2,v2|20<<11):  # contract v1, v2 without storage: all False
+   self.assertEqual([self._info(raw)[k] for k in keys],[False]*4)
+  self.assertEqual([self._info(v2|1<<17)[k] for k in keys],[True,False,False,False])
+  for i,key in enumerate(keys[1:]):
+   info=self._info(v2|1<<17|1<<(18+i)|20<<11)
+   self.assertEqual([info[k] for k in keys],[True]+[k==key for k in keys[1:]])
+   self.assertEqual((info['version'],info['active'],info['slope_valid'],info['zero_hz']),(2,True,True,20))
+  self.assertTrue(self._info(v2|1<<17|1<<21)['last_write_failed'])
+  self.assertFalse(self._info(v2|1<<17)['last_write_failed'])
+  for raw in (v2|1<<18,v2|1<<19,v2|1<<20,v2|1<<21,v2|1<<17|1<<22,1|256|1024|1<<17):
+   with self.assertRaisesRegex(RuntimeError,'unsupported normalized PI contract'):self._info(raw)
+ def test_normalized_pi_store_writes_now_survives_stop_restore_uses_it_and_clear_returns_to_compiled_profile(self):
+  f=StorageFake()
+  f.set_normalized_pi_638(2.6,5000,zero_hz=30)
+  r=f.store_normalized_pi_638()
+  get11,get10=(638,MANUAL_GET,11,0),(638,MANUAL_GET,10,0)
+  self.assertEqual(f.calls[-5:],[(638,MANUAL_SET,11,1),get11,get11,get11,get10])  # pending once, then written
+  self.assertEqual((r['save_pending'],r['clear_pending'],r['stored_active'],r['last_write_failed'],r['overridden']),
+                   (False,False,True,False,True))
+  self.assertEqual((r['kp'],r['ki_per_s'],r['zero_hz'],f.stored),(2.6,5000.0,30,(520,5000,30)))  # written before any STOP
+  f.stop_start()
+  r=f.read_normalized_pi_638()
+  self.assertEqual((r['stored_active'],r['overridden'],r['kp'],r['ki_per_s'],r['zero_hz']),(True,False,2.6,5000.0,30))
+  f.set_normalized_pi_638(.5,1000)
+  r=f.restore_normalized_pi_638()  # box defaults are the stored record, second integrator included
+  self.assertEqual((r['overridden'],r['stored_active'],r['kp'],r['ki_per_s'],r['zero_hz']),(False,True,2.6,5000.0,30))
+  f.set_normalized_pi_638(.7,2500)
+  self.assertEqual(f.store_normalized_pi_638()['kp'],.7)  # a new save replaces the record
+  self.assertEqual(f.stored,(140,2500,0))
+  r=f.clear_stored_normalized_pi_638()
+  self.assertEqual(f.calls[-5][:4],(638,MANUAL_SET,11,2))
+  self.assertEqual((r['clear_pending'],r['stored_active'],r['last_write_failed'],f.stored),(False,False,False,None))
+  f.stop_start()
+  r=f.read_normalized_pi_638()
+  self.assertEqual((r['stored_active'],r['overridden'],r['kp'],r['ki_per_s'],r['zero_hz']),(False,False,.485,450.0,0))
+  f.set_normalized_pi_638(.5,1000,zero_hz=20)
+  self.assertEqual(f.restore_normalized_pi_638()['zero_hz'],0)
+  r=f.store_normalized_pi_638()  # saving the defaults (not overridden) is allowed too
+  self.assertEqual((r['stored_active'],r['overridden'],r['kp']),(True,False,.485))
+ def test_normalized_pi_storage_write_failure_lost_write_timeout_and_cancel(self):
+  f=StorageFake(stored=(120,1925,0),fail_write=True)
+  f.set_normalized_pi_638(.7,2500)
+  with self.assertRaisesRegex(RuntimeError,'store: flash write failed'):f.store_normalized_pi_638()
+  r=f.read_normalized_pi_638()
+  self.assertEqual((r['last_write_failed'],r['stored_active'],r['save_pending'],f.stored),(True,True,False,(120,1925,0)))
+  with self.assertRaisesRegex(RuntimeError,'clear: flash write failed'):f.clear_stored_normalized_pi_638()
+  f.fail_write=False
+  self.assertFalse(f.store_normalized_pi_638()['last_write_failed'])  # a new SET 1 clears bit 21
+  self.assertEqual(f.stored,(140,2500,0))
+  class LosesWrite(StorageFake):  # pending drops but nothing is written (the IDLE-commit symptom)
+   def commit(self):self.pending=None
+  with self.assertRaisesRegex(RuntimeError,'store: stored gains not active after the write'):
+   LosesWrite().store_normalized_pi_638()
+  with self.assertRaisesRegex(RuntimeError,'clear: stored gains still active after the write'):
+   LosesWrite(stored=(120,1925,0)).clear_stored_normalized_pi_638()
+  class NeverCommits(StorageFake):
+   def commit(self):pass
+  clock=[0.0]
+  with patch('ultracoustics.system_control.time.monotonic',side_effect=lambda:clock[0]), \
+       patch('ultracoustics.system_control.time.sleep',side_effect=lambda dt:clock.__setitem__(0,clock[0]+dt)):
+   g=NeverCommits()
+   with self.assertRaisesRegex(RuntimeError,'store still pending after 1 s'):g.store_normalized_pi_638()
+  self.assertGreaterEqual(clock[0],1.0);self.assertLess(clock[0],1.1)
+  self.assertGreater(sum(c==(638,MANUAL_GET,11,0) for c in g.calls),40)
+  h=StorageFake()  # SET 0 before the main loop commits cancels the change
+  h.manual_command(638,MANUAL_SET,11,1);h.manual_command(638,MANUAL_SET,11,0)
+  r=h.read_normalized_pi_638()
+  self.assertEqual((r['save_pending'],r['stored_active'],h.stored),(False,False,None))
+ def test_normalized_pi_storage_refused_without_support_or_lock(self):
+  for raw in (1|256|1024,2|256|1024):  # contract v1; contract v2 without storage
+   f=Fake();f._system_manual_active=False;f._system_manual_owned=set();f.values[638,11]=raw
+   for call in (f.store_normalized_pi_638,f.clear_stored_normalized_pi_638):
+    with self.assertRaisesRegex(RuntimeError,'does not support on-box'):call()
+   self.assertFalse(any(c[1]==MANUAL_SET for c in f.calls))
+  f=StorageFake();f.locked=False
+  for call in (f.store_normalized_pi_638,f.clear_stored_normalized_pi_638):
+   with self.assertRaisesRegex(RuntimeError,'active with a valid slope'):call()
+  self.assertFalse(any(c[1]==MANUAL_SET for c in f.calls))
  def test_renew_failure_stops_both(self):
   f=Fake()
   def fail(*a,**k):raise TimeoutError('ack')
