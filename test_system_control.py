@@ -53,19 +53,30 @@ def raw_638_record(payload,seq):
  return raw+b'\xff'*(128-len(raw))
 class RecordFake(Fake):
  """The mainboard's 'n'/'N' relay (record kind 1) to the 638 bootloader's tuning store, answered
- through the stream (docs/TEC_TUNING.md). The store assigns the sequence. mode: None,
- 'old_master' (identity reply), 'old_boot' (NO_RESPONSE), 'busy' (BAD_STATE), 'silent' (no
- reply), 'corrupt' (stores Ki - 1)."""
+ through the stream (docs/TEC_TUNING.md). The store assigns the sequence. While it handles a
+ record the mainboard pauses the ADC stream, and it resumes it ~100 ms after the reply (here:
+ after resume_in stream_stats reads); until then it refuses record commands without a reply
+ (box 0056, 2026-10-21). mode: None, 'old_master' (identity reply), 'old_boot' (NO_RESPONSE),
+ 'busy' (BAD_STATE), 'silent' (no reply), 'corrupt' (stores Ki - 1)."""
  def __init__(self,record=None,mode=None):
   super().__init__();self._running=False;self._system_manual_active=False;self._system_manual_owned=set()
   self.record,self.mode,self.requests=record,mode,[]
   self.seq=tn.parse_record(record).seq if record else 0
+  self.packets,self.resume_in,self.refused=0,0,0
   self._stream=SimpleNamespace(running=True,_request_stream_control=self.request)
+ @property
+ def stream_stats(self):
+  if self.resume_in:self.resume_in-=1
+  else:self.packets+=1
+  return {'packets':self.packets}
  def request(self,payload,kind,stream_format=None,timeout_s=1.0,response_timeout_s=None):
   self.requests.append((payload[:5],payload[5:],kind,timeout_s,response_timeout_s))
   op=ident.OP_WRITE if payload[0]==protocol.CMD_IDENTITY_WRITE else ident.OP_READ
-  if self.mode=='silent':raise RuntimeError('stream-control request failed (firmware control response timed out)')
+  if self.mode=='silent' or self.resume_in:
+   self.refused+=bool(self.resume_in)
+   raise RuntimeError('stream-control request failed (firmware control response timed out)')
   status={'old_boot':ident.STATUS_NO_RESPONSE,'busy':ident.STATUS_BAD_STATE}.get(self.mode,ident.STATUS_OK)
+  if status!=ident.STATUS_BAD_STATE:self.resume_in=3  # still in its record state after the reply
   if status==ident.STATUS_OK and op==ident.OP_WRITE:
    tuning=tn.parse_record(payload[5:]).tuning
    if self.mode=='corrupt':tuning.lock_ki_per_s-=1
@@ -333,9 +344,8 @@ class SystemControlTests(unittest.TestCase):
  def test_lock_write_keeps_the_stored_tec_fields_and_returns_the_readback(self):
   tec=tn.TecTuning(board=3,kp=.07,ki=.22,integrator_limit=1.36,setpoint_filter=True,report_id='TUNE_X')
   f=RecordFake(tn.build_record(tec,seq=4))
-  with patch('ultracoustics.system_control.time.sleep') as sleep:
+  with patch('ultracoustics.system_control.time.sleep'):
    r=f.write_lock_tuning_638(.6,1925,report_id='LOCK_0056_DUSTIN')
-  sleep.assert_called_once_with(tn.RMW_GAP_S)
   (read,_,kind,bound,response_s),(write,record,*_)=f.requests
   self.assertEqual((read,kind,bound,response_s),(protocol.pack_command(protocol.CMD_IDENTITY_READ,1,638),'record',15.5,15.0))
   self.assertEqual((write,len(record),record[6]),(protocol.pack_command(protocol.CMD_IDENTITY_WRITE,1,638),128,60))
@@ -346,6 +356,29 @@ class SystemControlTests(unittest.TestCase):
   self.assertEqual(r,f.read_tuning_638())
   self.assertEqual(set(r),{'stored','sequence','rejected','lock_kp','lock_ki_per_s','lock_zero_hz','kp','ki','kd',
                            'integrator_limit','setpoint_filter','conditional_integration','tuned_at','report_id'})
+ def test_record_exchanges_wait_for_the_mainboard_to_resume_streaming(self):
+  # Box 0056 (master 9514d0a), 2026-10-21: a read sent right after another reply got no reply (the
+  # mainboard was still in its record state); after the ADC stream resumed (0.10 s) it was answered.
+  f=RecordFake()
+  r1,r2=f.read_tuning_638(),f.read_tuning_638()  # back to back, as record_test.py's read + write did
+  r3=f.write_lock_tuning_638(.575,1575)          # its read, then its write
+  self.assertEqual((f.refused,len(f.requests),r1,r2['stored'],r3['lock_kp']),(0,4,r2,False,.575))
+  self.assertEqual(f.resume_in,0)  # back in IDLE on return, so a START is not ignored
+  f.resume_in=5  # an earlier maintenance command (e.g. a stream format change) not finished yet
+  self.assertEqual(f.read_tuning_638()['sequence'],1);self.assertEqual(f.refused,0)
+  class OldSDK(RecordFake):
+   def _await_mainboard_streaming(self,limit_s=1.0):return True
+  g=OldSDK();g.read_tuning_638()
+  with self.assertRaisesRegex(RuntimeError,'no reply; the mainboard refused'):g.read_tuning_638()
+  self.assertEqual(g.refused,1)
+  class Frozen(RecordFake):  # no ADC packets at all: give up after the bound and send anyway
+   stream_stats={'packets':7}
+  clock=[0.0]
+  with patch('ultracoustics.system_control.time.monotonic',side_effect=lambda:clock[0]), \
+       patch('ultracoustics.system_control.time.sleep',side_effect=lambda dt:clock.__setitem__(0,clock[0]+dt)):
+   self.assertFalse(Frozen()._await_mainboard_streaming())
+   self.assertFalse(Frozen().read_tuning_638()['stored'])
+  self.assertGreaterEqual(clock[0],3.0)
  def test_lock_clear_keeps_tec_fields_and_an_empty_board_reads_unset(self):
   f=RecordFake()
   r=f.read_tuning_638()

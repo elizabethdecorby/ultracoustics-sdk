@@ -251,8 +251,14 @@ writes one group new and the other as stored:
 A stored group that the firmware rejects is not kept: the firmware ignores
 it either way, so the board keeps running what it runs now. If the read does
 not return `OK` or `EMPTY`, nothing is written. `tuned_at` and `report_id`
-describe the new write. The mainboard is back in IDLE about 100 ms after a
-reply; the SDK waits 0.25 s between the read and the write.
+describe the new write.
+
+The mainboard stays in its record state for about 100 ms after each reply
+and refuses another `n` / `N` without a reply until it is back in IDLE (it
+also ignores START then). `DiagnosticsManager` waits 0.25 s between the read
+and the write. A `Controller` sees the mainboard leave a maintenance state
+when its ADC stream resumes (the stream pauses for every one), so it waits
+for an ADC packet before and after each exchange.
 
 ### Host API on a running Controller
 

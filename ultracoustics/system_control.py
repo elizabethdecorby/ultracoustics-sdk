@@ -302,6 +302,22 @@ class SystemControlMixin:
 
     # -- Lock PI gains in the 638 tuning record (docs/TEC_TUNING.md) --------
 
+    def _await_mainboard_streaming(self, limit_s=1.0):
+        """Return once an ADC packet arrives after this call (False after *limit_s*).
+
+        The mainboard pauses the ADC stream for each maintenance command
+        (stream control, runtime metrics, board records) and resumes it on
+        its way back to IDLE, about 100 ms after a record reply. Until then
+        it refuses 'n'/'N' without a reply and ignores START.
+        """
+        baseline = int((self.stream_stats or {}).get('packets', 0))
+        deadline = time.monotonic() + limit_s
+        while int((self.stream_stats or {}).get('packets', 0)) <= baseline:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.001)
+        return True
+
     def _tuning_exchange_638(self, tuning=None, timeout_s=8.0):
         """Read ('n') or write ('N') the 638 tuning record on this connection.
 
@@ -319,6 +335,7 @@ class SystemControlMixin:
             raise RuntimeError('call begin_stream() before 638 tuning record access')
         command = CMD_IDENTITY_READ if tuning is None else CMD_IDENTITY_WRITE
         record = b'' if tuning is None else _tuning.build_record(tuning)
+        self._await_mainboard_streaming()  # out of any earlier maintenance state
         try:
             raw = self._stream._request_stream_control(
                 pack_command(command, _tuning.KIND, 638) + record, 'record',
@@ -330,6 +347,8 @@ class SystemControlMixin:
                 raise
             raise RuntimeError(f'638 tuning record {what}: no reply; the mainboard refused the '
                                'command (busy, or firmware without board records)') from exc
+        # Back in IDLE before the next command: another record exchange, or START.
+        self._await_mainboard_streaming()
         try:
             result = _tuning.parse_reply(raw)
         except _tuning.TuningError as exc:  # incl. an identity reply from older mainboard firmware
@@ -380,7 +399,6 @@ class SystemControlMixin:
         _tuning.validate(tuning)  # before anything is sent
         stored = self._tuning_exchange_638(timeout_s=timeout_s)
         tuning = _tuning.keep_stored(tuning, stored.record, 'tec')
-        time.sleep(_tuning.RMW_GAP_S)
         result = self._tuning_exchange_638(tuning, timeout_s)
         sent = _tuning.parse_record(_tuning.build_record(tuning)).tuning
         if (result.status != _identity.STATUS_OK or result.record is None

@@ -56,8 +56,10 @@ LOCK_BOUNDS = {
 _LOCK_FLOATS = ("lock_kp", "lock_ki_per_s")  # payload offsets 48, 52
 _LOCK_ZERO = 56  # u8, 0xFF not set; 57-59 reserved 0xFF
 LOCK_FIELDS = _LOCK_FLOATS + ("lock_zero_hz",)
-# A read-modify-write waits this long between the read reply and the write:
-# the mainboard resumes streaming and returns to IDLE 100 ms after a reply.
+# A read-modify-write on a bare USB connection waits this long between the
+# read reply and the write: the mainboard returns to IDLE 100 ms after a
+# reply and refuses record commands until then. (A Controller waits for its
+# ADC stream to resume instead.)
 RMW_GAP_S = 0.25
 
 
