@@ -96,7 +96,10 @@ class Programmer:
     MASTER_PAGE_SIZE = 512
     # Sector 7 (the last 8 KB) holds the board identity record and is never
     # erased by IAP, so master images are limited to sectors 0-6.
-    MASTER_MAX_FW = 56 * 1024
+    # Master IAP with the identity store on the external SPI NOR (xspi-flash, 0e503ca+) erases
+    # sectors 0-7 and takes 64 KB. A master on the 56 KB layout (identity in sector 7)
+    # refuses a larger image at IAP BEGIN, before anything is erased.
+    MASTER_MAX_FW = 64 * 1024
 
     # ---- Master IAP magic header (must match Boot/Core/Inc/firmware_info.h)
     MASTER_MAGIC_BYTES         = b"UCBT"   # FW_MAGIC_BYTES

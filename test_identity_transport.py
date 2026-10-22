@@ -126,7 +126,7 @@ class SystemInfoTests(unittest.TestCase):
 
 class MasterSizeGuardTests(unittest.TestCase):
     def test_master_image_limit_leaves_sector_7_free(self):
-        self.assertEqual(Programmer.MASTER_MAX_FW, 0x0800E000 - 0x08000000)
+        self.assertEqual(Programmer.MASTER_MAX_FW, 64 * 1024)  # identity store moved to the external NOR
 
 
 if __name__ == "__main__":
