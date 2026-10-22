@@ -60,10 +60,13 @@ STATUS_NAMES = {
 }
 
 _STR, _U32 = "str", "u32"
-# Pot resistances: u16 counts of 1/scale ohm. Records written before this
-# change used float32 (4 bytes); decode still accepts that length.
+# Pot resistances: u16 counts of 1/scale ohm. Whole-ohm pots above 65535 ohm
+# take a 3-byte u24 instead, so values that fit a u16 keep the old encoding.
+# Records written before the u16 change used float32 (4 bytes); decode still
+# accepts that length.
 _OHM_X10, _OHM = "ohm_x10", "ohm"
 _OHM_SCALE = {_OHM_X10: 10, _OHM: 1}
+_OHM_MAX_COUNTS = {_OHM_X10: 0xFFFF, _OHM: 0xFFFFFF}
 _ALL = (BOARD_MAIN, BOARD_1550, BOARD_638)
 _LASERS = (BOARD_1550, BOARD_638)
 
@@ -74,8 +77,8 @@ _FIELDS = {
     "pd_pcb_rev":     (0x03, _STR, 12, (BOARD_MAIN,)),
     "circ_sn":        (0x04, _STR, 24, (BOARD_MAIN,)),
     "driver_pot_ohm": (0x10, _OHM_X10, 0, _LASERS),  # 0.1 ohm, <= 6553.5
-    "lpf_pot_ohm":    (0x11, _OHM, 0, _LASERS),      # 1 ohm, <= 65535
-    "pd_pot_ohm":     (0x12, _OHM, 0, _LASERS),      # 1 ohm, <= 65535
+    "lpf_pot_ohm":    (0x11, _OHM, 0, _LASERS),      # 1 ohm, <= 16777215
+    "pd_pot_ohm":     (0x12, _OHM, 0, _LASERS),      # 1 ohm, <= 16777215
     "programmed_at":  (0x20, _U32, 0, _ALL),
     "report_id":      (0x21, _STR, 24, _ALL),
 }
@@ -168,11 +171,13 @@ def encode_payload(identity: BoardIdentity) -> bytes:
                 raise IdentityError(f"{name} is {len(data)} bytes; max {max_len}")
         elif kind in _OHM_SCALE:
             scale = _OHM_SCALE[kind]
+            limit = _OHM_MAX_COUNTS[kind]
             counts = round(float(value) * scale)
-            if not 0 <= counts <= 0xFFFF:
+            if not 0 <= counts <= limit:
                 raise IdentityError(
-                    f"{name} = {value} ohm is outside 0-{0xFFFF / scale:g} ohm")
-            data = struct.pack("<H", counts)
+                    f"{name} = {value} ohm is outside 0-{limit / scale:g} ohm")
+            data = (struct.pack("<H", counts) if counts <= 0xFFFF
+                    else counts.to_bytes(3, "little"))
         else:
             data = struct.pack("<I", int(value))
         out += bytes((tag, len(data))) + data
@@ -203,6 +208,8 @@ def decode_payload(board: int, payload: bytes) -> BoardIdentity:
             setattr(identity, name, value.decode("utf-8", errors="replace"))
         elif kind in _OHM_SCALE and length == 2:
             setattr(identity, name, struct.unpack("<H", value)[0] / _OHM_SCALE[kind])
+        elif kind == _OHM and length == 3:
+            setattr(identity, name, float(int.from_bytes(value, "little")))
         elif kind in _OHM_SCALE and length == 4:  # float32 from before u16
             setattr(identity, name, struct.unpack("<f", value)[0])
         elif kind == _U32 and length == 4:

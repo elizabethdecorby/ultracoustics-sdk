@@ -53,11 +53,21 @@ class RecordTests(unittest.TestCase):
                          (15.0, 9080.0, 0.0))
 
     def test_pot_range_limits(self):
-        ident.encode_payload(laser(driver_pot_ohm=6553.5, lpf_pot_ohm=65535))
+        ident.encode_payload(laser(driver_pot_ohm=6553.5,
+                                   lpf_pot_ohm=0xFFFFFF, pd_pot_ohm=0xFFFFFF))
         for bad in (dict(driver_pot_ohm=6553.6), dict(driver_pot_ohm=-0.1),
-                    dict(lpf_pot_ohm=65536), dict(pd_pot_ohm=-1)):
+                    dict(lpf_pot_ohm=0x1000000), dict(pd_pot_ohm=-1)):
             with self.assertRaises(IdentityError, msg=str(bad)):
                 ident.encode_payload(laser(**bad))
+
+    def test_large_whole_ohm_pots_take_a_u24(self):
+        # Hundreds of kilohms no longer fit a u16; values that do keep it.
+        payload = ident.encode_payload(BoardIdentity(
+            board=ident.BOARD_638, lpf_pot_ohm=470000.4, pd_pot_ohm=65535))
+        self.assertIn(bytes((0x11, 3)) + (470000).to_bytes(3, "little"), payload)
+        self.assertIn(bytes((0x12, 2)) + struct.pack("<H", 65535), payload)
+        got = ident.decode_payload(ident.BOARD_638, payload)
+        self.assertEqual((got.lpf_pot_ohm, got.pd_pot_ohm), (470000.0, 65535.0))
 
     def test_float32_pots_from_older_records_still_decode(self):
         payload = bytes((0x10, 4)) + struct.pack("<f", 19.8)
