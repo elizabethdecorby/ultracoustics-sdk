@@ -63,12 +63,21 @@ record with the highest sequence number. A write programs the next erased slot
 and never touches the previous record, so a power loss mid-write leaves the
 old record readable.
 
-- **Mainboard:** internal flash sector 7 (`0x0800E000`, 8 KB), 64 slots.
-  - When all slots are full, the sector is erased and the new record goes
-    into slot 0. A power loss between that erase and the write leaves the
-    board empty.
-  - Master IAP erases only sectors 0–6, so firmware images are limited to
-    56 KB.
+- **Mainboard:** the external SPI NOR (U13, MX25L12833F on XSPI1), two 4 KB
+  sectors at `0xFFE000` and `0xFFF000`, 32 slots per sector, used ping-pong
+  (master `xspi-flash` / `0e503ca` and later; see that repo's
+  `docs/EXTFLASH.md`).
+  - When the active sector is full, the new record is written to the other
+    sector before the old one is erased. `slots_free` counts the active
+    sector (0–32).
+  - If the external flash does not answer, the reply is `NO_RESPONSE` and
+    nothing is written.
+  - Master IAP never touches the external flash, erases internal sectors 0–7
+    and takes images up to 64 KB.
+  - Masters on the earlier layout (`tec-tuning` 9514d0a) keep the record in
+    internal sector 7 and accept images up to 56 KB. Upgrading one takes two
+    hops (a DEV_DIAGNOSTICS=OFF image under 56 KB first, then the full image);
+    read the main record with `n` before and write it back with `N` after.
 - **Laser boards:** sectors 2 and 3 (`0x08008000` and `0x0800C000`, 16 KB
   each), 128 slots per sector, used ping-pong.
   - When the active sector is full, the new record is written to the other
