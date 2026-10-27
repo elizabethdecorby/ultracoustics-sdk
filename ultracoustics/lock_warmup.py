@@ -20,7 +20,10 @@ from . import lock_calibration as _cal
 from .lock_check import check_lock_638
 from .pi_characterization import _Cancelled, _plain
 
-SETTLE = dict(min_locked_s=10.0, quiet_s=5.0, span_dac=100, drift_dac_per_s=3.0, timeout_s=90.0)
+# Quiet enough for a 1.6 s burst: the span limit catches handling and bumps; a slow thermal drift is detrended
+# by the check, so it may be faster than the calibration's 3 DAC/s (its trace takes a minute), which right after
+# lock kept GUI warm-ups waiting 6-10 s longer on 00560032.
+SETTLE = dict(min_locked_s=10.0, quiet_s=5.0, span_dac=100, drift_dac_per_s=10.0, timeout_s=90.0)
 LOCK_TIMEOUT_S = 60.0
 APPLY_EXPECTED_S = dict(checking=0.5, residual_before=2.0, applying=3.0, residual_after=2.0, relock_test=4.0)
 STEP_WEIGHTS = dict(settling=12, checking=3.5, applying=11.5, storing=20, confirming=15.5)
@@ -38,7 +41,7 @@ def wait_settled_638(controller, *, progress=None, cancel=None, min_locked_s=SET
                      quiet_s=SETTLE["quiet_s"], span_dac=SETTLE["span_dac"],
                      drift_dac_per_s=SETTLE["drift_dac_per_s"], timeout_s=SETTLE["timeout_s"]):
     """Wait until the 638 has been LOCKED for ``min_locked_s`` and its DAC was quiet over the last ``quiet_s``
-    (span <= ``span_dac``, |drift| <= ``drift_dac_per_s``): the calibration's own quiet limits, shorter windows.
+    (span <= ``span_dac``, |drift| <= ``drift_dac_per_s``; see SETTLE).
     Returns ``{"settled", "locked_s", "span_dac", "drift_dac_per_s", "waited_s"}``; never raises on a noisy
     lock, only on cancel. A drop restarts the clock."""
     t0 = time.monotonic()
