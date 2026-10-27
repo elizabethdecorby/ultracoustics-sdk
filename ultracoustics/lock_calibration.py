@@ -55,13 +55,15 @@ def _gains(pi):
 
 
 class _Calibration:
+    expected = EXPECTED_S  # progress weight per stage
+
     def __init__(self, controller, report_dir, progress, cancel, ms_limit, amplitude_dac, full_check):
         self.c, self.progress, self.cancel = controller, progress, cancel
         self.ms_limit, self.amplitude_dac, self.full_check = ms_limit, amplitude_dac, full_check
         self.out = Path(report_dir).expanduser().resolve() if report_dir is not None else None
         self.t0 = time.monotonic()
-        self.stages = [s for s in EXPECTED_S if full_check or s != "checking_design"]
-        self.total_s = sum(EXPECTED_S[s] for s in self.stages)
+        self.stages = [s for s in self.expected if full_check or s != "checking_design"]
+        self.total_s = sum(self.expected[s] for s in self.stages)
         self.stage, self.stage_t0, self.stage_seconds = None, self.t0, {}
         self.message, self.part, self.extra, self.last_emit, self.fraction = "", None, {}, -math.inf, 0.0
         self.epoch, self.cap, self.depth, self.last_trace_id = None, None, None, None
@@ -90,8 +92,8 @@ class _Calibration:
         self.last_emit = time.monotonic()
         if not self.progress:
             return
-        expected = EXPECTED_S[self.stage]
-        done = sum(EXPECTED_S[s] for s in self.stages[:self.stages.index(self.stage)])
+        expected = self.expected[self.stage]
+        done = sum(self.expected[s] for s in self.stages[:self.stages.index(self.stage)])
         within = expected * self.part if self.part is not None else time.monotonic() - self.stage_t0
         self.fraction = max(self.fraction, min(1.0, (done + min(within, expected)) / self.total_s))
         event = {"stage": self.stage, "message": self.message, "elapsed_s": round(time.monotonic() - self.t0, 2),
