@@ -17,6 +17,8 @@ from scipy.signal import lfilter
 from ultracoustics import check_lock_638, lock_calibration, lock_check
 from ultracoustics._internal import lock_model as lm
 from ultracoustics._internal import stream_lock as sl
+from ultracoustics._internal.control import MANUAL_SET
+from ultracoustics.system_control import SlaveCommandRejected
 from test_lock_calibration import Clock, Fake
 
 PLANT = dict(g=0.9, tau=0.42e-3, driver_hz=1200.0, delay_us=20, slope=-18.0)
@@ -183,7 +185,11 @@ class StreamFake(Fake):
     def control_638(self, action, timeout_s=1):
         if action != "identify":
             return super().control_638(action, timeout_s)
+        if self.clock() < self.busy_until:             # still streaming the previous trace's rows
+            self.calls.append("identify_busy")
+            raise SlaveCommandRejected(638, 3, 10, MANUAL_SET)
         self.calls.append(action)
+        self.busy_until = self.clock() + 2 + 57
         pi = self.pi
         stream, start = simulate_stream(pi["kp"], pi["ki_per_s"], self.rng, pre_updates=500)
         # place the burst so its first update is ~2 ms after the command, like the 638
@@ -237,6 +243,17 @@ class CheckLockTests(unittest.TestCase):
         self.assertEqual(files, ["lock_check.json", "lock_check.npz"])
         self.assertEqual(saved["status"], "ok")
         self.assertLess(report["duration_s"], 10)
+
+    def test_a_second_check_reuses_the_configuration(self):
+        fake, clock = self.fake(*self.design)
+        run_check(fake, clock)
+        report, *_ = run_check(fake, clock)          # the 638 is still streaming the first trace (BUSY)
+        self.assertEqual(report["status"], "ok", report["message"])
+        configures = [c for c in fake.calls if isinstance(c, tuple) and c[0] == "configure"]
+        self.assertEqual(len(configures), 1)          # the configuration left by the first check is reused
+        self.assertEqual(fake.calls.count("identify"), 2)
+        self.assertGreater(fake.calls.count("identify_busy"), 10)
+        self.assertGreater(report["details"]["busy_wait_s"], 30)
 
     def test_hot_gains_ask_for_a_rerun(self):
         kp, ki = lm.migo([self.params], 1.9, kp_limit=2.0, ki_limit=16383.0, contract=2)

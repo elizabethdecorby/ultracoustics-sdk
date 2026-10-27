@@ -13,7 +13,8 @@ Verdict (``status``):
   failed / cancelled
 
 The burst modulates the laser for 1.64 s and shows in the signal: run it after the lock has settled and never
-while recording. The 638's trace configuration is left at the identification setting (it cannot change while the
+while recording. After a burst the 638 streams its trace rows for about a minute and refuses another burst
+meanwhile, so a second check (or a calibration) within that minute waits; the first check after a START does not. The 638's trace configuration is left at the identification setting (it cannot change while the
 638 streams the trace rows, about a minute; the 638 is power-cycled at the next STOP anyway); the previous setting
 is in the report.
 
@@ -29,7 +30,8 @@ import numpy as np
 from . import lock_calibration as _cal
 from ._internal import lock_model as lm
 from ._internal import stream_lock as sl
-from .pi_characterization import COUNTERS, _Cancelled, _plain
+from .pi_characterization import COUNTERS, TRACE_CONFIG_FIELDS, _Cancelled, _plain
+from .system_control import CHANNEL_OPTICAL, SlaveCommandRejected
 
 SAMPLE_RATE = 10_000_000
 PRE_S, POST_S = 0.3, 0.25
@@ -58,13 +60,23 @@ class _Check(_cal._Calibration):
         """Trigger the burst and copy [trigger - PRE_S, burst end + POST_S] out of the ring as 1 us means."""
         c, per_us = self.c, SAMPLE_RATE // 1_000_000
         cap = int(c.buffer_capacity)
-        before = self.stats()
-        trigger = int(c.samples_received)
-        start = trigger - int(PRE_S * SAMPLE_RATE)
-        if trigger - _cal.GUARD_SAMPLES - start > cap - 2 * _cal.GUARD_SAMPLES:
+        if int(PRE_S * SAMPLE_RATE) > cap - 3 * _cal.GUARD_SAMPLES:
             raise RuntimeError("ADC ring too small for the pre-trigger record")
-        self.check_cancel()
-        c.control_638("identify", timeout_s=1.0)
+        deadline, waited = time.monotonic() + _cal.TIMING["busy_s"], time.monotonic()
+        while True:
+            self.check_cancel()
+            before = self.stats()
+            trigger = int(c.samples_received)              # re-taken per attempt: the burst follows the accepted one
+            try:
+                c.control_638("identify", timeout_s=1.0)
+                break
+            except SlaveCommandRejected as exc:
+                if (exc.target, exc.channel, exc.status) != (638, CHANNEL_OPTICAL, 10) or time.monotonic() >= deadline:
+                    raise
+                self.emit("Waiting for the previous burst's trace readout to finish (up to a minute)")
+                self.watch(1.0, guard_limit=guard_limit)
+        self.d["busy_wait_s"] = round(time.monotonic() - waited, 2)
+        start = trigger - int(PRE_S * SAMPLE_RATE)
         end = int(c.samples_received) + int((BURST_S + POST_S) * SAMPLE_RATE)
         cursor, parts, rest = start, [], np.empty(0)
         while cursor < end:
@@ -99,7 +111,10 @@ class _Check(_cal._Calibration):
             pi = self.previous
             r["gains"] = _cal._gains(pi)
             self.enter("arming", f"Configuring the identification burst (+/-{self.amp} DAC)")
-            left = self.configure_trace(self.amp)
+            if tuple(self.original_trace[k] for k in TRACE_CONFIG_FIELDS) == (self.amp, _cal.HOLD, _cal.DECIMATION):
+                left = self.original_trace  # left by an earlier check; a SET would wait out its readout (~50 s)
+            else:
+                left = self.configure_trace(self.amp)
             r["trace_config"] = {"before": self.original_trace, "left": left}
             self.watch(0.3)
             page = self.fresh_page()
