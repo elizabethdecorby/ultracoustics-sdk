@@ -30,6 +30,8 @@ from .manual_sweep import ManualSweepError, run_manual_sweep
 from .pi_characterization import run_pi_characterization, review_saved_pi_characterization
 from .lock_calibration import calibrate_lock_638, apply_saved_lock_gains_638
 from .lock_check import check_lock_638
+from .lock_warmup import (apply_recommended_lock_gains_638, store_lock_gains_638, wait_settled_638,
+                          warm_up_lock_638)
 
 __all__ = [
     "__version__",
@@ -64,4 +66,8 @@ __all__ = [
     "calibrate_lock_638",
     "apply_saved_lock_gains_638",
     "check_lock_638",
+    "warm_up_lock_638",
+    "wait_settled_638",
+    "apply_recommended_lock_gains_638",
+    "store_lock_gains_638",
 ]
