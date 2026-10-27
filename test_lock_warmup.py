@@ -23,8 +23,9 @@ from test_lock_check import StreamFake, onset_constant, sampled_plant
 class WarmFake(StreamFake):
     """StreamFake that can STOP, START and store a tuning record, like the master and 638 do."""
 
-    def __init__(self, clock, const, ring_after_apply=False, noisy_dac=False, **kw):
+    def __init__(self, clock, const, ring_after_apply=False, noisy_dac=False, silent_s=0.0, **kw):
         super().__init__(clock, const, **kw)
+        self.silent_until = clock() + silent_s                 # booting: no 638 pages yet
         self.ring_after_apply, self.noisy_dac = ring_after_apply, noisy_dac
         self.record, self.ringing = None, False
         self.noise = np.random.default_rng(5)
@@ -35,6 +36,8 @@ class WarmFake(StreamFake):
 
     @property
     def telemetry(self):
+        if self.clock() < self.silent_until:
+            return None
         snap = super().telemetry
         if self.noisy_dac:
             page = snap.optical_live_638.page
@@ -197,6 +200,22 @@ class WarmUpTests(unittest.TestCase):
         self.assertEqual(report["outcome"], "ready")
         self.assertFalse(report["settle"]["settled"])
         self.assertNotIn("identify", fake.calls)
+
+    def test_a_638_in_error_is_not_waited_on(self):
+        fake, clock = self.fake(*self.design)
+        fake.state = 4                                         # ERROR: acquisition found no dip
+        start = clock()
+        report, *_ = warm(fake, clock)
+        self.assertFalse(report["settle"]["settled"])
+        self.assertIn("ERROR", report["settle"]["reason"])
+        self.assertLess(clock() - start, 10)
+        self.assertNotIn("identify", fake.calls)
+
+    def test_a_long_boot_is_waited_out(self):
+        fake, clock = self.fake(*self.design, silent_s=25.0)   # the 1550 warming up from cold
+        report, *_ = warm(fake, clock)
+        self.assertEqual(report["outcome"], "ready", report["message"])
+        self.assertTrue(report["settle"]["settled"])
 
     def test_cancel_while_settling(self):
         fake, clock = self.fake(*self.design)

@@ -24,6 +24,9 @@ from .pi_characterization import _Cancelled, _plain
 # by the check, so it may be faster than the calibration's 3 DAC/s (its trace takes a minute), which right after
 # lock kept GUI warm-ups waiting 6-10 s longer on 00560032.
 SETTLE = dict(min_locked_s=10.0, quiet_s=5.0, span_dac=100, drift_dac_per_s=10.0, timeout_s=90.0)
+# The 638 in ERROR, or silent after it had been publishing (the master stopped the box): stop waiting. Silence
+# before its first page is the boot (the 1550 warming up, the 638 not yet powered) and is waited out.
+GIVE_UP = dict(error_s=5.0, stale_s=10.0)
 LOCK_TIMEOUT_S = 60.0
 APPLY_EXPECTED_S = dict(checking=0.5, residual_before=2.0, applying=3.0, residual_after=2.0, relock_test=4.0)
 STEP_WEIGHTS = dict(settling=12, checking=3.5, applying=11.5, storing=20, confirming=15.5)
@@ -42,17 +45,25 @@ def wait_settled_638(controller, *, progress=None, cancel=None, min_locked_s=SET
                      drift_dac_per_s=SETTLE["drift_dac_per_s"], timeout_s=SETTLE["timeout_s"]):
     """Wait until the 638 has been LOCKED for ``min_locked_s`` and its DAC was quiet over the last ``quiet_s``
     (span <= ``span_dac``, |drift| <= ``drift_dac_per_s``; see SETTLE).
-    Returns ``{"settled", "locked_s", "span_dac", "drift_dac_per_s", "waited_s"}``; never raises on a noisy
-    lock, only on cancel. A drop restarts the clock."""
+    Returns ``{"settled", "locked_s", "span_dac", "drift_dac_per_s", "waited_s", "reason"}``; never raises on
+    a noisy lock, only on cancel. A drop restarts the clock. Gives up early when the 638 stays in ERROR or
+    telemetry stops (the master stopped the box), so a box that cannot lock is not waited on."""
     t0 = time.monotonic()
-    locked_since, last_seq, hist = None, None, []
-    out = {"settled": False, "locked_s": 0.0, "span_dac": None, "drift_dac_per_s": None}
+    locked_since, last_seq, hist, error_since, fresh_at = None, None, [], None, None
+    out = {"settled": False, "locked_s": 0.0, "span_dac": None, "drift_dac_per_s": None, "reason": ""}
     while time.monotonic() - t0 < timeout_s:
         if cancel and cancel():
             raise _Cancelled("Cancelled while waiting for a settled lock")
         page, now = _live(controller), time.monotonic()
+        if page is None and fresh_at is not None and now - fresh_at > GIVE_UP["stale_s"]:
+            out["reason"] = "638 telemetry stopped (the box stopped?)"
+            break
         if page is not None and page.sequence != last_seq:
-            last_seq = page.sequence
+            last_seq, fresh_at = page.sequence, now
+            error_since = (error_since or now) if page.state == _cal.ERROR else None
+            if error_since is not None and now - error_since >= GIVE_UP["error_s"]:
+                out["reason"] = "the 638 reported ERROR (no lock)"
+                break
             if page.state != _cal.LOCKED:
                 locked_since, hist = None, []
             else:
@@ -70,6 +81,8 @@ def wait_settled_638(controller, *, progress=None, cancel=None, min_locked_s=SET
             progress({"stage": "settling", "fraction": min(1.0, out["locked_s"] / min_locked_s),
                       "message": "Waiting for a settled lock", "elapsed_s": round(now - t0, 2)})
         time.sleep(0.05)
+    if not out["settled"] and not out["reason"]:
+        out["reason"] = "the lock was not quiet enough within the time allowed"
     out["waited_s"] = round(time.monotonic() - t0, 2)
     return out
 
@@ -209,7 +222,7 @@ def warm_up_lock_638(controller, report_dir=None, *, progress=None, cancel=None,
     try:
         out["settle"] = wait_settled_638(controller, progress=reporter("settling"), cancel=cancel)
         if not out["settle"]["settled"]:
-            out.update(outcome="ready", message="the lock did not settle; gains left as they are")
+            out.update(outcome="ready", message=f"not settled ({out['settle']['reason']}); gains left as they are")
             return out
         out["check"] = c1 = check("check")
         out["gains_before"] = out["gains_after"] = c1.get("gains")
