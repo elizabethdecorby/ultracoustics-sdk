@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=77.0"]   # SPDX licence expressions
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ultracoustics"
+dynamic = ["version"]
+description = "Capture, analysis and monitoring for the Ultracoustics BROADSONIC optical ultrasound sensor"
+readme = "README.md"
+authors = [{ name = "Ultracoustics Technologies Ltd." }]
+license = "BSD-3-Clause"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "ultracoustics/_internal/bin/LGPL-2.1.txt"]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=2.0",
+    "scipy>=1.10",
+    "pyusb>=1.3.1",
+    "libusb1>=3.1.0",
+    "pyserial>=3.5",
+    "truststore>=0.9; python_version>='3.10'",
+    "cryptography>=42",
+]
+keywords = ["ultrasound", "acoustics", "condition monitoring", "SigMF", "optical sensor"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Manufacturing",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: System :: Hardware :: Hardware Drivers",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "ultracoustics.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["ultracoustics*"]
+
+[tool.setuptools.package-data]
+"ultracoustics._internal" = ["bin/*.dll", "bin/*.txt"]

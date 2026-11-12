@@ -1,0 +1,7 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Recordings and libraries are bytes: never convert their line endings
+*.sigmf-data binary
+*.bin binary
+*.dll binary
