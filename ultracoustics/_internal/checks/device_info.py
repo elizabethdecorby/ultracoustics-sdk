@@ -1,9 +1,9 @@
 """Firmware versions and identity records of all three boards.
 
 The reads are maintenance queries, so they need the USB device to themselves:
-close any Controller first. The timing was tuned on hardware, as the lab's
-diagnostics scan uses it: the master needs a gap after every slave query, and
-the 638 ignores the first query after it powers up.
+close any Controller first. The timing was tuned on hardware: the master needs
+a gap after every slave query, and the 638 ignores the first query after it
+powers up.
 """
 import time
 

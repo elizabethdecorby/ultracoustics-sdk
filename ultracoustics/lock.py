@@ -52,6 +52,14 @@ class LockError(RuntimeError):
 
 @dataclass(frozen=True)
 class LockGains:
+    """The gains of the loop that holds the laser on the probe (see :attr:`Controller.lock_gains`).
+
+    ``kp`` and ``ki_per_s`` are the proportional and integral gains, and ``zero_hz``
+    an optional second integrator's corner (0 for none). ``source`` says where they
+    came from: ``"live"`` (set this START and not stored), ``"stored"`` (kept on the
+    box) or ``"default"`` (the factory gains). They are reported, not set by hand:
+    :meth:`Controller.check_lock` and :meth:`Controller.calibrate_lock` choose them.
+    """
     kp: float
     ki_per_s: float
     zero_hz: int = 0

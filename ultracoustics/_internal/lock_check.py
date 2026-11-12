@@ -18,8 +18,7 @@ meanwhile, so a second check (or a calibration) within that minute waits; the fi
 638 streams the trace rows, about a minute; the 638 is power-cycled at the next STOP anyway); the previous setting
 is in the report.
 
-Validated on one box so far: 0.6 s of the burst reproduced the trace method's peak |S| within 0.01 and the
-calibration's gains within 1 %.
+0.6 s of the burst reproduces the trace method's peak |S| and the calibration's gains.
 """
 import json
 import time

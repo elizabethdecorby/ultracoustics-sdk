@@ -1,7 +1,6 @@
 """The LI sweep on a laser's own monitor photodiode, and its analysis.
 
-The lab's power tests and the Self-check's laser steps both run :func:`li_sweep`
-and :func:`analyse_li`.
+The Self-check's laser steps run :func:`li_sweep` and :func:`analyse_li`.
 
 **The sweep** steps the laser DAC 0 -> top inside a manual session. Every SET is
 confirmed by the board's reply, and every reading is a photodiode sample taken
@@ -25,8 +24,7 @@ lower half of the rise. Two rules keep it off features above threshold:
   after a fall would otherwise score as the knee;
 - the rise counts relative to the slope before it: at threshold the slope grows
   many times over, while above it a reading that repeats the one before and the
-  catch-up after it only double the slope, yet can rise more in counts
-  (seen on one box's 638: DAC 29640, not its threshold at 13300).
+  catch-up after it only double the slope, yet can rise more in counts.
 
 Reported: ``threshold_dac``, ``knee_dac``, the slope just above threshold and at
 the top (``linearity`` is their ratio: 1 is straight, below 1 rolls over), the

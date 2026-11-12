@@ -2,8 +2,7 @@
 
 A :class:`~ultracoustics.Controller` keeps one :class:`Box` private and offers only
 the customer's calls on top of it. The SDK's own procedures (the lock, the
-self-test, the signal level, a firmware update) drive the Box. The lab's service
-tools reach every command through their own package, which builds on it.
+self-test, the signal level, a firmware update) drive the Box.
 """
 from typing import Optional
 

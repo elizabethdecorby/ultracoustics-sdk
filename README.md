@@ -7,6 +7,16 @@ The Ultracoustics GUI is built on these same functions, so a script and the GUI 
 Analysis needs no box. Every guide and the first three examples run on the
 sample recording in `examples/data`.
 
+**New to the BROADSONIC or to Python?** Start with
+[Getting started](docs/getting_started.md): hardware setup, installing, a first
+capture explained line by line, and the words this documentation uses.
+
+**Laser safety.** The unit contains two lasers, one invisible, and a script can
+switch them on. Never look into the probe tip, a fiber end or an optical port.
+Read the safety section of the
+[User Manual](https://ultracoustics.ca/assets/User%20Manual/BROADSONIC%20Optical%20Microphone%20User%20Manual.pdf)
+before you connect the probe.
+
 ## Install
 
 Python 3.9 or later. From a copy of this repository:
@@ -15,7 +25,7 @@ Python 3.9 or later. From a copy of this repository:
 pip install .
 ```
 
-This also installs NumPy, SciPy, PyUSB, libusb1 and pySerial. To talk to the
+This also installs NumPy, SciPy, PyUSB and libusb1. To talk to the
 box, the computer also needs libusb and permission to use the device:
 
 - **Windows.** Nothing more. The box installs its own WinUSB driver, and the
@@ -47,7 +57,8 @@ def main():
         ctrl.calibrate_pressure(dark)        # this START's pressure calibration
         rec = ctrl.capture(1.0)              # the next second, checked for lost samples and lock
         rec.save("capture")                  # SigMF, with its calibration
-        ctrl.record("long_run", duration_s=60)    # straight to disk, any length
+        recorder = ctrl.record("long_run", duration_s=60)    # straight to disk, any length
+        print(recorder.samples, "samples saved,", recorder.lost, "lost")
 
 if __name__ == "__main__":
     main()
@@ -163,6 +174,8 @@ The steps behind them (reading the box's versions, one board at a time) are in
 
 | | |
 |---|---|
+| [Getting started](docs/getting_started.md) | Safety, hardware setup, installing, a first capture line by line, and a glossary |
+| [Reference](docs/reference.md) | Every public name on one page, grouped by task |
 | [Analysis guide](docs/analysis_guide.md) | Counts to sound pressure, the three SPL numbers, removing noise, waveforms and tones |
 | [Saving data](docs/saving_data.md) | The SigMF files, their metadata, gaps, split files and events |
 | [Monitoring](docs/monitoring.md) | Triggers, baselines, alarms and events, the run folder, limits |
@@ -171,6 +184,33 @@ The steps behind them (reading the box's versions, one board at a time) are in
 
 Every public class and function has its own help: `help(uc.Recording)`,
 `help(uc.Controller.monitor)`.
+
+The hardware has its own documents, at
+[ultracoustics.ca/downloads](https://ultracoustics.ca/downloads): the Quick
+Start Guide, the
+[User Manual](https://ultracoustics.ca/assets/User%20Manual/BROADSONIC%20Optical%20Microphone%20User%20Manual.pdf)
+(safety, connections, status lights, troubleshooting) and the
+[datasheet](https://ultracoustics.ca/assets/docs/UltracousticsBroadsonicDatasheet.pdf).
+For support, write to Ultracoustics at
+[ultracoustics.ca/contact](https://ultracoustics.ca/contact).
+
+## What is supported
+
+Use the names on `ultracoustics` itself, the methods of `Controller` and the
+steps in `ultracoustics.updates`. `help()` documents each of them, and they are
+what Ultracoustics supports.
+
+**Do not use `ultracoustics._internal`, or any name that starts with an
+underscore**, such as `ctrl._box`. That code is there because the self-test, the
+signal level, the lock and firmware updates run on it. It is not an API:
+
+- It can drive the lasers, and write firmware and the settings stored on the
+  box, without the checks the public calls make first.
+- A mistake there can leave the box needing service, with no recovery over USB.
+- It changes without notice, from one release to the next.
+- Ultracoustics does not support a box that has been driven through it.
+
+If something you need is missing from the public names, ask Ultracoustics.
 
 ## Troubleshooting
 

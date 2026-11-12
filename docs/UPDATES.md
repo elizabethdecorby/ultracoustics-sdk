@@ -70,9 +70,6 @@ for board in compare_firmware(firmware, manifest):    # one BoardStatus per boar
 - `signature` is the approval: Ed25519 over `release_statement()`, which covers the
   board, version, `from`, and each image's build, SHA-256 and `dac_cap`. The download
   address is outside it, so moving a file needs no new approval.
-- Release notes are not here. They are on the GitHub release.
-- Fields can be added without changing `schema`. Change `schema` only if old
-  readers must stop trusting the file.
 
 ## Installing
 
@@ -81,7 +78,8 @@ laser boards first. It checks and downloads everything before the first write.
 `ultracoustics.updates.install_firmware(board, image)` does one board.
 
 An image goes on only if a release signed by a key in `FIRMWARE_KEYS` names it by
-SHA-256, and the box runs a version under that release's `from`. A 638 must also
+SHA-256, and the box runs a version under that release's `from`. The code that
+writes the image checks the signature again itself, just before its first byte. A 638 must also
 run the image's profile and DAC cap, so an update never changes the laser current
 limit. Each board's update stops the box, turns the laser rails off around the
 transfer and reads all three versions back. Those come from flash, so it then

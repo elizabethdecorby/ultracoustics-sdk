@@ -27,9 +27,12 @@ The first release for customers.
 - **Updates.** `check_for_updates()` compares the SDK and the box with the
   list on ultracoustics.ca, and `update_firmware()` installs firmware releases
   Ultracoustics has signed, from the website or an unzipped download. Their
-  single steps are in `ultracoustics.updates`.
-- **Customer names only.** The package holds no service tools: `Controller`
-  has the methods listed in its help and no others, and drives the box
-  through a private object.
+  single steps are in `ultracoustics.updates`. The code that writes an image
+  checks the signature itself, so nothing reaches a board without one.
+- **Customer names only.** `Controller` has the methods listed in its help
+  and no others, and drives the box through a private object. The code under
+  it, `ultracoustics._internal`, ships because the self-test, the signal
+  level, the lock and firmware updates run on it. It is not an API and is not
+  supported: see "What is supported" in the README.
 - **Recordings.** `load_recording()` opens SigMF recordings, split recordings,
   event files and raw `.bin` captures, without loading the samples into memory.

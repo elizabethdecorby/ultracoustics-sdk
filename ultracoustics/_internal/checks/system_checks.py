@@ -1,7 +1,6 @@
 """The software and USB checks: the paths every later test depends on, over the master's USB.
 
-The lab's hardware scan and the Self-check's first step both run
-:func:`run_system_checks`:
+The Self-check's first step runs :func:`run_system_checks`:
 
 1. A confirmed STOP returns the master to IDLE, with its record of the run before.
 2. It advertises stream formats 1 (board telemetry) and 2 (638 optical diagnostics).

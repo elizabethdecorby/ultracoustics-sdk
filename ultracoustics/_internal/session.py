@@ -2,8 +2,8 @@
 one laser at a time under host control, raw reads from the ring, and the probe sweep.
 
 Private: the self-test, the signal level and a firmware update use it through a
-Controller's :class:`~ultracoustics._internal.device.Box`. The lab's service tools build
-on it. Methods are bounded synchronous operations: a GUI runs
+Controller's :class:`~ultracoustics._internal.device.Box`. Methods are bounded
+synchronous operations: a GUI runs
 them off its paint thread and calls renew_system_manual periodically while a session
 is active.
 """

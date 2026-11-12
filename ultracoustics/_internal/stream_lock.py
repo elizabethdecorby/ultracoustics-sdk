@@ -1,8 +1,8 @@
 """Pure stream-side analysis for the 638 quick lock check. No device I/O.
 
 The lock calibration's identification burst (PRBS-9, one chip = ``hold`` updates, +/-A DAC added to the PI
-command) shows in the 10 MSPS photodetector stream, which is the loop's own feedback: on the box tested the
-stream reproduced the 638's recorded feedback with correlation 0.9996.
+command) shows in the 10 MSPS photodetector stream, which is the loop's own feedback: the stream
+reproduces the 638's recorded feedback.
 With the injection R regenerated exactly and the stream Y taken on the controller's sample instants,
 S = 1 - C * (Y/R) / k, the same input sensitivity as the trace's U/R.
 
@@ -19,8 +19,7 @@ from . import lock_model as lm
 
 US_PER_UPDATE = 100
 PRBS_LENGTH = 511
-#: Onset of the single-chip response after the controller's sample (86.5 and 88.3 us at two gain sets on one
-#: box). Firmware timing plus the driver filter; check it on other boxes.
+#: Onset of the single-chip response after the controller's sample: firmware timing plus the driver filter.
 ONSET_AFTER_SAMPLE_US = 87.4
 #: The stream/PRBS correlation peaks about this many updates after the PRBS start (3 in both captures);
 #: only a starting point, the onset search spans -1000..+1500 us around it.

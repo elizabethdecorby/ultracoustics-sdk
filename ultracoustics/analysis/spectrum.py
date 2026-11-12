@@ -56,6 +56,7 @@ class Spectrum:
         return self.psd_w2hz / math.sqrt(self.num_averages)
 
     def on_grid(self, freqs):
+        """The density (W²/Hz) interpolated onto other frequencies *freqs* (Hz)."""
         return np.interp(freqs, self.freqs, self.psd_w2hz,
                          left=self.psd_w2hz[0], right=self.psd_w2hz[-1])
 
