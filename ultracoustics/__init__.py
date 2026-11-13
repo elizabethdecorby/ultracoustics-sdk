@@ -5,7 +5,7 @@ the software and firmware update checks, load the first time they are used.
 """
 from importlib import import_module
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 from .analysis.calibration import Calibration, CalibrationError, ProbeParameters, load_calibration
 from .analysis.filters import band_pass, notch
