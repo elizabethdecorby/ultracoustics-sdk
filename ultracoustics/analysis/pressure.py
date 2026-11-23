@@ -108,7 +108,7 @@ def to_pressure(cal, spectrum, check_power=True):
     """``spectrum`` in pressure units, over the calibrated band.
 
     Noise stays in unless it was subtracted first, so off resonance the result
-    rises above NEP² where the detector, not the dome's thermal motion, limits
+    rises above NEP² where the detector, not the sensor's thermal motion, limits
     detection. A warning if the optical power moved since the calibration, as
     the scale depends on it (``check_power=False`` for a caller that shows this
     itself, as the GUI does).
@@ -222,7 +222,7 @@ def pressure_waveform(cal, power_uw, band, sample_rate):
     below about 500 kHz on the probes measured. A warning if the sensitivity swings
     by more than MAX_RIPPLE_DB across the band, as it does over a resonance: use a
     narrower band, or tone_level for a tone. Thermal noise stays in: it passes
-    through the dome as sound does, so only a narrower band reduces it.
+    through the sensor as sound does, so only a narrower band reduces it.
     """
     ripple = sensitivity_ripple_db(cal, band)
     if ripple > MAX_RIPPLE_DB:

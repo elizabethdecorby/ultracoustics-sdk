@@ -19,11 +19,9 @@ def show(change):
 
 def main():
     with uc.Controller() as ctrl:
-        dark = ctrl.capture_dark()
-        ctrl.start()
-        if not ctrl.check_lock(retune=True).ready:
-            raise SystemExit("no settled lock: check the probe and the room, then run this again")
-        ctrl.calibrate_pressure(dark)          # so limits can be in pressure
+        report = ctrl.start_ready()            # lasers on, ready and calibrated: about 30 s
+        if not report.calibrated:              # the limits below are in pressure
+            raise SystemExit(report.message)
 
         healthy = ctrl.capture(5.0).spectrum()    # the machine when it is healthy
         watch = [uc.BandPowerTrigger((20e3, 100e3), threshold_db=10, baseline=healthy, name="bearing band"),

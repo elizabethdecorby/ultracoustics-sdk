@@ -5,6 +5,7 @@ The tests of the box that need no opening and no other equipment.
 - the software and USB checks;
 - the laser output on each board's own monitor photodiode;
 - both TEC heat-load steps;
+- the reflected level, the master's own gate before it starts the 638;
 - the probe sweep (``Box.run_probe_sweep``);
 - the lock, the data rate, the dark and locked levels and the spectrum, with
   the thermal-noise fit;
@@ -28,17 +29,57 @@ import numpy as np
 from scipy.ndimage import median_filter
 
 from ...analysis import calibration as nepcal
-from ...readout import CLIP_FRACTION
+from ...readout import CLIP_FRACTION, DARK_MAX_COUNTS
 # The report's format is the public selftest module's, so reports are read without this one
 from ...selftest import (MEASURED, PROBE_SERIAL_MAX_CHARS, SCHEMA, STEPS, TITLES,  # noqa: F401
                         SelfTestReport, probe_serial_text, short_uid)
 from . import laser_board, li_curve, system_checks, thermal_step
+from .acquisition import (ACQ_MARGIN_WARN_MS, _hide_margin, acquisition_dwells,  # noqa: F401
+                          analyse_acquisition, attempt_text, firmware_638, no_lock_reason)
 from .probe import MODE_MIN_DEPTH_PCT, find_dips, first_order_mode  # noqa: F401
 from .device_info import BOARD_LABELS, IDENTITY_FIELDS, IDENTITY_STATUS, field_text, firmware_text
 from .laser_board import manual_session as _manual_session  # noqa: F401 (laser_check's)
 from .li_curve import NoPhotodiode, analyse_li, li_sweep
 from .system_checks import BOOT_FAULTS, BOOT_STATES, ended_text, fault_name, state_name  # noqa: F401
 from .thermal_step import analyse_thermal_step, run_thermal_step
+
+# The chain: a step records what it found broken (_Run.find) and a later step that relies on it
+# does not run, so a failure is put down to the first thing that really broke. Hard facts stop
+# the steps that need them; soft ones only label the results that follow them.
+BOX = ('link', 'telemetry', 'boards')
+REQUIRES = {'dark': ('link',),
+            'li_1550': BOX + ('tec_1550',), 'tec_1550': BOX + ('tec_1550',),
+            'reflected': BOX + ('detector', 'tec_1550'),
+            'li_638': BOX + ('tec_1550', 'tec_638', 'light'),
+            'tec_638': BOX + ('tec_1550', 'tec_638', 'light'),
+            'probe': BOX + ('detector', 'tec_1550', 'tec_638', 'light'),
+            # No telemetry: _lock has a path without it
+            'lock': ('link', 'boards', 'detector', 'tec_1550', 'tec_638', 'light', 'level', 'dip')}
+READ_WITH = {'tec_1550': ('laser_1550',), 'reflected': ('laser_1550', 'load_1550', 'stream'),
+             'tec_638': ('laser_638',), 'probe': ('laser_638', 'level', 'stream'),
+             'lock': ('load_1550', 'load_638', 'shallow_dip', 'stream'), 'lock_loop': ('stream',)}
+HARD = frozenset(fact for facts in REQUIRES.values() for fact in facts) | {'locked'}
+#: A step that raises says this about the box: (fact, report text)
+ON_ERROR = {'checks': ('link', 'The box stopped answering: {}.'),
+            'dark': ('detector', 'The detector sent no samples: {}.')}
+#: What the customer is told. The words avoid "laser"; the report's own text does not need to.
+_REPLUG = 'Unplug it for 10 s, plug it back in, then run the Self-check again.'
+_SEND = 'Please send this report to Ultracoustics.'
+_REPEATS = 'If it repeats, please send this report to Ultracoustics.'
+ADVICE = {'link': f'The box stopped answering. {_REPLUG}',
+          'detector': f'The detector is not reading correctly. {_SEND}',
+          'boards': f'The box did not start properly. {_REPLUG}',
+          'tec': ('The box could not reach its working temperature. Let it rest for 10 minutes, '
+                  f'then run the Self-check again. {_REPEATS}'),
+          'source': f'The light source did not start. {_SEND}',
+          'probe': 'Check that the microphone is plugged in, then run the Self-check again.',
+          'dip': ('The microphone shows no resonance. Reseat it, then run the Self-check again. '
+                  f'{_REPEATS}'),
+          'no_lock': f'The box did not lock this time. Press START again. {_REPEATS}',
+          'lock_lost': 'Keep the microphone still, then run the Self-check again.'}
+#: The advice for what the checks found broken (system_checks.SystemChecks.broken)
+CHECKS_ADVICE = {'link': ADVICE['link'], 'boards': ADVICE['boards'], 'tec_1550': ADVICE['tec'],
+                 'tec_638': ADVICE['tec']}
 
 STOP_TIMEOUT_S = system_checks.STOP_TIMEOUT_S
 #: Telemetry newer than the manual session's power-up, before judging the boards.
@@ -77,6 +118,14 @@ PROBE_WARMUP_S = 10.0
 # The sweep runs the 638 to its cap: the SDK's stop at 95% of full scale is off,
 # and the report says where the detector reached that level instead
 PROBE_FULL_SCALE = CLIP_FRACTION
+#: The firmware's own gate on the dip: this deep, and this many counts
+FIRMWARE_DIP_PCT = 25.0
+FIRMWARE_DIP_COUNTS = 512
+# The reflected level: the 1550 on its own firmware, the 638 off. Below this much over dark the
+# master would end a START (it wants 470 counts within 500 ms)
+STORED_WARMUP_S = 2.0
+LEVEL_SAMPLES = 200000
+REFLECTED_MIN_COUNTS = 500
 #: What a saturated detector asks for (laser_check chooses a lower 1550 power). The
 #: GUI shows it as Help › Self-check, which names no laser.
 LASER_CHECK_ADVICE = ('The detector saturates at the current 1550 nm setting: Diagnostics › '
@@ -85,6 +134,11 @@ LASER_CHECK_ADVICE = ('The detector saturates at the current 1550 nm setting: Di
 # The master gives up first: up to 60 s for the 1550, then 30 s for the 638 to lock
 # (the master firmware's boot timeouts)
 LOCK_TIMEOUT_S = 100.0
+# Give up early, as the warm-up does: the 638 stays in ERROR, or falls silent after it had been
+# publishing (the master stopped the box). ERROR comes after the last attempt, so its page is
+# about 0.25 s away; silence before the first page is the boot, and is waited out.
+LOCK_ERROR_S = 5.0
+LOCK_SILENT_S = 10.0
 OBSERVE_S = 20.0
 #: The GUI flags a data rate under 90% of the 10 MSPS stream.
 RATE_FRACTION = 0.9
@@ -97,6 +151,11 @@ STREAM_ERRORS = (('drops_seq', 'sequence gaps'), ('drops_fw', 'firmware drops'),
 # The 638 optical loop's states, as its firmware numbers them
 OPTICAL_STATES = ('IDLE', 'CALIBRATING', 'ROOT FINDING', 'LOCKED', 'ERROR', 'MEASURE SLOPE')
 LOCKED = 3
+OPTICAL_ERROR = 4
+#: Acquisition pages land about every 0.2 s and only the latest is kept
+ACQ_POLL_S = 0.02
+#: The last attempt's page can follow the state that ended it by this much
+ACQ_TAIL_S = 0.5
 
 
 class Cancelled(Exception):
@@ -214,13 +273,23 @@ class _Run:
         self.cancelled = cancel
         self.sample_rate = sample_rate
         self.key = None
-        self.telemetry = True    # board telemetry (stream format 1)
         self.optical = False     # 638 optical diagnostics (stream format 2)
+        self.found = {}          # fact -> what a step found broken: step, reason, advice
+        self.dac_limit = {}      # target -> the top DAC with its photodiode in range
         self.cap_638 = None
         self.dark = None         # nepcal.Spectrum with the lasers off
         self.locked = False
         self.pi = None           # the 638's running normalized PI, read at lock
         self.stopped = False     # the last step's confirmed STOP has run
+        self.firmware_638 = None  # the 638 application's version, from the 'device' step
+
+    def find(self, fact, reason, advice=None):
+        """Record ``fact``; the first finding of it stands."""
+        self.found.setdefault(fact, dict(fact=fact, step=self.key, reason=reason, advice=advice))
+
+    def cause(self):
+        """The first hard fact found: what the report names as the root cause, or None."""
+        return next((found for fact, found in self.found.items() if fact in HARD), None)
 
     def say(self, message, fraction=None):
         """Progress, from anywhere: an SDK callback must never be made to raise."""
@@ -235,19 +304,24 @@ class _Run:
             raise Cancelled()
 
 
-def run_report(ctrl, probe=None, progress=None, cancel=None, sample_rate=10_000_000):
-    """Run every on-box step in order; returns ``{'steps', 'cancelled'}``.
+def run_report(ctrl, probe=None, progress=None, cancel=None, sample_rate=10_000_000,
+               firmware_638=None):
+    """Run every on-box step in order; returns ``{'steps', 'cancelled', 'cause'}``.
 
     ``ctrl`` is connected and streaming and nothing else commands it meanwhile.
     ``probe`` (a ProbeParameters) scales the thermal fit's NEP.
+    ``firmware_638``, from the 'device' step, sets the root search's dwell (firmware_638()).
     ``progress(event)`` gets ``{'step', 'message', 'fraction'}`` while a step
     runs and ``{'step', 'done'}`` (the step's dict) after it. A step that fails
-    is reported and the next one runs. The box is left stopped (IDLE).
+    is reported, and the next one runs unless it relies on what failed
+    (REQUIRES). The box is left stopped (IDLE). The result's ``cause`` is the
+    first thing found broken, as a dict, or None.
     """
     progress = progress or (lambda event: None)
     run = _Run(ctrl, progress, cancel or (lambda: False), sample_rate)
+    run.firmware_638 = firmware_638
     measures = {'checks': _checks, 'dark': _dark, 'li_1550': _li(1550), 'li_638': _li(638),
-                'tec_1550': _tec(1550),
+                'tec_1550': _tec(1550), 'reflected': _reflected,
                 'tec_638': _tec(638), 'probe': _probe, 'lock': lambda r, s: _lock(r, s, probe),
                 'lock_loop': _lock_loop, 'stop': _stop}
     steps, cancelled = [], False
@@ -263,7 +337,9 @@ def run_report(ctrl, probe=None, progress=None, cancel=None, sample_rate=10_000_
             else:
                 run.say('Starting…')
                 try:
+                    _gate(run, key)
                     measures[key](run, step)
+                    _read_with(run, step, key)
                 except NotRun as exc:
                     step.status, step.summary = 'skipped', f'Not run: {exc}'
                 except Exception as exc:
@@ -273,6 +349,9 @@ def run_report(ctrl, probe=None, progress=None, cancel=None, sample_rate=10_000_
                     else:
                         step.status, step.summary = 'error', f'Did not complete: {exc}'
                         step.data['error'] = traceback.format_exc()
+                        if key in ON_ERROR:
+                            fact, text = ON_ERROR[key]
+                            run.find(fact, text.format(exc), ADVICE[fact])
             done = step.as_dict(time.monotonic() - started)
             steps.append(done)
             progress({'step': key, 'done': done})
@@ -282,7 +361,21 @@ def run_report(ctrl, probe=None, progress=None, cancel=None, sample_rate=10_000_
                 ctrl.stop_system_confirmed(timeout_s=STOP_TIMEOUT_S)
             except Exception as exc:
                 print(f'[system-report] confirmed STOP after the report failed: {exc}', flush=True)
-    return {'steps': steps, 'cancelled': cancelled}
+    return {'steps': steps, 'cancelled': cancelled, 'cause': run.cause()}
+
+
+def _gate(run, key):
+    """Not run: the first thing this step relies on that an earlier step found broken."""
+    for fact in REQUIRES.get(key, ()):
+        if fact in run.found:
+            raise NotRun(run.found[fact]['reason'])
+
+
+def _read_with(run, step, key):
+    """What an earlier step found that colours this one's results."""
+    labels = [f"Read with care: {run.found[fact]['reason']}." for fact in READ_WITH.get(key, ())
+              if fact in run.found]
+    step.summary = ' '.join(filter(None, [step.summary, *labels]))
 
 
 # -- Software and USB checks (system_checks) -------------------------------------
@@ -291,12 +384,15 @@ def _checks(run, step):
     result = system_checks.run_system_checks(
         run.ctrl, progress=run.say, check=run.check, read_tuning=True,
         power_up_attempts=POWER_UP_ATTEMPTS, retry_gap_s=POWER_UP_RETRY_GAP_S,
-        settle_s=TELEMETRY_SETTLE_S, stop_timeout_s=STOP_TIMEOUT_S)
+        settle_s=TELEMETRY_SETTLE_S, stop_timeout_s=STOP_TIMEOUT_S,
+        settle_tec=lambda target: _Laser(run, target).settle_tec())
     for item in result.items:
         step.row(item.label, item.value, item.passed)
     step.data.update(result.values)
     step.summary = result.summary
-    run.telemetry, run.optical, run.cap_638 = result.telemetry, result.optical, result.cap_638
+    run.optical, run.cap_638 = result.optical, result.cap_638
+    for fact, reason in result.broken.items():
+        run.find(fact, reason, CHECKS_ADVICE.get(fact))
     if result.exception is not None:
         raise result.exception
 
@@ -319,15 +415,42 @@ def _spectrum_data(spectrum):
                 num_averages=spectrum.num_averages)
 
 
+def _stream_rows(run, step, before, after, rate, seconds):
+    """The data rate and what the stream lost, between two stream_stats."""
+    step.data['stream'] = {'rate_sps': rate, 'before': before, 'after': after}
+    fast = rate >= RATE_FRACTION * run.sample_rate
+    step.row('Data rate', f'{rate / 1e6:.2f} MSPS', fast)
+    errors = [f'{after.get(k, 0) - before.get(k, 0)} {name}' for k, name in STREAM_ERRORS
+              if after.get(k, 0) != before.get(k, 0)]
+    step.row(f'Stream errors in {seconds:.3g} s', ', '.join(errors) or 'none', not errors)
+    if not fast or errors:
+        run.find('stream', f"the stream was short of data ({rate / 1e6:.2f} MSPS, "
+                 f"{', '.join(errors) or 'no errors'})")
+
+
 def _dark(run, step):
+    from ...config import ADC_MAX_VALUE
+    ctrl = run.ctrl
     run.stage('Stopping the box…')
-    run.ctrl.stop_system_confirmed(timeout_s=STOP_TIMEOUT_S)
+    ctrl.stop_system_confirmed(timeout_s=STOP_TIMEOUT_S)
+    before, count0, t0 = dict(ctrl.stream_stats or {}), ctrl.samples_received, time.monotonic()
     samples, run.dark = _capture(run, 'Recording the detector with the lasers off…')
+    seconds = time.monotonic() - t0
+    rate = (ctrl.samples_received - count0) / seconds
     step.data['spectrum'] = _spectrum_data(run.dark)
     step.data['counts'] = dict(mean=float(samples.mean()), std=float(samples.std()),
                                min=int(samples.min()), max=int(samples.max()))
-    step.row('Dark level', f'{samples.mean():.1f} counts')
+    pinned = bool(samples.max() >= PROBE_FULL_SCALE * ADC_MAX_VALUE or samples.max() == 0
+                  or samples.std() == 0)
+    step.row('Dark level', f'{samples.mean():.1f} counts',
+             bool(not pinned and samples.mean() < DARK_MAX_COUNTS))
     step.row('Dark noise', f'{samples.std():.2f} counts rms')
+    _stream_rows(run, step, before, dict(ctrl.stream_stats or {}), rate, seconds)
+    if pinned:
+        run.find('detector', f'The detector reads {samples.mean():.0f} counts with the lasers off '
+                 '(about 250 is normal).', ADVICE['detector'])
+        step.summary = run.found['detector']['reason']
+        return
     step.summary = f'{samples.mean():.1f} counts.'
 
 
@@ -349,8 +472,6 @@ def _li(target):
     def measure(run, step):
         if target not in run.ctrl.laser_boards:
             raise NotRun(f'this box has no {target} nm board.')
-        if not run.telemetry:
-            raise NotRun('it needs board telemetry, which the main board firmware lacks.')
         sweep = _li_sweep(run, target)
         dac, pd = [r[0] for r in sweep['rows']], [r[1] for r in sweep['rows']]
         result = analyse_li(dac, pd, sweep['saturated_at_dac'] is not None, sweep['pd_full_scale'])
@@ -361,10 +482,13 @@ def _li(target):
         else:
             step.row('Swept', f"stopped at DAC {sweep['saturated_at_dac']}: the photodiode "
                      'reached full scale, the most its ADC input can take', False)
+            run.dac_limit[target] = dac[-2] if len(dac) > 1 else 0
         step.row('Dark level, laser off', f"{result['dark_counts']:.0f} counts")
         threshold = result['threshold_dac']
         step.row('Lasing threshold', 'no threshold found' if threshold is None else
                  f'DAC {threshold:.0f}', threshold is not None)
+        if threshold is None:
+            run.find(f'laser_{target}', f'the {target} nm laser shows no threshold')
         # The slopes and the largest step stay in the analysis data, unshown
         share = 100.0 * result['pd_at_top'] / full if full else 0.0
         step.row('Photodiode at the top', f"{result['pd_at_top']} of {full} counts "
@@ -398,11 +522,10 @@ def _tec(target):
         ctrl = run.ctrl
         if target not in ctrl.laser_boards:
             raise NotRun(f'this box has no {target} nm board.')
-        if not run.telemetry:
-            raise NotRun('it needs board telemetry, which the main board firmware lacks.')
         step_dac = TEC_STEP_DAC[target]
         if target == 638 and run.cap_638:
             step_dac = min(step_dac, run.cap_638)
+        step_dac = min(step_dac, run.dac_limit.get(target, step_dac))
         capture = run_thermal_step(
             ctrl, target, step_dac, baseline_s=TEC_BASELINE_S, edge_s=TEC_EDGE_S,
             settle_pp_mdegc=TEC_SETTLE_PP_MDEGC, lock_timeout_s=TEC_LOCK_TIMEOUT_S,
@@ -429,7 +552,59 @@ def _tec(target):
                      edge['settled'] and abs(edge['residual_mdegc']) <= band)
         if result['passed']:
             step.summary = 'Met target.'
+        else:
+            run.find(f'load_{target}', f"the {target} nm TEC did not hold against its laser's heat")
     return measure
+
+
+# -- Light back from the microphone: the master's own gate before it starts the 638 ----
+
+def _stored_level(run):
+    """The reflected level with the 1550 on its own firmware (its stored DAC), 638 off."""
+    ctrl = run.ctrl
+    run.stage('Running the 1550 nm laser at its current setting…')
+    with _manual_session(ctrl):
+        ctrl.start_1550_automatic(warmup_s=STORED_WARMUP_S, cancel=run.cancelled)
+        run.check()
+        samples = ctrl.collect_fresh(LEVEL_SAMPLES, timeout_s=5.0)
+        run.say('Stopping (confirmed shutdown)…')
+    return {'level_counts': float(samples.mean()), 'std_counts': float(samples.std())}
+
+
+def _reflected(run, step):
+    from ...config import ADC_MAX_VALUE
+    from ..control import MASTER_FAULT_NAMES
+    if 1550 not in run.ctrl.laser_boards:
+        raise NotRun('it needs the 1550 nm board.')
+    dark = run.dark.mean_counts if run.dark is not None else 0.0
+    try:
+        level = _stored_level(run)['level_counts']
+    except RuntimeError as exc:   # no light back: the master ends the session itself (red ×1)
+        if MASTER_FAULT_NAMES[1] not in str(exc):
+            raise
+        step.data['master'] = str(exc)
+        level = dark
+    above, fraction = level - dark, level / ADC_MAX_VALUE
+    step.data.update(level_counts=level, dark_counts=dark, full_scale_fraction=fraction)
+    step.row('Reflected level, 638 nm off', f'{uw(above):.1f} µW ({level:.0f} counts)')
+    if above < REFLECTED_MIN_COUNTS:
+        if 'laser_1550' in run.found:
+            reason, advice = ('no light reaches the detector and the 1550 nm laser shows no '
+                              'threshold'), ADVICE['source']
+        else:
+            reason, advice = ('hardly any light comes back from the microphone: '
+                              f'{above:.0f} counts above dark, at least {REFLECTED_MIN_COUNTS} '
+                              'needed'), ADVICE['probe']
+        step.row('Light back from the microphone', reason, False)
+        run.find('light', reason, advice)
+        return
+    step.row('Light back from the microphone', f'{above:.0f} counts above dark', True)
+    usable = fraction < PROBE_FULL_SCALE
+    step.row('Detector level', f'{100 * fraction:.0f}% of full scale', usable)
+    if not usable:
+        run.find('level', f'the detector is at {100 * fraction:.0f}% of full scale with the 638 nm '
+                 'off, so the lock was not tried')
+        step.summary = LASER_CHECK_ADVICE
 
 
 # -- Probe sweep ------------------------------------------------------------------
@@ -444,8 +619,9 @@ def _probe(run, step):
         run.say(f"Sweeping the 638 nm laser: DAC {point['dac']}",
                 (point['index'] + 1) / point['count'])
     result = ctrl.run_probe_sweep(step=PROBE_STEP, dwell_s=PROBE_DWELL_S, settle_s=PROBE_SETTLE_S,
-                                  warmup_s=PROBE_WARMUP_S, saturation_threshold=float('inf'),
-                                  cancel=run.cancelled, on_progress=on_progress)
+                                  top=run.dac_limit.get(638), warmup_s=PROBE_WARMUP_S,
+                                  saturation_threshold=float('inf'), cancel=run.cancelled,
+                                  on_progress=on_progress)
     run.check()
     dac = np.asarray(result.current, dtype=float)
     pd = np.asarray(result.photodetector, dtype=float)
@@ -471,6 +647,17 @@ def _probe(run, step):
     step.row('First-order optical mode', f"DAC {mode['dac']}, {mode['depth_pct']:.0f}% deep"
              if mode else f'no dip at least {MODE_MIN_DEPTH_PCT:g}% deep', mode is not None)
     step.row('Dips', ', '.join(f"DAC {d['dac']} ({d['depth_pct']:.0f}%)" for d in dips) or 'none')
+    if pd[0] >= PROBE_FULL_SCALE * ADC_MAX_VALUE:   # a fringe touching it can still lock
+        run.find('level', f'the detector is at {100 * pd[0] / ADC_MAX_VALUE:.0f}% of full scale '
+                 'with the 638 nm off, so the lock was not tried')
+    if mode is None:
+        run.find('dip', f'the sweep found no dip at least {MODE_MIN_DEPTH_PCT:g}% deep',
+                 ADVICE['dip'])
+    elif (mode['depth_pct'] < FIRMWARE_DIP_PCT
+          or mode['level'] - mode['pd_counts'] < FIRMWARE_DIP_COUNTS):
+        run.find('shallow_dip', f"the dip is {mode['depth_pct']:.0f}% deep and "
+                 f"{mode['level'] - mode['pd_counts']:.0f} counts, and the firmware wants "
+                 f'{FIRMWARE_DIP_PCT:.0f}% and {FIRMWARE_DIP_COUNTS}')
     if mode:
         step.summary = f"First-order mode at DAC {mode['dac']}, {mode['depth_pct']:.0f}% deep."
     if full_scale_dac is not None:
@@ -507,35 +694,52 @@ def _lock(run, step, probe):
     ctrl.stop_system_confirmed(timeout_s=STOP_TIMEOUT_S)
     if run.optical:
         run.optical = ctrl.try_optical_diagnostics()
+    capture = _AcquisitionCapture(ctrl) if run.optical else None
+    before_start = (_live_638(ctrl) or {}).get('sequence') if run.optical else None
     started = time.monotonic()
     ctrl.start_confirmed(timeout_s=STOP_TIMEOUT_S)
     if run.optical:
         states, live, shown = [], None, None
+        error_at, heard_at = None, None
         while True:
             run.check()
             elapsed = time.monotonic() - started
-            live = _live_638(ctrl) or live
+            capture.poll()
+            page = _live_638(ctrl)
+            if page is not None and page['sequence'] != before_start:
+                live, heard_at = page, elapsed
+                error_at = (error_at or elapsed) if page['state'] == OPTICAL_ERROR else None
             if live is not None:
                 if not states or states[-1][1] != live['state']:
                     states.append([round(elapsed, 2), live['state']])
                 if live['state'] == LOCKED:
                     break
-            if elapsed > LOCK_TIMEOUT_S:
+                if live['state'] == OPTICAL_ERROR:
+                    capture.take()   # the ring would overwrite it
+            if (elapsed > LOCK_TIMEOUT_S
+                    or (error_at is not None and elapsed - error_at >= LOCK_ERROR_S)
+                    or (heard_at is not None and elapsed - heard_at >= LOCK_SILENT_S)):
                 break
             text = (f"Waiting for the lock: {elapsed:.0f} s, the 638 is "
                     f"{_optical_name(live['state']) if live else 'starting'}")
             if text != shown:
                 run.say(text, min(elapsed / 60.0, 0.95))
                 shown = text
-            time.sleep(0.1)
+            time.sleep(ACQ_POLL_S)
         step.data['lock_states'] = [[t, _optical_name(s)] for t, s in states]
         run.locked = live is not None and live['state'] == LOCKED
         step.row('Locks after START', f'in {elapsed:.1f} s' if run.locked else
-                 f'not locked after {LOCK_TIMEOUT_S:.0f} s (the 638 is '
-                 f"{_optical_name(live['state']) if live else 'not reporting'}); the box's "
-                 'own record of why is under Stop and record', run.locked)
+                 f'not locked after {elapsed:.0f} s (the 638 is '
+                 f"{_optical_name(live['state']) if live else 'not reporting'})", run.locked)
+        result = _acquisition_rows(run, step, capture)
+        if not run.locked:
+            run.find('locked', no_lock_reason(result, live), ADVICE['no_lock'])
+            step.row('Thermal noise fit', 'not measured: the box did not lock')
+            return
     else:
         step.row('Lock state', 'not reported by this main board firmware')
+        step.row('Lock acquisition', 'not analysed: this main board firmware reports no lock '
+                 'state')
         run.stage('Letting the box start…')
         _wait(run, 15.0)
     if 1550 in ctrl.laser_boards:
@@ -556,11 +760,7 @@ def _lock(run, step, probe):
         time.sleep(0.05)
     count1, t1, after = ctrl.samples_received, time.monotonic(), dict(ctrl.stream_stats or {})
     rate = (count1 - count0) / (t1 - t0)
-    step.data['stream'] = {'rate_sps': rate, 'before': before, 'after': after}
-    step.row('Data rate', f'{rate / 1e6:.2f} MSPS', rate >= RATE_FRACTION * run.sample_rate)
-    errors = [f'{after.get(k, 0) - before.get(k, 0)} {name}' for k, name in STREAM_ERRORS
-              if after.get(k, 0) != before.get(k, 0)]
-    step.row(f'Stream errors in {OBSERVE_S:g} s', ', '.join(errors) or 'none', not errors)
+    _stream_rows(run, step, before, after, rate, OBSERVE_S)
     if pages:
         step.data['lock_pages'] = {'columns': ['t_s', 'state', 'dac', 'feedback', 'target'],
                                    'rows': pages}
@@ -570,6 +770,10 @@ def _lock(run, step, probe):
         step.row('Stays locked', f'for all {OBSERVE_S:g} s' if held else
                  f'left the lock {unlocks} times' if unlocks else
                  f'locked {states.count(LOCKED)} of {len(states)} reports', held)
+        if run.locked and not held:
+            run.find('locked', f'left the lock {unlocks} times, so the lock loop was not measured',
+                     ADVICE['lock_lost'])
+        run.locked = run.locked and held
         dacs = [p[2] for p in pages if p[1] == LOCKED]
         if dacs:
             step.row('Lock point', f'638 nm DAC {np.median(dacs):.0f}, moving '
@@ -605,7 +809,7 @@ def _lock(run, step, probe):
     if probe is None:
         return
     if not run.locked:
-        step.row('Thermal noise fit', 'not measured: the box did not lock')
+        step.row('Thermal noise fit', 'not measured: the box did not hold the lock')
         return
     run.stage('Fitting the thermal noise peaks…', 0.8)
     try:
@@ -663,6 +867,85 @@ def _wait(run, seconds):
     while time.monotonic() < end:
         run.check()
         time.sleep(0.1)
+
+
+# -- Lock acquisition: what the lock step keeps across START (acquisition) ---------
+
+class _AcquisitionCapture:
+    """What the lock step keeps across START: the acquisition pages as they pass (telemetry
+    holds only the latest), where the stream lost data, and the raw ADC once it is over."""
+
+    def __init__(self, ctrl):
+        self.ctrl = ctrl
+        self.pages, self.gaps, self.samples = {}, [], None
+        self.first = self.counted = ctrl.samples_received
+        self.errors = self._errors()
+        page = self._page()   # from a run before this START
+        self.stale = None if page is None else self._key(page)
+
+    def _errors(self):
+        stats = self.ctrl.stream_stats or {}
+        return [stats.get(key, 0) for key, _name in STREAM_ERRORS]
+
+    def _page(self):
+        snapshot = self.ctrl.telemetry
+        entry = getattr(snapshot, 'optical_acquisition_638', None)
+        return None if entry is None else plain(entry.page)
+
+    @staticmethod
+    def _key(page):
+        return page['event_id'], page['start_tick_ms']
+
+    def poll(self):
+        page = self._page()
+        if page is not None and self._key(page) != self.stale:
+            self.pages.setdefault(self._key(page), page)
+        errors = self._errors()
+        counted = self.ctrl.samples_received
+        if errors != self.errors:   # somewhere since the last poll: its span is the gap
+            self.gaps.append([self.counted, counted])
+        self.errors, self.counted = errors, counted
+
+    def take(self):
+        """Copy the ring from START on, once, keeping clear of the writer."""
+        if self.samples is not None:
+            return
+        ctrl = self.ctrl
+        total, capacity = ctrl.samples_received, ctrl.buffer_capacity
+        self.first = max(self.first, total - capacity + capacity // 10)
+        start, length = self.first % capacity, total - self.first
+        ring = ctrl.buffer
+        self.samples = (ring[start:start + length].copy() if start + length <= capacity else
+                        np.concatenate((ring[start:], ring[:start + length - capacity])))
+
+    def analyse(self, locked, sample_rate, dwells):
+        """analyse_acquisition's result, or one that says why there is none. The raw ADC goes."""
+        samples, self.samples = self.samples, None
+        gaps = [[max(a - self.first, 0), b - self.first] for a, b in self.gaps if b > self.first]
+        try:
+            return analyse_acquisition(list(self.pages.values()), samples, gaps, locked,
+                                       sample_rate, dwells)
+        except Exception as exc:
+            return dict(verdict='unavailable', text=f'Not available: {exc}', attention=False,
+                        attempts=[], figure=None, error=traceback.format_exc())
+
+
+def _acquisition_rows(run, step, capture):
+    capture.take()
+    run.stage('Analysing the acquisition…')
+    end = time.monotonic() + ACQ_TAIL_S
+    while time.monotonic() < end:
+        run.check()
+        capture.poll()
+        time.sleep(ACQ_POLL_S)
+    result = capture.analyse(run.locked, run.sample_rate, acquisition_dwells(run.firmware_638))
+    step.data['acquisition'] = result
+    step.row('Lock acquisition', result['text'], False if result['attention'] else None)
+    if result['attention'] or not run.locked:
+        step.summary = result['text']
+    for attempt in result['attempts']:
+        step.row(f"Attempt {attempt['attempt']}", attempt_text(attempt))
+    return result
 
 
 # -- Lock loop measurement (calibrate_lock_638, nothing stored) --------------
@@ -723,7 +1006,7 @@ def _stop(run, step):
     step.data['runtime'] = window
     step.row('Stops on request (IDLE confirmed)', state_name(window.current_state),
              window.current_state == 0)
-    step.row('The run', ended_text(window), window.fault_code == 0)
+    step.row('The run', ended_text(window), None if run.cause() else window.fault_code == 0)
     active = getattr(window, 'active_percent', None)
     step.row('Main board CPU load', f'{active:.1f}%' if active is not None and window.flags & 8
              else 'not reported')

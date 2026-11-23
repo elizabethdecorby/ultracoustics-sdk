@@ -1,16 +1,16 @@
 """Thermomechanical-noise pressure calibration.
 
-The dome's own thermal peak is the pressure reference:
+The sensor's own thermal peak is the pressure reference:
 
     |H(f)|^2 = S_TH(f) / NEP_1^2     [W^2/Hz per Pa^2/Hz]
     S_pp(f)  = S_TOT / |H(f)|^2       [Pa^2/Hz, noise included]
 
-S_TH is the sum of the dome modes in the pressure scale, so the second mode is
+S_TH is the sum of the sensor modes in the pressure scale, so the second mode is
 divided out along with the first and the thermal floor reads flat at NEP_1^2
 across both peaks. NEP comes from the fundamental (mode 1) only.
 
 The acquisition is anti-aliased, so every narrow peak in the band is a real
-dome mode. The fit also finds broad features of the readout's response; they
+sensor mode. The fit also finds broad features of the readout's response; they
 stay in the fitted model but not in the pressure scale (see scale_modes). The
 anti-alias filter's response is fitted too (see filter_gain): it shapes the
 optical terms (and sound) but not the dark, which was recorded through it. The
@@ -43,7 +43,7 @@ CAPTURE_FFT_SIZE = 16384
 MIN_AVERAGES = 16
 # The fit and the mode search start here. Below it, 1/f-like excess noise
 # (+6 dB at 150 kHz, +1 dB at 550 kHz, gone by ~0.9 MHz on the bench) rises in
-# a way the white floor C can't follow, and bent the fit. Dome modes sit above
+# a way the white floor C can't follow, and bent the fit. Sensor modes sit above
 # 2 MHz on every probe so far.
 MIN_MODE_FREQ_HZ = 1.0e6
 MIN_MODE_Q = 3.0
@@ -52,7 +52,7 @@ MAX_FIT_LOG_Q = 3.5
 MIN_MODE_WIDTH_BINS = 3
 
 # Autofit. Every resolved resonance in the band (1 MHz to the anti-alias
-# cutoff) is fitted, however weak, so the model follows the spectrum; the dome
+# cutoff) is fitted, however weak, so the model follows the spectrum; the sensor
 # modes among them are divided out so the thermal floor reads flat in pressure
 # units. Single-bin pickup lines are masked. After each fit the largest
 # leftover bump (e.g. a weak feature on a strong mode's skirt) is added if it
@@ -82,17 +82,17 @@ RESIDUAL_SEARCH_ROUNDS = 3
 LEFTOVER_MIN_PEAK_FRACTION = 0.25  # of the local noise floor
 RESIDUAL_ROUND_MAX_NFEV = 200  # warm-started rounds converge in tens of steps
 MODE_FREQ_TOLERANCE_WIDTHS = 0.5
-PEAK_CORE_SIGMA = 0.5      # bins within ±FWHM of a dome mode count 4x in the fit
+PEAK_CORE_SIGMA = 0.5      # bins within ±FWHM of a sensor mode count 4x in the fit
 FIT_LOSS_SCALE = 0.2       # log10 units (~2 dB); only larger residuals are down-weighted
 # The fundamental's f0 and Q (and so the NEP) come from a refit over this many
 # linewidths either side of it (see _refit_fundamental). From 3 to 20 they
 # agreed within 3% on the bench, and with the half-max width.
 LOCAL_FIT_FWHM = 5.0
 
-# Pressure scale. Only dome modes set it. A resonance much broader than the
+# Pressure scale. Only sensor modes set it. A resonance much broader than the
 # fundamental is the readout's response shaping the noise floor (the dark
 # spectrum peaks near 3.9 MHz, where a Q~5 "mode" gets fitted) or a bump on a
-# skirt, not the dome: checked against a 10 MHz detector, real modes sat at
+# skirt, not the sensor: checked against a 10 MHz detector, real modes sat at
 # >= 0.66x the fundamental's Q and these at <= 0.3x.
 SCALE_MIN_Q_FRACTION = 0.5
 # A mode within this many linewidths of the cutoff is cut by the filter: its
@@ -118,11 +118,11 @@ class CalibrationError(Exception):
 
 @dataclass
 class ProbeParameters:
-    """Dome constants that set the absolute NEP scale (NEP^2 is linear in m_eff).
+    """Sensor constants that set the absolute NEP scale (NEP^2 is linear in m_eff).
 
     ``acoustic_correction`` multiplies the thermal NEP^2 once an acoustic
     calibrator has measured the true scale. It belongs to the probe, not to one
-    fit, so it survives re-fits (f0 and Q may drift; the dome's mass/area don't).
+    fit, so it survives re-fits (f0 and Q may drift; the sensor's mass/area don't).
     """
     m_eff_kg: float = ucnep.DEFAULT_M_EFF
     radius_m: float = ucnep.DEFAULT_DOME_RADIUS
@@ -133,7 +133,7 @@ class ProbeParameters:
     name: str = 'Probe 1'
 
     def nep2(self, omega_n, q):
-        """The thermal noise-equivalent pressure², Pa²/Hz, of a dome mode at angular
+        """The thermal noise-equivalent pressure², Pa²/Hz, of a sensor mode at angular
         frequency *omega_n* (rad/s) with quality factor *q*."""
         return self.acoustic_correction * float(ucnep.nep_th_squared(
             omega_n, q, m_eff=self.m_eff_kg, a=self.radius_m, T=self.temperature_k))
@@ -170,7 +170,7 @@ class Calibration:
     The calls to use are :meth:`to_pressure` (a spectrum in Pa²/Hz),
     :meth:`sensitivity`, :meth:`noise_budget`, :meth:`pressure_waveform` and
     :meth:`pa_per_uw`. ``nep2`` is the quietest sound the probe resolves, in Pa²/Hz,
-    and ``fundamental`` the dome's first resonance. The other fields are the fit
+    and ``fundamental`` the sensor's first resonance. The other fields are the fit
     itself, kept so a recording can be analysed again later.
 
     A calibration belongs to one probe at one START: do not carry it to another.
@@ -197,7 +197,7 @@ class Calibration:
 
     @property
     def fundamental(self):
-        """The dome's first resonance, as a fitted mode: ``f0_hz`` and ``Q``."""
+        """The sensor's first resonance, as a fitted mode: ``f0_hz`` and ``Q``."""
         return fundamental(self.modes, band_top_hz(self.sample_rate))
 
     @cached_property
@@ -327,12 +327,12 @@ def fundamental(modes, top_hz):
     """The lowest-frequency mode within MODE_STRENGTH_WINDOW_DB of the tallest,
     among the modes clear of the filter edge.
 
-    The fundamental is the dome's lowest mode and normally its strongest; the
+    The fundamental is the sensor's lowest mode and normally its strongest; the
     strength window keeps a weak low-frequency peak from being taken for it.
     """
     clear = [m for m in modes if not at_filter_edge(m, top_hz)]
     if not clear:
-        raise CalibrationError('No dome mode was fitted below the anti-alias filter '
+        raise CalibrationError('No sensor mode was fitted below the anti-alias filter '
                                'edge, so there is no fundamental.')
     tallest = max(m.peak_w2hz for m in clear)
     strong = [m for m in clear
@@ -341,7 +341,7 @@ def fundamental(modes, top_hz):
 
 
 def scale_modes(modes, top_hz):
-    """The modes that set the pressure scale: the dome modes.
+    """The modes that set the pressure scale: the sensor modes.
 
     Resonances broader than SCALE_MIN_Q_FRACTION of the fundamental's Q stay in
     the fitted model (they shape the floor) but are not sensitivity.
@@ -360,7 +360,7 @@ def calibrate(signal, dark, probe, sample_rate):
     with a free white floor C >= 0 and the anti-alias filter's gain G
     (filter_gain), fitted along with the modes. The dark was recorded through
     the filter, so G applies to the optical terms only. The input is
-    anti-aliased, so every narrow peak is a dome mode; the dome modes are
+    anti-aliased, so every narrow peak is a sensor mode; the sensor modes are
     divided out of the pressure view (see scale_modes).
     """
     w_pc = ucnep.w_per_count()
@@ -677,7 +677,7 @@ def thermal_psd_w2hz(cal, freqs, modes=None):
 
 
 def transfer_w2_per_pa2(cal, freqs):
-    """Sensitivity used to convert to pressure, W^2/Hz per Pa^2/Hz: the dome
+    """Sensitivity used to convert to pressure, W^2/Hz per Pa^2/Hz: the sensor
     modes in the pressure scale over the fundamental's NEP^2, through the
     anti-alias filter (sound is filtered like the thermal noise is)."""
     return (filter_gain(cal.filter_params, freqs)
@@ -694,7 +694,7 @@ def pressure_psd(cal, freqs, psd_w2hz):
 
     Dark and shot noise are not subtracted: the result is the pressure-referred
     noise, so off resonance it rises above NEP^2 where the detector, not the
-    dome's thermal motion, limits detection.
+    sensor's thermal motion, limits detection.
     """
     return (np.asarray(psd_w2hz, dtype=np.float64)
             / np.maximum(transfer_w2_per_pa2(cal, freqs), 1e-300))
@@ -871,7 +871,7 @@ def save(cal, path):
 
 def floor_over_noise_db(cal):
     """How far the fit's white floor sits above dark and shot noise, in dB. About 0
-    on a clean fit: far above FIT_FLOOR_MAX_DB, something other than the dome's
+    on a clean fit: far above FIT_FLOOR_MAX_DB, something other than the sensor's
     thermal motion was in the fit, such as sound or a disturbed lock."""
     known = cal.shot_psd_w2hz + (float(np.median(cal.dark.psd_w2hz)) if cal.dark is not None else 0.0)
     return float(10 * np.log10((known + cal.floor_w2hz) / known))

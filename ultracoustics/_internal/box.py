@@ -642,6 +642,7 @@ class BoxCommands:
         metrics = self.runtime_metrics(timeout_s=timeout_s)
         self.last_master_fault = getattr(metrics, 'fault', None)
         if metrics.current_state != 0:
+            self._running = True    # not stopped: close() tries again
             raise RuntimeError(f'Global STOP did not reach IDLE: state {metrics.current_state}')
         return metrics
 
@@ -652,8 +653,8 @@ class BoxCommands:
         remaining = .2 - (time.monotonic_ns() - self._last_manual_rail_off_ns) / 1e9
         if remaining > 0:
             time.sleep(remaining)
+        self._running = True    # before the command: if its answer is lost the lasers may be on, and close() must stop them
         result = self._send_confirmed(CMD_BOOT, timeout_s=timeout_s)
-        self._running = True
         self._last_manual_rail_off_ns = None
         return result
 

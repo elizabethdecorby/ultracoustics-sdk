@@ -2,8 +2,8 @@
 
 What is current is listed in one small file, ``updates.json`` on
 ultracoustics.ca (docs/UPDATES.md). Nothing here runs by itself and the box
-never needs a network: a check is one plain download that sends no identifiers
-and raises :class:`UpdateCheckError` when offline, and :func:`update_firmware`
+never needs a network: a check is one plain download that sends only the SDK's
+name and version, and raises :class:`UpdateCheckError` when offline, and :func:`update_firmware`
 can work from a folder of files carried over by hand.
 
 Images are public, so a file proves nothing by where it came from. A release

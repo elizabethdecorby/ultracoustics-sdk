@@ -1,19 +1,33 @@
 # Software and firmware updates
 
-`ultracoustics.updates` compares this SDK and the connected box with one small
-file on the website, `https://ultracoustics.ca/updates.json`, and installs
-approved firmware. The GUI runs the same code. Using the box never needs a
-network: a check is a plain download with no identifiers, and it raises
-`UpdateCheckError` when offline.
+`ultracoustics.updates` compares this SDK and the connected readout box with
+one small file on the website, `https://ultracoustics.ca/updates.json`, and
+installs approved firmware. The Ultracoustics GUI runs the same code. Using the
+box never needs a network. A check is one plain download: it sends the SDK's
+name and version as its User-Agent and nothing about you or the box, and it
+raises `UpdateCheckError` when offline.
+
+**This release carries no approval key yet**, so `update_firmware()` refuses
+every release with `FirmwareRefused`, before anything is written to the box.
+`check_for_updates()` works.
 
 ```python
 from ultracoustics import check_for_updates, update_firmware
 
-report = check_for_updates()        # close any Controller first
-print(report.describe())
-if report.firmware_updates:
-    update_firmware(progress=print)
+def main():
+    report = check_for_updates()        # close any Controller first
+    print(report.describe())
+    if report.firmware_updates:
+        update_firmware(progress=print)
+
+if __name__ == "__main__":              # required: update_firmware() starts the USB reader process
+    main()
 ```
+
+Both calls open the box themselves, over USB, with no `Controller`: close any
+`Controller`, the GUI and any other script first. `update_firmware()` stops the
+box. With no box connected, `check_for_updates()` still compares the SDK, and
+its report says the firmware was not read.
 
 Those two, `UpdateReport` and the errors `UpdateCheckError`, `FirmwareRefused`
 and `FirmwareUpdateError` are also on `ultracoustics` itself. The steps they
@@ -72,6 +86,10 @@ for board in compare_firmware(firmware, manifest):    # one BoardStatus per boar
   address is outside it, so moving a file needs no new approval.
 
 ## Installing
+
+This release's `FIRMWARE_KEYS` is empty: it carries no approval key yet, so
+`update_firmware()` and `install_firmware()` refuse every release. What follows
+describes how they work once a release carries a key.
 
 `update_firmware()` brings every board with an update to its newest release, the
 laser boards first. It checks and downloads everything before the first write.

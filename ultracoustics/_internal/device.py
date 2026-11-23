@@ -79,7 +79,8 @@ class Box(StreamCommands, SessionCommands):
             self._system_manual_active = False
             self._system_manual_owned = set()
         if shutdown_error is not None:
-            raise RuntimeError(f"USB closed; physical shutdown was not confirmed: {shutdown_error}") from shutdown_error
+            raise RuntimeError(f"USB closed; physical shutdown was not confirmed: {shutdown_error}. The lasers may still "
+                               "be on: use the box's button or power switch.") from shutdown_error
 
     @property
     def connected(self) -> bool:

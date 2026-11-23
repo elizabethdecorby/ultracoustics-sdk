@@ -1,11 +1,33 @@
 """Ultracoustics Python SDK.
 
+The whole of a measurement script::
+
+    import ultracoustics as uc
+
+    def main():
+        with uc.Controller() as ctrl:        # connects, and turns the lasers off at the end
+            report = ctrl.start_ready()      # lasers on and ready: about 30 s
+            rec = ctrl.capture(1.0)          # one second of signal, checked
+            rec.save("a_new_name")           # SigMF files; never overwrites
+
+    if __name__ == "__main__":               # required
+        main()
+
+Three rules:
+
+- Keep the script's work under ``if __name__ == "__main__":``. The USB is read by
+  a second process, which imports the script when it starts.
+- Use the names on ``ultracoustics`` and the methods of ``Controller``. Never use
+  ``ultracoustics._internal`` or a name that starts with an underscore.
+- Call ``ctrl.start_ready()`` first. When anything is wrong, run
+  ``ctrl.self_test()`` and keep its report.
+
 Analysis needs no box and no USB libraries. The names that talk to the box, and
 the software and firmware update checks, load the first time they are used.
 """
 from importlib import import_module
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 from .analysis.calibration import Calibration, CalibrationError, ProbeParameters, load_calibration
 from .analysis.filters import band_pass, notch
@@ -22,7 +44,7 @@ from .signal_level import SignalLevel, SignalLevelError, StoredSignalLevel
 from .trigger import BandPowerTrigger, LevelTrigger
 
 _ON_DEMAND = {
-    ".controller": ("BoxFault", "Controller", "Status"),
+    ".controller": ("BoxFault", "Controller", "StartError", "StartReport", "Status"),
     ".lock": ("LockError", "LockGains", "LockReport"),
     # The rest of ultracoustics.updates (one board at a time, the update list itself) stays in that module
     ".updates": ("FirmwareRefused", "FirmwareUpdateError", "UpdateCheckError", "UpdateReport",

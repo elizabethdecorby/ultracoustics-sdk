@@ -1,6 +1,6 @@
 # Analysis guide
 
-Everything here works on a saved recording, with no box. The code runs on the
+Everything here works on a saved recording, with no readout box. The code runs on the
 sample recording in `examples/data`: 0.1 s of a probe in a quiet room, with the
 calibration taken at that START.
 
@@ -13,13 +13,37 @@ cal = rec.calibration
 fs = rec.sample_rate          # 10 MS/s
 ```
 
+The numbers pass through four forms, and each section below takes one step:
+
+```mermaid
+flowchart LR
+    A["ADC counts<br/>rec.counts()"] -->|"x 0.00844"| B["Optical power, µW<br/>rec.power_uw()"]
+    B -->|"rec.spectrum()"| C["Spectrum, W²/Hz<br/>uc.Spectrum"]
+    C -->|"cal.to_pressure()"| D["Pressure, Pa²/Hz<br/>uc.PressureSpectrum"]
+    D --> E["dB SPL:<br/>density, band level"]
+```
+
+| Form | Unit | Section |
+|---|---|---|
+| Raw samples | ADC counts, 0 to 16383 | 1 |
+| Optical power | µW | 1 |
+| Spectrum | W²/Hz | 2 |
+| Pressure spectrum | Pa²/Hz | 3 |
+| Density, band level, tone level | dB SPL | 4 |
+
 ## 1. Counts and optical power
 
 The box samples a photodetector at 10 MS/s with a 14-bit ADC. `rec.counts()`
 gives the raw counts (0 to 16383). `rec.power_uw()` gives optical power in µW,
-which is counts × `rec.uw_per_count` (about 0.0084 µW per count). The mean is
-the light reaching the detector at the lock point. Sound is the small
-fluctuation on top of it.
+which is counts × `rec.uw_per_count` (0.00844 µW per count, so the full scale
+of 16383 counts is about 138 µW). The mean is the light reaching the detector
+while the box is ready. Sound is the small fluctuation on top of it. The mean
+includes the detector's dark offset: with the lasers off it still reads about
+240 counts, about 2 µW. `rec.power_uw(baseline=240)` subtracts a level given in
+counts. `power_uw()` returns `float64`, 80 MB for each second: for the mean of a
+long recording use `rec.counts().mean() * rec.uw_per_count`.
+`uc.counts_to_uw(counts)` does the same conversion for counts from anywhere
+else, such as the live `ctrl.buffer`.
 
 ```python
 x = rec.power_uw()                     # µW
@@ -51,21 +75,22 @@ spectrum.sigma                         # one standard deviation of each bin
 
 ## 3. From optical power to pressure
 
-The probe's dome moves with sound, and the box reads that motion as optical
-power. The dome also moves on its own, from thermal motion, by an amount set by
-physics alone. Each START, `ctrl.calibrate_pressure()` fits this thermal motion
-in a quiet room and so measures the probe's sensitivity. That fit is the
+The sensor in the probe tip moves with sound, and the box reads that motion as
+optical power. The sensor also moves on its own, from thermal motion, by an
+amount set by physics alone. Each START, `ctrl.start_ready()` fits this thermal
+motion in quiet surroundings and so measures the probe's sensitivity. That fit is the
 **calibration**. Recordings keep it, as `rec.calibration`. A calibration file
-saved by the GUI loads with `uc.load_calibration(path)`.
+saved by the Ultracoustics GUI loads with `uc.load_calibration(path)`.
 
 ```python
-cal.fundamental.f0_hz                  # the dome's first resonance: 2.09 MHz here
+cal.fundamental.f0_hz                  # the sensor's first resonance: 2.09 MHz here
 cal.sensitivity(spectrum.freqs)        # W²/Hz of optical power per Pa²/Hz of sound
 cal.nep2                               # noise-equivalent pressure², Pa²/Hz
 pressure = cal.to_pressure(spectrum)   # a PressureSpectrum, Pa²/Hz
 ```
 
-- The sensitivity peaks at the dome's resonances. Below about 500 kHz it is
+- The sensitivity peaks at the sensor's resonances. [How it works](how_it_works.md#the-sensors-resonances)
+  shows them on the sample recording. Below about 500 kHz it is
   nearly flat.
 - `cal.nep2` is the thermal noise floor in pressure units, the quietest sound
   the probe can resolve in 1 Hz. On the sample it is 4e-10 Pa²/Hz, which is
@@ -116,14 +141,24 @@ Four methods remove different things:
 | Averaging repeated events | Anything that does not repeat, thermal noise included | Waveforms | Needs repeatable events |
 
 **Thermal noise cannot be filtered out of a single waveform.** It moves the
-dome exactly as sound does, so in pressure units it is flat at NEP² across the
+sensor exactly as sound does, so in pressure units it is flat at NEP² across the
 band. It can only be subtracted from averaged power, reduced by narrowing the
 band, or averaged down over repeated events.
 
 ### Measured background
 
-Capture the same probe with the source off, at the same optical power, and
-subtract power from power:
+This is the **background sample**: the surroundings with the thing you are
+measuring switched off. It is the one reference only you can take, and the most
+useful one, because it removes everything that is not your source. Capture the
+same probe with the source off, in the same START and at the same optical
+power, and subtract power from power. With a box:
+
+```python
+background = ctrl.capture(5.0).spectrum(16384)    # source off
+measured = ctrl.capture(5.0).spectrum(16384)      # source on
+```
+
+On the sample recording, with its two halves standing in for the two captures:
 
 ```python
 background = rec.spectrum(16384, t0_s=0.0, t1_s=0.05)    # source off
@@ -133,8 +168,13 @@ real = clean.significant(sigma=5)        # bins truly above the background
 cal.to_pressure(clean).band_level(140e3, 160e3)
 ```
 
-Both spectra need the same `fft_size`. Bins that come out negative stay
-negative: they are scatter, and clipping them would bias a band level upward.
+Both spectra need the same `fft_size` (`ValueError` otherwise). Bins that come
+out negative stay negative: they are scatter, and clipping them would bias a
+band level upward. Where the source adds nothing, the level after subtracting
+is a number well below the level before, and means nothing: in the 20 to
+100 kHz band of the sample, 50 against 63 dB SPL. Always compare the two.
+`subtract` warns when the optical power of the two captures differs: the
+background then no longer matches, so retake both.
 `examples/remove_background.py` adds a known tone and reads it back.
 
 ### The noise model
@@ -145,7 +185,7 @@ The calibration's fit describes the noise as
 
 where `dark` is the electronics with the lasers off, `shot` the photon noise of
 the light, `white` any further flat noise such as laser noise, `thermal` the
-dome's motion, `broad` broad features of the readout's response and `G` the
+sensor's motion, `broad` broad features of the readout's response and `G` the
 anti-alias filter.
 
 ```python
@@ -202,7 +242,8 @@ tone.spl_db, tone.p_rms_pa, tone.bandwidth_hz
 `tone_level` is a lock-in at exactly one frequency. Its noise is the density
 times `bandwidth_hz`, so a narrower bandwidth reads weaker tones. It also needs
 a longer recording: at least 1.5 / `bandwidth_hz` seconds, so 0.15 s for the
-default 10 Hz. The sample is 0.1 s, hence 100 Hz here. A tone at a frequency
+default 10 Hz, and `ValueError` on less. The sample is 0.1 s, hence 100 Hz
+here. A tone at a frequency
 between FFT bins reads correctly, with no correction for the window. The GUI's
 per-bin view reads the same tone through the window's bandwidth.
 

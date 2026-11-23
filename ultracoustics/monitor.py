@@ -33,6 +33,7 @@ from .trigger import BandPowerTrigger, EventRecorder, Watch, make_event
 
 #: After the lock returns, wait this long before trusting the signal again.
 LOCK_SETTLE_S = 1.0
+NO_DATA_S = 0.5      # no samples for this long: the stream has stopped, and the time counts as not watched
 #: Telemetry lags the signal: hold each event this long, so one fired by the lock
 #: being lost is dropped with it.
 LOCK_GUARD_S = 0.1
@@ -396,14 +397,24 @@ class Monitor(threading.Thread):
             self.sink.close()
         if self.folder is not None:
             text = json.dumps(asdict(self.summary()), indent=2, default=str)
-            (Path(self.folder) / 'summary.json').write_text(text, encoding='utf-8')
+            try:
+                (Path(self.folder) / 'summary.json').write_text(text, encoding='utf-8')
+            except OSError as exc:      # the folder went: the owner must still be told it finished
+                self.error = self.error or exc
         self.on_finished(self)
 
     def _run(self):
         cursor = StreamCursor(self.controller)
         pending = []
         chunk = int(READ_SECONDS * self.sample_rate)
+        last_data, starved = time.monotonic(), False
         while not self._stop_event.is_set():
+            # Time with no samples at all (the cable, the reader) is time not watched
+            now = time.monotonic()
+            if starved:
+                self._not_watched += int((now - last_data) * self.sample_rate)
+                self._pauses[-1][1] += int((now - last_data) * self.sample_rate)
+                last_data = now
             try:
                 start, data, lost = cursor.read(chunk)
             except StreamReset:
@@ -412,6 +423,16 @@ class Monitor(threading.Thread):
                 self.watch.reset()
                 pending.clear()
                 continue
+            if data.size:
+                if starved:
+                    self.on_status('Samples are arriving again: monitoring')
+                last_data, starved = time.monotonic(), False
+            elif not starved and time.monotonic() - last_data > NO_DATA_S:
+                starved = True
+                self._pauses.append([datetime.now(timezone.utc), int((time.monotonic() - last_data) * self.sample_rate)])
+                self._not_watched += int((time.monotonic() - last_data) * self.sample_rate)
+                last_data = time.monotonic()
+                self.on_status('No samples are arriving from the box: not monitoring. Check the cable.')
             if lost:
                 self.lost += lost
                 self.watch.reset()

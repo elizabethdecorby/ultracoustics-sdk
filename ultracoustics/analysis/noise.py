@@ -4,12 +4,12 @@ The calibration's fitted model gives each term on the spectrum's bins::
 
     S(f) = dark(f) + G(f) * (shot + white + thermal(f) + broad(f))
 
-``G`` is the anti-alias filter's power gain and ``thermal`` the dome modes that
+``G`` is the anti-alias filter's power gain and ``thermal`` the sensor modes that
 set the pressure scale. ``broad`` holds the broad features of the readout's
 response that the fit also finds. Dividing by the sensitivity refers each term
 to pressure, where the thermal noise is flat at NEP².
 
-Thermal noise passes through the dome as sound does, so it cannot be filtered
+Thermal noise passes through the sensor as sound does, so it cannot be filtered
 out of a single waveform. It can only be subtracted from averaged power, reduced
 by narrowing the band, or averaged down over repeated events.
 """
@@ -35,7 +35,7 @@ class NoiseBudget:
     dark: np.ndarray       # the electronics: zeros if the calibration has no dark spectrum
     shot: np.ndarray
     white: np.ndarray      # the fit's white floor above dark and shot, such as laser noise
-    thermal: np.ndarray    # the dome modes in the pressure scale
+    thermal: np.ndarray    # the sensor modes in the pressure scale
     broad: np.ndarray      # broad features of the readout's response
     sensitivity: np.ndarray  # W²/Hz per Pa²/Hz
 
@@ -57,7 +57,7 @@ class NoiseBudget:
     @property
     def limited_by(self):
         """What limits detection at each bin, by name: 'thermal' while everything else
-        adds up to less than the dome's own motion, so the floor is within 3 dB of the
+        adds up to less than the sensor's own motion, so the floor is within 3 dB of the
         NEP; otherwise the largest of ``SOURCES``."""
         others = np.vstack((self.shot, self.white, self.dark, self.broad, np.maximum(self.excess, 0.0)))
         return np.where(others.sum(axis=0) < self.thermal, 'thermal', np.array(SOURCES)[np.argmax(others, axis=0)])

@@ -4,19 +4,47 @@
 
 | Call | Saves | Length |
 |---|---|---|
-| `ctrl.capture(seconds)`, then `.save(path)` | The next stretch, every sample, with the lock checked throughout | What memory holds |
-| `ctrl.snapshot(seconds)`, then `.save(path)` | What just happened, from the live ring | Up to `ring_seconds` (1.2 s by default) |
+| `ctrl.capture(seconds)`, then `.save(path)` | The next stretch, every sample, with the readout box checked to be ready throughout | What memory holds |
+| `ctrl.snapshot(seconds)`, then `.save(path)` | What just happened, from the live ring | Up to `ring_seconds` less 0.2 s (about 1.0 s by default) |
 | `ctrl.record(path, duration_s=...)` | The stream, written straight to disk as it arrives | Any |
 | `ctrl.monitor(..., folder=...)` | A stretch around each trigger, and a log of levels | Any |
 | `rec.save(path, t0_s, t1_s)` | A recording, or the part between two times | |
 
 Nothing is ever overwritten: saving to a name that already has a recording
 raises `FileExistsError`. `path` is a name such as `"runs/test_3"`, or either
-file's path.
+file's path. Give each run a new name, for example with
+`time.strftime("%Y%m%d_%H%M%S")` in it.
 
 `capture()` refuses data it cannot vouch for: it raises `CaptureError` if a
-sample was lost, or the lock was not confirmed from start to finish. `record()`
-keeps going and marks what was lost in the file.
+sample was lost, no samples arrived for 2 s, or the box was not confirmed ready
+from start to finish. `record()` keeps going and marks what happened in the
+file.
+
+## What `record()` tells you
+
+```python
+recorder = ctrl.record("runs/test_3", duration_s=600)
+recorder.samples        # how many were saved
+recorder.lost           # samples the disk could not keep up with: marked as gaps
+recorder.dropped        # a dict of the stream's loss counters that rose: empty when clean
+recorder.not_ready_s    # seconds recorded while the box was not ready
+recorder.reason         # why it ended: "duration reached", "stopped", ...
+rec = recorder.open()   # the uc.Recording, read from disk
+```
+
+- **It does not raise when data is lost or the box stops being ready.** It
+  checks that the box is ready when it starts (`CaptureError` if not), then
+  writes whatever arrives. Check `lost`, `dropped` and `not_ready_s` afterwards.
+- **`not_ready_s`** counts the data recorded while the box was not ready, such
+  as lasers-off data after the box stopped itself. The file has a `not ready`
+  annotation at the first such sample of each stretch. With
+  `require_lock=False` it is not counted.
+- **It stops if no samples arrive for 2 s**, as when the cable is pulled. With
+  `wait=True` the call raises `CaptureError`. With `wait=False`,
+  `recorder.error` holds it and `recorder.reason` says so.
+- **It refuses to start**, with `FileExistsError`, when `name` or `name_001`
+  already has a recording. A later split part never overwrites a file either:
+  the recording ends there, with the `FileExistsError` in `recorder.error`.
 
 ## The files
 
@@ -24,7 +52,7 @@ Every recording is a [SigMF](https://sigmf.org) pair:
 
 - `name.sigmf-data`: the raw ADC counts as little-endian unsigned 16-bit
   integers (SigMF datatype `ru16_le`), 14 bits used. 10 MS/s is 20 MB per
-  second.
+  second, about 72 GB an hour.
 - `name.sigmf-meta`: JSON describing the data.
 
 Any tool can read the samples: `numpy.fromfile("name.sigmf-data", "<u2")`.
@@ -43,15 +71,15 @@ The `global` object holds what applies to the whole recording.
 |---|---|
 | `core:sample_rate` | 10000000 |
 | `core:datatype`, `core:version` | `ru16_le`, SigMF 1.2.0 |
-| `core:recorder` | `Ultracoustics SDK`, or the GUI with its version |
+| `core:recorder` | `Ultracoustics SDK`, or the Ultracoustics GUI with its version |
 | `core:description`, `core:hw` | What it is, and `BROADSONIC` |
 | `broadsonic:kind` | How it was made: `capture`, `snapshot`, `continuous` or `events` from the SDK. The GUI adds its own. |
 | `broadsonic:adc_bits` | 14 |
-| `broadsonic:uw_per_count` | Optical power per ADC count, µW |
+| `broadsonic:uw_per_count` | Optical power per ADC count, µW: 0.00844 |
 | `broadsonic:system_state` | `RUNNING` or `IDLE` when it was made. The GUI writes its own state names. |
-| `broadsonic:locked` | Whether the box reported a lock when it was made |
+| `broadsonic:locked` | Whether the box reported it was ready (locked) when it was made |
 | `broadsonic:box_serial`, `broadsonic:sdk_version` | Where it came from |
-| `broadsonic:probe` | The probe's constants: dome mass and radius, temperature, any acoustic correction, name |
+| `broadsonic:probe` | The probe's constants: sensor mass and radius, temperature, any acoustic correction, name |
 | `broadsonic:calibration` | The pressure calibration, with a reduced dark spectrum. See below. |
 | `broadsonic:stream_drops` | The stream's loss counters when it began |
 | `broadsonic:stream_drops_end` | The same counters at the end of each file of a `record()` |
@@ -70,6 +98,7 @@ after a gap or at each event. Each segment has:
 The `annotations` list marks places in the data:
 
 - `gap`: samples lost at this point, counted in `broadsonic:lost_samples`.
+- `not ready`: in a `record()`, the box stopped being ready to measure here.
 - `trigger`: an event, with `broadsonic:event` (its number),
   `broadsonic:pre_trigger_samples`, `broadsonic:baseline_counts` and the
   event's features (see [monitoring](monitoring.md)).
@@ -105,7 +134,7 @@ for event in events.events:
 ## Calibrations in files
 
 `broadsonic:calibration` holds the START's pressure calibration: the fitted
-dome modes, the noise-equivalent pressure, the noise terms and a 512-bin dark
+sensor resonances, the noise-equivalent pressure, the noise terms and a 512-bin dark
 spectrum. That is everything needed for SPL and the noise budget, from the
 recording alone. It is about 30 KB.
 

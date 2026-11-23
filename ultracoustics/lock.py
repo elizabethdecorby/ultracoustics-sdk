@@ -44,6 +44,8 @@ __all__ = ["LockError", "LockGains", "LockReport", "calibrate_lock", "check_lock
            "lock_gains", "locked_638", "restore_lock_gains", "wait_ready"]
 
 _STATUS = {"rerun": "needs_retune"}
+#: Ends every "not ready" message: the self-test is the first thing to run
+SELF_TEST_HINT = " Run ctrl.self_test() to find out why."
 
 
 class LockError(RuntimeError):
@@ -155,7 +157,7 @@ def check_lock(controller, retune=False, *, progress=None, cancel=None, report_d
     except Cancelled as exc:
         return LockReport("cancelled", str(exc))
     if not settle["settled"]:
-        return LockReport("not_ready", f"not settled: {settle['reason']}", details=settle)
+        return LockReport("not_ready", f"not settled: {settle['reason']}.{SELF_TEST_HINT}", details=settle)
     raw = check_lock_638(controller._box, report_dir, progress=progress, cancel=cancel)
     return _from_check(raw, raw["status"] not in ("cancelled", "failed") and locked_638(controller._box))
 
@@ -168,7 +170,7 @@ def wait_ready(controller, timeout_s=90.0):
     _require_running(controller)
     settle = wait_settled_638(controller._box, timeout_s=timeout_s)
     if not settle["settled"]:
-        raise LockError(f"no settled lock: {settle['reason']}")
+        raise LockError(f"no settled lock: {settle['reason']}.{SELF_TEST_HINT}")
 
 
 def lock_gains(controller):

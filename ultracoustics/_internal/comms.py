@@ -82,7 +82,8 @@ class USBBulkConnection:
 
         self.dev = find_dev()
         if self.dev is None:
-            raise RuntimeError(f"Master Board not found (VID: {hex(self.vid)})")
+            raise RuntimeError(f"Master Board not found (VID: {hex(self.vid)}): no BROADSONIC box on USB. Check its power "
+                               "and that the cable carries data.")
 
         # Detach kernel driver if active (Linux/macOS)
         detached = False

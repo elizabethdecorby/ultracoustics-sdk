@@ -2,7 +2,8 @@
 
     python examples/find_events.py
 
-find_events replays the same triggers a live monitor runs. Here three 2 ms
+find_events replays the same triggers a live monitor runs, and returns every
+firing. (A live monitor by default keeps one event per alarm.) Here three 2 ms
 bursts at 50 kHz are added to the sample recording in software, and the
 recording itself is the healthy baseline.
 """

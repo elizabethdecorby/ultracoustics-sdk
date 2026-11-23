@@ -1,8 +1,9 @@
 # Monitoring
 
-A monitor watches every sample of the live stream for one or more triggers. It
-is built to run unattended, so it says what it did: the events it caught, the
-alarms it raised, the samples it lost and the time it was not watching.
+A monitor watches every sample of the live stream from the readout box for one
+or more triggers. It is built to run unattended, so it says what it did: the
+events it caught, the alarms it raised, the samples it lost and the time it was
+not watching.
 
 ```python
 import time
@@ -10,10 +11,9 @@ import ultracoustics as uc
 
 def main():
     with uc.Controller() as ctrl:
-        dark = ctrl.capture_dark()
-        ctrl.start()
-        ctrl.check_lock(retune=True)       # before the monitor: it disturbs the signal
-        ctrl.calibrate_pressure(dark)      # for limits in pressure
+        report = ctrl.start_ready()        # required, and before the monitor: about 30 s
+        if not report.calibrated:          # the second trigger's limit is in pressure
+            raise SystemExit(report.message)
 
         healthy = ctrl.capture(5.0).spectrum()
         watch = [uc.BandPowerTrigger((20e3, 100e3), threshold_db=10, baseline=healthy, name="bearing"),
@@ -75,16 +75,24 @@ persists gives one alarm and one event, not one event per holdoff. Pass
 monitor's thread as things happen. Keep them short. `monitor.active_alarms`
 names the alarms raised now.
 
-## The lock
+## When the box is not ready
 
-While the lock is lost there is nothing to watch: events then would only be the
-lock moving. The monitor pauses, says so through `on_status`, and counts the
-time. When the lock returns it waits 1 s for the signal to settle, then carries
-on. An event fired as the lock was being lost is dropped with it. Pass
+The box has to hold itself in tune with the sensor for the signal to mean
+anything. The API calls this the lock, and the monitor's status messages use
+that word. If it is lost during a run there is nothing to watch: events then
+would only be the box recovering. The monitor pauses, says so through
+`on_status` ("Lock lost: not monitoring until it returns"), and counts the
+time. When the box is ready again it waits 1 s for the signal to settle, then
+carries on. An event fired as readiness was being lost is dropped with it. Pass
 `require_lock=False` to watch regardless.
 
-So a monitor can start before the lock settles. Run `ctrl.check_lock()` before
-starting it, though: the check's 1.6 s burst is refused while a monitor runs.
+If no samples arrive at all for 0.5 s, as when the cable is pulled, that time
+counts as not watched too. `on_status` gets "No samples are arriving from the
+box: not monitoring. Check the cable." and, when they return, "Samples are
+arriving again: monitoring".
+
+Start the box with `ctrl.start_ready()` before starting a monitor: it is
+refused while a monitor runs, because its checks disturb the signal.
 
 ## The run folder
 
@@ -93,11 +101,11 @@ With `folder="pump_3"`, each run gets its own subfolder, such as
 
 | File | Holds |
 |---|---|
-| `trend.csv` | A row every `trend_s` (1 s): UTC, lock, mean optical power, rms, peak, crest factor, kurtosis, temperature, events so far, samples lost, time not watched, and each trigger's highest level and alarm state |
+| `trend.csv` | A row every `trend_s` (1 s): UTC, whether the box was ready (the lock), mean optical power, rms, peak, crest factor, kurtosis, temperature, events so far, samples lost, time not watched, and each trigger's highest level and alarm state |
 | `alarms.csv` | A row each time an alarm is raised or cleared, with its level and limit |
 | `events_0001.sigmf-meta`, `-data` | The events, a new file every 1 GiB. See [saving data](saving_data.md). |
 | `events_0001_events.csv` | One row per event: time, trigger, peak, dominant frequency, band level, rms, crest factor, kurtosis |
-| `summary.json` | Written at the end: the same as `monitor.summary()` |
+| `summary.json` | Written at the end: the same as `monitor.summary()`. If it cannot be written, the summary's `error` says so. |
 
 `trend.csv` is often the main output of a long run. A machine getting slowly
 worse shows up there before any trigger fires.
@@ -125,15 +133,17 @@ Each event carries `features`, also in the events CSV:
 s = monitor.summary()
 s.complete            # every second watched, nothing lost or unsaved, no error
 s.samples_lost        # the computer fell behind the stream
-s.not_monitored_s     # paused for the lock
-s.not_watched         # (UTC start, seconds) of each pause
+s.not_monitored_s     # the box was not ready, or no samples were arriving
+s.not_watched         # (UTC start, seconds) of each pause while the box was not ready
 s.events, s.events_not_saved, s.alarms_raised, s.alarms_active
 ```
 
 ## Tuning limits offline
 
-`find_events` replays the same triggers over a saved recording, exactly as a
-live monitor would. Tune limits there, with no box:
+`find_events` replays the same triggers over a saved recording. Tune limits
+there, with no box. It returns every firing, as a live monitor does with
+`events_during_alarm=True`. A live monitor by default keeps one event per
+alarm, so expect fewer events live than `find_events` lists.
 
 ```python
 rec = uc.load_recording("pump_3_one_hour")
@@ -158,10 +168,10 @@ them.
   false triggers, 6 dB about one a second. Start at 10 dB.
 - **A learned baseline is blind while it learns.** It listens for
   `learn_seconds` after arming, and checks from the next 0.1 s block. It keeps
-  what it learned through pauses for the lock. A healthy `baseline` or
+  what it learned through pauses while the box is not ready. A healthy `baseline` or
   `level_spl` checks from the start.
 - **Pressure limits assume a flat sensitivity across the band.** A warning
   says when it swings more than 1 dB, as near a resonance: then the limit is
   right only near the band's centre.
 - **Events must fit in the live ring.** `pre_s + post_s` must be less than the
-  Controller's `ring_seconds` (1.2 s by default).
+  Controller's `ring_seconds` less 0.2 s: about 1.0 s by default.

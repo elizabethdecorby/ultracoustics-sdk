@@ -1,7 +1,7 @@
 """
 Thermomechanical noise and pressure calibration.
 
-The dome's Brownian motion is always present and passes through the same
+The sensor's Brownian motion is always present and passes through the same
 mechanical response as sound, so its peak in the photodiode spectrum is a
 built-in pressure reference.
 
@@ -30,9 +30,9 @@ from .readout import ADC_VREF, DIFF_GAIN, RESPONSIVITY_1550, TRANSIMPEDANCE_1550
 K_B = 1.380649e-23           # Boltzmann constant  [J/K]
 ELEM_CHARGE = 1.602176634e-19  # elementary charge   [C]
 
-# Default dome physical parameters
+# Default sensor physical parameters
 DEFAULT_M_EFF = 25e-12       # effective modal mass    [kg]   (25 pg)
-DEFAULT_DOME_RADIUS = 50e-6  # dome radius             [m]    (50 µm)
+DEFAULT_DOME_RADIUS = 50e-6  # sensor radius           [m]    (50 µm)
 DEFAULT_TEMPERATURE = 300.0  # ambient                 [K]
 
 # The ADC / TIA chain, under the names these functions take as arguments.

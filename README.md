@@ -1,234 +1,200 @@
 # Ultracoustics SDK
 
-Python for the Ultracoustics BROADSONIC optical ultrasound sensor. Use it to
-capture the box's 10 MS/s signal, analyse saved recordings in sound pressure, or monitor for changes.
-The Ultracoustics GUI is built on these same functions, so a script and the GUI give the same answers.
+The Ultracoustics SDK is the Python interface to the BROADSONIC optical
+ultrasound sensor. It lets a script do what the Ultracoustics GUI does: start
+the instrument, capture and record its signal, convert that signal to sound
+pressure, and monitor for changes. The GUI is itself built on this SDK, so a
+script and the GUI produce the same results from the same hardware.
 
-Analysis needs no box. Every guide and the first three examples run on the
-sample recording in `examples/data`.
+This page introduces the instrument and the ideas the SDK is built around, shows
+a first script, and explains how the repository is organised. The remaining
+documentation is listed under [Documentation](#documentation).
 
-**New to the BROADSONIC or to Python?** Start with
-[Getting started](docs/getting_started.md): hardware setup, installing, a first
-capture explained line by line, and the words this documentation uses.
+> **Laser safety.** The readout box contains two lasers, one of them invisible,
+> and a script switches them on. Never look into the probe tip, a fiber end or
+> an optical port, and never touch the probe's sensing face. Read the safety
+> section of the
+> [User Manual](https://ultracoustics.ca/assets/User%20Manual/BROADSONIC%20Optical%20Microphone%20User%20Manual.pdf)
+> before connecting the probe.
 
-**Laser safety.** The unit contains two lasers, one invisible, and a script can
-switch them on. Never look into the probe tip, a fiber end or an optical port.
-Read the safety section of the
-[User Manual](https://ultracoustics.ca/assets/User%20Manual/BROADSONIC%20Optical%20Microphone%20User%20Manual.pdf)
-before you connect the probe.
+## Background
 
-## Install
+A BROADSONIC system has two parts. The **probe** is an optical sensor on the end
+of a fiber cable. The **readout box** contains the lasers, the detector and the
+electronics, and connects to a computer by USB.
 
-Python 3.9 or later. From a copy of this repository:
+Sound moves the sensor at the probe tip, and the box measures that movement
+with light. An infrared laser at 1550 nm is reflected from the sensor, and the
+reflected light falls on a detector. Sound appears as small fluctuations in the
+optical power the detector receives. A second laser, at 638 nm, is used by the
+box to hold itself in tune with the sensor, so that the measurement stays at
+the sensor's most sensitive point.
 
-```bash
-pip install .
-```
+The box digitises the detector signal at 10 million samples per second and
+streams it to the computer continuously. Everything after that happens in
+software: the SDK receives the stream, checks it for lost data, converts it to
+optical power and to sound pressure, and saves it.
 
-This also installs NumPy, SciPy, PyUSB and libusb1. To talk to the
-box, the computer also needs libusb and permission to use the device:
+The figure below is two seconds recorded from one probe in quiet surroundings.
+The upper panel is the signal as recorded, in optical power. The lower panel is
+the same data converted to sound pressure, and shows the quietest sound the
+system can distinguish at each frequency.
 
-- **Windows.** Nothing more. The box installs its own WinUSB driver, and the
-  SDK brings `libusb-1.0.dll`. If Device Manager shows BROADSONIC without a
-  driver, see Troubleshooting.
-- **macOS.** `brew install libusb`
-- **Linux.** Install libusb (`sudo apt install libusb-1.0-0` on Debian and
-  Ubuntu). Then let users open the box without root: save this line as
-  `/etc/udev/rules.d/99-ultracoustics.rules`
+![Spectrum of a recording from one probe, with the sensor's resonances, the dark floor and the calibrated band](docs/images/sample_spectrum.png)
 
-  ```text
-  SUBSYSTEM=="usb", ATTR{idVendor}=="2e9d", ATTR{idProduct}=="000a", MODE="0660", TAG+="uaccess"
-  ```
+The peaks are the sensor's own mechanical resonances, driven by thermal motion.
+They are present in every recording and differ from probe to probe. The SDK
+uses them as a built-in reference to calibrate sound pressure, which is why no
+external reference source is needed. [How it works](docs/how_it_works.md)
+explains the figure in detail.
 
-  then run `sudo udevadm control --reload-rules` and plug the box in again.
+## Key ideas
 
-Use a USB 2.0 High Speed port or faster, without a hub. The stream is 20 MB/s.
+**The Controller.** One object, `uc.Controller`, represents the box. A script
+connects to it, starts it, takes data and releases it. Only one program can use
+the box at a time, so the GUI must be closed while a script runs.
 
-## Capture
+**Start-up.** `ctrl.start_ready()` performs the whole start-up in one call, as
+the START button does in the GUI. It takes a lasers-off reference, switches the
+lasers on, waits for the box to settle on the sensor, checks the box's control
+settings, and calibrates sound pressure. This takes about 30 seconds, during
+which the probe should be still and the surroundings quiet.
+`ctrl.start_ready(quick=True)` is ready in a few seconds but skips the checks
+and the calibration.
+
+**The dark and the background.** Two reference measurements make data usable.
+The *dark* is the detector's signal with the lasers off, and `start_ready()`
+takes it automatically. The *background* is what the probe picks up with the
+source under study switched off. Only the user can take it, and subtracting it
+is what separates a source from its surroundings.
+
+**Pressure calibration.** The conversion from optical power to sound pressure
+is measured at every start, from the sensor's thermal resonances. It belongs to
+one probe and one start, and it is saved with every recording. Pressure values
+are valid from 0 to 4.5 MHz.
+
+**Checked data.** `ctrl.capture()` returns complete data or raises an error that
+says what went wrong. It never returns data with samples missing. Long
+recordings made with `ctrl.record()` go straight to disk and mark any loss in
+the file.
+
+**Units.** Data is stored as raw detector readings and converted on request:
+
+| Quantity | Unit | Obtained with |
+|---|---|---|
+| Raw samples | ADC counts, 0 to 16383, at 10 MS/s | `rec.counts()` |
+| Optical power | µW (one count is 0.00844 µW) | `rec.power_uw()` |
+| Spectrum | W²/Hz | `rec.spectrum()` |
+| Sound pressure spectrum | Pa²/Hz, or dB SPL in 1 Hz | `rec.calibration.to_pressure(spectrum)` |
+| Level in a frequency band | dB SPL | `pressure.band_level(20e3, 100e3).spl_db` |
+
+**When something is wrong.** `ctrl.self_test()` checks the whole system in about
+six minutes and reports what it finds. It is the first step whenever the box
+does not behave as expected. Error messages from the SDK say what to do next.
+
+## A first script
 
 ```python
 import ultracoustics as uc
 
 def main():
-    with uc.Controller() as ctrl:            # close() always runs, with a confirmed stop
-        dark = ctrl.capture_dark()           # lasers-off reference, before START
-        ctrl.start()
-        ctrl.check_lock(retune=True)         # every START: see "The lock" below
-        ctrl.calibrate_pressure(dark)        # this START's pressure calibration
-        rec = ctrl.capture(1.0)              # the next second, checked for lost samples and lock
-        rec.save("capture")                  # SigMF, with its calibration
-        recorder = ctrl.record("long_run", duration_s=60)    # straight to disk, any length
-        print(recorder.samples, "samples saved,", recorder.lost, "lost")
+    with uc.Controller() as ctrl:       # connects, and turns the lasers off at the end
+        report = ctrl.start_ready()     # lasers on, ready and calibrated: about 30 s
+        print(report.message)
+        rec = ctrl.capture(1.0)         # one second of signal, checked for lost samples
+        rec.save("first_capture")       # two files, .sigmf-data and .sigmf-meta; an existing name is never overwritten
 
-if __name__ == "__main__":
+if __name__ == "__main__":              # required: see Essentials
     main()
 ```
 
-Keep the `__main__` guard. The USB stream is read by a second Python process,
-which imports your script when it starts, so code outside the guard runs twice.
-
-The stream starts at `connect()`, so `ctrl.buffer` shows the signal before
-START, with the lasers off. `ctrl.telemetry` has the lasers and temperatures
-while running; `ctrl.request_telemetry()` asks a stopped box for them too.
-`fault = ctrl.stop()` says why, if the box had already stopped itself (the probe
-signal lost, say): `fault.code` and `fault.reason`, or `None`.
-
-## Analyse a recording
+Saved recordings can be analysed later on any computer, without the box:
 
 ```python
 import ultracoustics as uc
 
-rec = uc.load_recording("capture.sigmf-meta")
-spectrum = rec.spectrum(fft_size=16384)               # W²/Hz, every FFT averaged
-pressure = rec.calibration.to_pressure(spectrum)      # Pa²/Hz, and pressure.spl in dB SPL
-
-print(pressure.band_level(20e3, 100e3).spl_db)        # total sound in a band, dB SPL
-print(uc.tone_level(rec, rec.calibration, 40e3).spl_db)   # one steady tone, dB SPL
-print(rec.calibration.noise_budget(spectrum).limited_by_at(1e6))   # what sets the floor there
+rec = uc.load_recording("first_capture.sigmf-meta")
+spectrum = rec.spectrum()
+pressure = rec.calibration.to_pressure(spectrum)
+print(pressure.band_level(20e3, 100e3).spl_db, "dB SPL between 20 and 100 kHz")
 ```
 
-A density, a band level and a tone level are three different numbers in dB SPL.
-The [analysis guide](docs/analysis_guide.md) explains when to use which, and
-how to remove noise.
+Before relying on data from your own scripts, read
+[Essentials](docs/essentials.md). It covers what the start-up report means, how
+to take a background, file naming, what each error means, and what happens to
+the lasers when a script ends.
 
-## Watch a machine
+## Using this repository
 
-```python
-healthy = ctrl.capture(5.0).spectrum()      # the machine running normally
-watch = uc.BandPowerTrigger((20e3, 100e3), threshold_db=10, baseline=healthy, name="bearing")
-monitor = ctrl.monitor(watch, folder="runs", on_alarm=print)
-...
-monitor.stop()
-print(monitor.summary())                    # events, alarms, samples lost, time not watched
+| Folder or file | Contents |
+|---|---|
+| `ultracoustics/` | The Python package. |
+| `docs/` | The guides listed below. |
+| `examples/` | Five short scripts. Three run on the sample recording in `examples/data` and need no box. |
+| `AGENTS.md` | The rules and calls in a form written for an AI coding assistant. |
+| `CHANGELOG.md` | What changed in each release. |
+
+**Install.** Python 3.9 or later is required. In a terminal, in a copy of this
+repository:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install .
 ```
 
-The run's folder holds the events, a level log every second and the alarms.
-`uc.find_events(recording, watch)` replays the same triggers over a saved
-recording, to tune limits with no box. See [monitoring](docs/monitoring.md).
+On Windows the second line is `.venv\Scripts\activate`. On macOS, also run
+`brew install libusb`. [Getting started](docs/getting_started.md#2-install-the-sdk)
+gives the steps in detail, including Linux.
 
-## The lock
+**Check the installation.** This runs on the sample recording and needs no box:
 
-The box holds its laser on the probe with a control loop. The loop's gains
-depend on the probe and can change from one START to the next.
-
-Run `ctrl.check_lock(retune=True)` after every START where possible. It
-confirms the lock gains suit this probe and this start, and corrects them if
-they don't. Keep the probe still and away from noise while it runs, ideally
-before the monitored machine starts. It disturbs the signal for about 1.6 s, so
-the SDK won't run it during a recording or while a monitor is on. If
-conditions are too noisy it reports that the gains couldn't be measured, leaves
-them unchanged, and you can run it again at the next START.
-
-`ctrl.calibrate_lock()` is the full calibration. It measures the loop for about
-a minute and designs the gains from the measurement, then verifies them and
-stores them on the box. Run it for a new probe, or when the check keeps asking
-for a retune. Gains that fail their checks are never kept.
-
-```python
-report = ctrl.check_lock(retune=True)
-report.status, report.message      # "ok", "retuned", "inconclusive", ...: see help(uc.LockReport)
-report.ready                       # a settled lock to take data on
-ctrl.wait_ready()                  # waits for a settled lock without the burst
-report = ctrl.calibrate_lock()     # the full calibration: about 2 minutes, and 1 more to store
-ctrl.lock_gains                    # the gains running now: kp, ki_per_s and where they came from
-ctrl.restore_lock_gains()          # drop gains that were not stored: back to the box's
-ctrl.clear_stored_lock_gains()     # box stopped: the factory gains from the next START
+```bash
+python examples/analyze_recording.py
 ```
 
-Choosing Kp and Ki by hand is a service task.
-
-## Check the box
-
-These are the GUI's Diagnostics menu. Each takes a few minutes, needs the box
-connected with nothing recording or monitoring, and leaves it stopped.
-
-```python
-report = ctrl.self_test(probe_serial="...")   # the Self-check: firmware, lasers, temperatures, probe, lock, data;
-                                              # probe_serial: the number on your probe, for the report
-print(report.text())
-report.save("self_test.json")      # send it to Ultracoustics when something seems wrong
-
-level = ctrl.measure_signal_level()     # Adjust signal level: the 1550 nm power for this probe
-print(level.describe())                 # changes nothing
-ctrl.store_signal_level(level)          # stores it, and checks the box comes back at it
-```
-
-`report.recommends_signal_adjustment` says when the detector saturated in the
-self-test, which `measure_signal_level()` corrects.
-
-## Updates
-
-`check_for_updates()` compares this SDK and the connected box with the list on
-ultracoustics.ca, and `update_firmware()` installs firmware Ultracoustics has
-signed. Neither runs by itself, and the box never needs a network.
-
-```python
-report = uc.check_for_updates()    # close any Controller first
-print(report.describe())
-```
-
-The steps behind them (reading the box's versions, one board at a time) are in
-`ultracoustics.updates`: see [Updates](docs/UPDATES.md).
+**Suggested order.** Use the GUI first, to confirm that the box and probe work
+and to see what a normal signal looks like. Then run `examples/capture.py`,
+read [Essentials](docs/essentials.md), and adapt the examples to your
+application.
 
 ## Documentation
 
-| | |
+| Page | Read it for |
 |---|---|
-| [Getting started](docs/getting_started.md) | Safety, hardware setup, installing, a first capture line by line, and a glossary |
-| [Reference](docs/reference.md) | Every public name on one page, grouped by task |
-| [Analysis guide](docs/analysis_guide.md) | Counts to sound pressure, the three SPL numbers, removing noise, waveforms and tones |
-| [Saving data](docs/saving_data.md) | The SigMF files, their metadata, gaps, split files and events |
-| [Monitoring](docs/monitoring.md) | Triggers, baselines, alarms and events, the run folder, limits |
-| [Updates](docs/UPDATES.md) | Checking for updates, installing firmware, with or without a network |
-| [Examples](examples) | `analyze_recording.py`, `remove_background.py` and `find_events.py` run on the sample recording. `capture.py` and `monitor.py` need a box. |
+| [Essentials](docs/essentials.md) | Everything to know before relying on the data: the start-up in full, the rules, units, what to do when something is wrong, common tasks. |
+| [Getting started](docs/getting_started.md) | The slow walkthrough: setting up the box, installing step by step, the first script line by line, a glossary. |
+| [How it works](docs/how_it_works.md) | What the box does and what your computer does, the USB stream, the start-up stages, what happens when a script ends. |
+| [Analysis guide](docs/analysis_guide.md) | Counts to sound pressure, the three dB SPL numbers, removing noise, waveforms and tones. |
+| [Saving data](docs/saving_data.md) | The files, their metadata, gaps, split files and events. |
+| [Monitoring](docs/monitoring.md) | Triggers, baselines, alarms and events, the run folder, limits. |
+| [Advanced control](docs/advanced_control.md) | The start-up one stage at a time, the box's control settings, the signal level, changing probes. |
+| [Reference](docs/reference.md) | Every public name on one page. |
+| [Updates](docs/UPDATES.md) | Checking for updates and installing firmware. |
+| [Examples](examples) | Three that run on the sample recording with no box, and two that need one. |
 
-Every public class and function has its own help: `help(uc.Recording)`,
-`help(uc.Controller.monitor)`.
+Every public class and function has its own help: `help(uc.Controller.start_ready)`,
+`help(uc.Recording)`.
 
-The hardware has its own documents, at
-[ultracoustics.ca/downloads](https://ultracoustics.ca/downloads): the Quick
-Start Guide, the
+**Using an AI assistant?** Point it at [AGENTS.md](AGENTS.md). It holds the
+rules and the calls in a form written for a coding assistant.
+
+The hardware's Quick Start Guide,
 [User Manual](https://ultracoustics.ca/assets/User%20Manual/BROADSONIC%20Optical%20Microphone%20User%20Manual.pdf)
-(safety, connections, status lights, troubleshooting) and the
-[datasheet](https://ultracoustics.ca/assets/docs/UltracousticsBroadsonicDatasheet.pdf).
-For support, write to Ultracoustics at
+and [datasheet](https://ultracoustics.ca/assets/docs/UltracousticsBroadsonicDatasheet.pdf)
+are at [ultracoustics.ca/downloads](https://ultracoustics.ca/downloads). For
+support, write to Ultracoustics at
 [ultracoustics.ca/contact](https://ultracoustics.ca/contact).
 
 ## What is supported
 
 Use the names on `ultracoustics` itself, the methods of `Controller` and the
-steps in `ultracoustics.updates`. `help()` documents each of them, and they are
-what Ultracoustics supports.
-
-**Do not use `ultracoustics._internal`, or any name that starts with an
-underscore**, such as `ctrl._box`. That code is there because the self-test, the
-signal level, the lock and firmware updates run on it. It is not an API:
-
-- It can drive the lasers, and write firmware and the settings stored on the
-  box, without the checks the public calls make first.
-- A mistake there can leave the box needing service, with no recovery over USB.
-- It changes without notice, from one release to the next.
-- Ultracoustics does not support a box that has been driven through it.
-
-If something you need is missing from the public names, ask Ultracoustics.
-
-## Troubleshooting
-
-**"Master Board not found".** Check that the box is on and the cable carries
-data. Only one program can use the box at a time: close the GUI first.
-
-**Windows shows BROADSONIC without a driver.** Run
-[Zadig](https://zadig.akeo.ie), choose Options > List All Devices, select
-BROADSONIC (2E9D:000A), choose WinUSB and click Replace Driver.
-
-**Access denied on Linux.** Add the udev rule above, then plug the box in again.
-
-**`CaptureError: ... the computer fell behind the stream`, or `the stream
-lost data`.** Use a port without a hub, close other heavy programs, and save
-long runs with `record()`, which writes straight to disk.
-
-**The script starts twice, or fails at start with a message about
-`__main__`.** Put the script's work under `if __name__ == "__main__":`.
+steps in `ultracoustics.updates`. **Do not use `ultracoustics._internal`, or
+any name that starts with an underscore**, such as `ctrl._box`. That code can
+drive the lasers and overwrite firmware without the checks the public calls
+make, and a mistake there can leave the box needing service: see
+[the reference](docs/reference.md#what-is-not-here). If something you need is
+missing, ask Ultracoustics.
 
 ## Licence
 

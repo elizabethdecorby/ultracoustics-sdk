@@ -14,7 +14,7 @@ import time
 import numpy as np
 
 from .config import RING_GUARD_SAMPLES
-from .recording import SigMFRecording, load_recording, stream_drops
+from .recording import SigMFRecording, load_recording, new_recording_base, stream_drops
 
 # One USB packet. Data within a packet of the write head may be mid-update.
 GUARD_SAMPLES = RING_GUARD_SAMPLES
@@ -24,6 +24,7 @@ SPLIT_BYTES = 2 * 1024 ** 3      # continuous recordings start a new file here
 MARGIN_SECONDS = 0.2
 READ_SECONDS = 0.1               # largest block a reader takes at once
 POLL_SECONDS = 0.02
+STALL_SECONDS = 2.0              # no samples for this long: the stream has stopped
 
 
 class StreamReset(RuntimeError):
@@ -92,8 +93,10 @@ def capture_samples(controller, count, sample_rate, require_lock=True, stall_s=2
     """
     def check():
         if require_lock and not controller.locked:
-            raise CaptureError('the lock is not confirmed: run start() and check_lock() or wait_ready() '
-                               'first, or pass require_lock=False')
+            raise CaptureError('the box is not ready to measure (the lock is not confirmed). Before a start: run '
+                               'ctrl.start_ready(). After one: the probe moved or the signal was lost. ctrl.stop() '
+                               'returns why if the box stopped itself; then start_ready() again, and '
+                               'ctrl.self_test() if it keeps happening.')
 
     health = controller._stream_health()
     check()
@@ -105,7 +108,8 @@ def capture_samples(controller, count, sample_rate, require_lock=True, stall_s=2
             start, data, lost = cursor.read(min(count - got, int(READ_SECONDS * sample_rate)))
             if lost:
                 raise CaptureError(f'{lost} samples were overwritten before they were read: '
-                                   'the computer fell behind the stream')
+                                   'the computer fell behind the stream. Close other heavy programs, or save '
+                                   'long runs with ctrl.record().')
             if data.size:
                 if started is None:
                     lag = (int(controller.samples_received) - start) / sample_rate
@@ -114,7 +118,7 @@ def capture_samples(controller, count, sample_rate, require_lock=True, stall_s=2
                 got += data.size
                 last = time.monotonic()
             elif time.monotonic() - last > stall_s:
-                raise CaptureError(f'no samples arrived for {stall_s:g} s: is the stream running?')
+                raise CaptureError(f'no samples arrived for {stall_s:g} s: the stream has stopped. Check the cable and the box.')
             else:
                 time.sleep(POLL_SECONDS)
     except StreamReset as exc:
@@ -123,7 +127,8 @@ def capture_samples(controller, count, sample_rate, require_lock=True, stall_s=2
     after = controller._stream_health()
     dropped = {key: after[key] - health[key] for key in after if after[key] != health[key]}
     if dropped:
-        raise CaptureError(f'the stream lost data during the capture: {dropped}')
+        raise CaptureError(f'the USB link lost data during the capture ({dropped}). Use a port on the computer '
+                           'itself, without a hub, and close other heavy programs.')
     return np.concatenate(parts), started
 
 
@@ -167,10 +172,19 @@ class ContinuousRecorder(threading.Thread):
     """
 
     def __init__(self, controller, base, sample_rate, global_meta, *, max_seconds=0,
-                 max_bytes=0, split_bytes=SPLIT_BYTES, on_finished=None):
+                 max_bytes=0, split_bytes=SPLIT_BYTES, on_finished=None, require_lock=False):
         super().__init__(name='continuous-recorder', daemon=True)
         self.controller = controller
         self.base = Path(base)
+        part = self.base.with_name(f'{self.base.name}_001')
+        try:
+            new_recording_base(part)
+        except FileExistsError:
+            raise FileExistsError(f'a long recording named {self.base.name} continues in {part.name}, which already '
+                                  'has a recording; choose another name') from None
+        self.require_lock = require_lock
+        #: Seconds recorded while the box was not ready (with ``require_lock``): lasers-off or unsettled data
+        self.not_ready_s = 0.0
         self.sample_rate = sample_rate
         self.global_meta = global_meta
         self.max_samples = int(max_seconds * sample_rate) if max_seconds else 0
@@ -213,7 +227,7 @@ class ContinuousRecorder(threading.Thread):
 
     def _open_part(self):
         part = len(self.files)
-        base = self.base if part == 0 else self.base.with_name(f'{self.base.name}_{part:03d}')
+        base = self.base if part == 0 else new_recording_base(self.base.with_name(f'{self.base.name}_{part:03d}'))
         self.files.append(SigMFRecording(base, self.sample_rate, self.global_meta))
         return self.files[-1]
 
@@ -222,8 +236,23 @@ class ContinuousRecorder(threading.Thread):
         try:
             cursor = StreamCursor(self.controller)
             recording = self._open_part()
+            last_data, ready = time.monotonic(), True
             while not self._stop_event.is_set():
                 start, data, lost = cursor.read(int(READ_SECONDS * self.sample_rate))
+                if data.size:
+                    last_data = time.monotonic()
+                    if self.require_lock and not self.controller.locked:
+                        self.not_ready_s += data.size / self.sample_rate
+                        if ready:
+                            recording.annotate(recording.samples, None, 'not ready',
+                                               'the box stopped being ready to measure here')
+                        ready = False
+                    else:
+                        ready = True
+                elif time.monotonic() - last_data > STALL_SECONDS:
+                    self.reason = f'no samples arrived for {STALL_SECONDS:g} s: the stream stopped'
+                    self.error = CaptureError(f'{self.reason}. Check the cable and the box.')
+                    break
                 if lost:
                     self.lost += lost
                     recording.annotate(recording.samples, None, 'gap',
@@ -244,6 +273,8 @@ class ContinuousRecorder(threading.Thread):
                     if recording.bytes >= self.split_bytes:
                         self._close_part(recording)
                         recording = self._open_part()
+                        if not ready:
+                            recording.annotate(0, None, 'not ready', 'the box was not ready to measure here')
                 if data.size < READ_SECONDS * self.sample_rate:
                     self._stop_event.wait(POLL_SECONDS)
             else:

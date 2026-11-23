@@ -2,9 +2,12 @@
 
 It is the GUI's Diagnostics > Self-check. In about six minutes it reads every
 board's firmware and identity, checks the software and USB link, the detector
-with the lasers off, both lasers' output and temperature control, the probe,
-the lock, the data rate and the spectrum, and measures the lock loop. It changes
-nothing that is stored, and leaves the box stopped.
+with the lasers off, both lasers' output and temperature control, the light back
+from the probe, the probe, the lock, the data rate and the spectrum, and measures
+the lock loop. The steps run in the order the box works in, and a step that relies
+on something an earlier one found broken does not run, so the report names the
+first thing that really broke (:attr:`SelfTestReport.cause`). It changes nothing
+that is stored, and leaves the box stopped.
 
 Run it first when something seems wrong, and send its report to Ultracoustics.
 """
@@ -29,8 +32,9 @@ STEPS = (
     ("checks", "Software and USB checks", 20),
     ("dark", "Detector with the lasers off", 2),
     ("li_1550", "1550 nm laser output (internal photodiode)", 20),
-    ("li_638", "638 nm laser output (internal photodiode)", 20),
     ("tec_1550", "1550 nm TEC under laser load", 25),
+    ("reflected", "Light back from the microphone", 10),
+    ("li_638", "638 nm laser output (internal photodiode)", 20),
     ("tec_638", "638 nm TEC under laser load", 25),
     ("probe", "Probe sweep", 40),
     ("lock", "Lock, data rate and spectrum", 50),
@@ -68,16 +72,29 @@ class SelfTestReport:
         return [(step["title"], step["summary"]) for step in self.steps if step["status"] in PROBLEM_STATUSES]
 
     @property
+    def cause(self):
+        """The first thing the self-test found broken, which the later steps relied on, as a
+        dict: ``step`` (its key), ``reason``, and ``advice`` for the user (None when there is
+        none to give). None when nothing stopped a step."""
+        return self.data.get("cause")
+
+    @property
     def ok(self):
         """Every step ran, and none needs a look."""
         return not self.cancelled and not self.problems
 
     @property
     def recommends_signal_adjustment(self):
-        """The detector saturated at the stored 1550 nm power, in the probe sweep or while locked:
-        ``ctrl.measure_signal_level()`` chooses a lower one."""
+        """The detector saturated at the stored 1550 nm power, with the 638 nm off, in the probe
+        sweep or while locked: ``ctrl.measure_signal_level()`` chooses a lower one."""
         for step in self.steps:
             if step["key"] == "probe" and (step.get("data") or {}).get("full_scale_from_dac") is not None:
+                return True
+            if step["key"] == "reflected" and any(label == "Detector level" and ok is False
+                                                  for label, _value, ok in step["rows"]):
+                return True
+            if step["key"] == "lock" and ((step.get("data") or {}).get("acquisition")
+                                          or {}).get("verdict") == "saturated":
                 return True
             if step["key"] == "lock" and any(label == "Detector clipping" and ok is False
                                              for label, _value, ok in step["rows"]):
@@ -99,6 +116,9 @@ class SelfTestReport:
         probe = self.data.get("probe_serial")
         lines = [f"Self-test of box {self.box_number or 'unknown'}" + (f", probe {probe}" if probe else "")
                  + f", {self.data.get('created', '')}"]
+        if self.cause:
+            lines += ["", f"Found: {self.cause['reason']}"] + ([f"  {self.cause['advice']}"]
+                                                              if self.cause.get("advice") else [])
         for section in [self.data.get("host")] + list(self.steps):
             if not section:
                 continue
@@ -170,7 +190,8 @@ def run_self_test(controller, probe=None, progress=None, cancel=None, software=N
     probe = probe if probe is not None else (calibration.probe if calibration is not None else None)
     serial = None if controller is None else (str(controller.device_serial or "").strip() or None)
     report = {"schema": SCHEMA, "created": datetime.now().astimezone().isoformat(timespec="seconds"),
-              "box_serial": serial, "probe_serial": probe_serial, "cancelled": False, "steps": [],
+              "box_serial": serial, "probe_serial": probe_serial, "cancelled": False, "cause": None,
+              "steps": [],
               "host": sr.host_section(software or f"Ultracoustics SDK {__version__}", serial, probe, calibration,
                                       saved_gains, qt=qt)}
     if controller is None:
@@ -200,9 +221,10 @@ def run_self_test(controller, probe=None, progress=None, cancel=None, software=N
         report["steps"] += sr.not_run("Not run: the self-test was cancelled.", keys=MEASURED, status="cancelled")
         return SelfTestReport(report)
     measured = sr.run_report(controller._box, probe=probe, progress=say, cancel=cancelled,
-                             sample_rate=SAMPLE_RATE)
+                             sample_rate=SAMPLE_RATE, firmware_638=sr.firmware_638(report["steps"]))
     report["steps"] += measured["steps"]
     report["cancelled"] = measured["cancelled"]
+    report["cause"] = measured.get("cause")
     return SelfTestReport(report)
 
 

@@ -9,10 +9,11 @@ The Self-check's first step runs :func:`run_system_checks`:
 4. A leased round trip to each board (its TEC target and laser DAC), and on the 638
    its DAC cap, optical state, box profile and controller timing. The replies carry
    the applied value: proof the board executed the command.
-5. Each board's telemetry: a fresh temperature with no fault, and its photodiode
+5. Optionally each TEC reaches its target with the lasers at zero (``settle_tec``).
+6. Each board's telemetry: a fresh temperature with no fault, and its photodiode
    (one compiled out of the firmware is recorded, not failed).
-6. A confirmed STOP with both rails off, on every path.
-7. Optionally the 638's stored lock gains (its tuning record).
+7. A confirmed STOP with both rails off, on every path.
+8. Optionally the 638's stored lock gains (its tuning record).
 
 No laser emits. The 638's cap is read here, so later tests ramp to what the board says.
 """
@@ -102,6 +103,9 @@ class SystemChecks:
     telemetry: bool = True       # the master streams board telemetry (format 1)
     optical: bool = False        # and 638 optical diagnostics (format 2)
     cap_638: Optional[int] = None
+    #: What later tests cannot run without, and was found broken: 'link', 'telemetry',
+    #: 'boards', 'tec_1550', 'tec_638' -> why, in words. The first one found stands.
+    broken: dict = field(default_factory=dict)
     #: What stopped the checks early, if anything did (they still shut down)
     exception: Optional[BaseException] = None
 
@@ -124,13 +128,15 @@ class SystemChecks:
 
 def run_system_checks(ctrl, progress=None, check=None, read_tuning=True,
                       power_up_attempts=POWER_UP_ATTEMPTS, retry_gap_s=POWER_UP_RETRY_GAP_S,
-                      settle_s=TELEMETRY_SETTLE_S, stop_timeout_s=STOP_TIMEOUT_S):
+                      settle_s=TELEMETRY_SETTLE_S, stop_timeout_s=STOP_TIMEOUT_S, settle_tec=None):
     """Run the checks on a connected, streaming ``ctrl``; returns :class:`SystemChecks`.
 
     ``progress(message)`` reports each stage; ``check()`` is called before each and
     raises to cancel, which propagates once the box is stopped. Any other error is
     kept in ``exception`` and the result returned. ``read_tuning`` also reads the
-    638's stored lock gains after the shutdown.
+    638's stored lock gains after the shutdown. ``settle_tec(target)`` waits for a
+    board's TEC inside the manual session and returns ``(target_c, seconds, spread)``;
+    a TimeoutError or RuntimeError from it is that TEC not reaching its target.
     """
     say = progress or (lambda message: None)
     cancelled = []
@@ -146,7 +152,8 @@ def run_system_checks(ctrl, progress=None, check=None, read_tuning=True,
 
     result = SystemChecks()
     try:
-        _run(ctrl, result, stage, say, power_up_attempts, retry_gap_s, settle_s, stop_timeout_s)
+        _run(ctrl, result, stage, say, power_up_attempts, retry_gap_s, settle_s, stop_timeout_s,
+             settle_tec)
         if read_tuning and 638 in ctrl.laser_boards and hasattr(ctrl, 'read_tuning_638'):
             stage("Reading the 638 nm board's tuning record…")
             _tuning(ctrl, result)
@@ -157,10 +164,14 @@ def run_system_checks(ctrl, progress=None, check=None, read_tuning=True,
     return result
 
 
-def _run(ctrl, result, stage, say, attempts, retry_gap_s, settle_s, stop_timeout_s):
+def _run(ctrl, result, stage, say, attempts, retry_gap_s, settle_s, stop_timeout_s, settle_tec=None):
     from ..control import CHANNEL_LASER_DAC, CHANNEL_TEMPERATURE, MANUAL_GET
     stage('Stopping the box and reading the record of its last run…')
-    metrics = ctrl.stop_system_confirmed(timeout_s=stop_timeout_s)
+    try:
+        metrics = ctrl.stop_system_confirmed(timeout_s=stop_timeout_s)
+    except Exception as exc:
+        result.broken.setdefault('link', f'The box did not confirm STOP: {exc}.')
+        raise
     result.values['previous_run'] = metrics
     result.add('master_idle', 'Stops on request (IDLE confirmed)', metrics.current_state == 0,
                runtime_text(metrics))
@@ -182,6 +193,7 @@ def _run(ctrl, result, stage, say, attempts, retry_gap_s, settle_s, stop_timeout
         result.telemetry = False
         result.summary = ('The main board firmware has no board telemetry, so the steps '
                           'that need it are not run.')
+        result.broken.setdefault('telemetry', 'the main board firmware has no board telemetry')
         return
 
     stage('Powering both laser boards, lasers held at zero…')
@@ -195,6 +207,7 @@ def _run(ctrl, result, stage, say, attempts, retry_gap_s, settle_s, stop_timeout
                 dac = ctrl.system_manual_command(target, MANUAL_GET, CHANNEL_LASER_DAC)
             except Exception as exc:
                 result.add(f'manual_{target}', f'{target} nm board answers', False, exc)
+                result.broken.setdefault('boards', f'the {target} nm board did not answer: {exc}')
                 continue
             result.values[f'temperature_target_{target}_c'] = temp.applied_value / 1000.0
             result.add(f'manual_{target}', f'{target} nm board answers', dac.applied_value == 0,
@@ -202,6 +215,9 @@ def _run(ctrl, result, stage, say, attempts, retry_gap_s, settle_s, stop_timeout
                        f'{dac.applied_value} (expected 0)')
         if 638 in ctrl.laser_boards:
             _optical_638(ctrl, result, stage)
+        if settle_tec is not None and 'boards' not in result.broken:
+            for target in ctrl.laser_boards:
+                _settle_tec(ctrl, result, stage, target, settle_tec)
         stage('Checking the board telemetry…')
         time.sleep(settle_s)
         snapshot = ctrl.telemetry
@@ -250,6 +266,7 @@ def _power_up(ctrl, result, stage, attempts, retry_gap_s):
     late = power_up_text(errors[0])
     if len(errors) == len(tries):
         result.add('slaves_powered', label, False, f'{late}, on {len(tries)} power-ons')
+        result.broken.setdefault('boards', f'{late}, on {len(tries)} power-ons')
         return False
     result.add('slaves_powered', label, False, f'{late}; both answered when powered on again')
     result.summary = ' '.join(filter(None, [
@@ -270,6 +287,20 @@ def power_up_text(exc):
     fine = [f'the {target} nm board did' for target, state in states if state == 'ready']
     text = f'{" and ".join(late)} within {POWER_UP_WAIT_S} s of power-on'
     return text + (f' ({" and ".join(fine)})' if fine else '')
+
+
+def _settle_tec(ctrl, result, stage, target, settle_tec):
+    """The TEC reaches its target with the lasers at zero: everything after relies on it."""
+    label = f'{target} nm TEC reaches its target'
+    stage(f'Waiting for the {target} nm TEC to reach its target…')
+    ctrl.renew_system_manual()   # the session is older than the laser's own renewals
+    try:
+        target_c, seconds, _spread = settle_tec(target)
+    except (TimeoutError, RuntimeError) as exc:
+        result.add(f'tec_{target}', label, False, exc)
+        result.broken.setdefault(f'tec_{target}', str(exc))
+    else:
+        result.add(f'tec_{target}', label, True, f'{target_c:.2f} °C in {seconds:.1f} s')
 
 
 def _optical_638(ctrl, result, stage):

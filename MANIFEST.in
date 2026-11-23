@@ -1,4 +1,4 @@
-include README.md CHANGELOG.md LICENSE THIRD_PARTY_NOTICES.md
-recursive-include docs *.md
+include README.md AGENTS.md CHANGELOG.md LICENSE THIRD_PARTY_NOTICES.md
+recursive-include docs *.md *.png
 recursive-include examples *.py *.sigmf-meta *.sigmf-data
 global-exclude __pycache__ *.py[cod]

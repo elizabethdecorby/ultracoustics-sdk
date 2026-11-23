@@ -10,17 +10,19 @@ Typical usage::
     from ultracoustics import Controller
 
     with Controller() as ctrl:              # close() always runs, with a confirmed stop
-        dark = ctrl.capture_dark()          # lasers off
-        ctrl.start()
-        ctrl.check_lock(retune=True)        # every START, where the signal can stand it
-        ctrl.calibrate_pressure(dark)
-        recording = ctrl.capture(1.0)       # checks the lock and for lost samples
+        ctrl.start_ready()                  # lasers on, ready and calibrated: about 30 s
+        recording = ctrl.capture(1.0)       # checked for lost samples
         recording.save("capture")           # SigMF
 """
 
 from dataclasses import dataclass
+import atexit
 from datetime import datetime
+import signal
+import sys
+import threading
 import time
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -30,9 +32,9 @@ from . import lock as _lock
 from ._internal.device import Box
 from ._internal.protocol import CMD_WARM
 from .analysis import calibration as nepcal
-from .config import RING_GUARD_SAMPLES, SAMPLE_RATE
+from .config import ADC_MAX_VALUE, RING_GUARD_SAMPLES, SAMPLE_RATE
 from .monitor import EventFolder, Monitor, TrendLog
-from .readout import ADC_TO_POWER_UW, DARK_MAX_COUNTS, DARK_SETTLE_S
+from .readout import ADC_TO_POWER_UW, CLIP_FRACTION, DARK_MAX_COUNTS, DARK_SETTLE_S
 from .recorder import CaptureError, ContinuousRecorder, MARGIN_SECONDS, capture_samples, take_snapshot
 from .recording import Recording, global_meta, new_recording_base
 
@@ -40,6 +42,60 @@ from .recording import Recording, global_meta, new_recording_base
 
 # After a lock check the excitation needs this long to die away before a fit.
 EXCITATION_DECAY_S = 0.5
+# How long start_ready(quick=True) waits for the box to report it is ready.
+QUICK_START_TIMEOUT_S = 30.0
+# A box that is running but not yet ready gets this long before the quick start restarts it.
+QUICK_SETTLE_GRACE_S = 5.0
+
+
+#: Connected Controllers, held until close(): the exit hook must still find one its script let go of
+_open = set()
+
+
+def _close_at_exit():
+    """At interpreter exit: stop every box its script left running (no ``with``, no close())."""
+    for controller in list(_open):
+        try:
+            controller.close()
+        except Exception:
+            pass
+
+
+def _sigterm(*_):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)    # a second one must not cut the stop short
+    sys.exit(143)
+
+
+def _exit_on_sigterm():
+    """Make a plain ``kill`` (SIGTERM: a service manager, docker stop) end the script as
+    sys.exit() does, so the lasers are turned off. Only from the main thread, and only when
+    the script set no handler itself."""
+    if (threading.current_thread() is threading.main_thread()
+            and signal.getsignal(signal.SIGTERM) is signal.SIG_DFL):
+        signal.signal(signal.SIGTERM, _sigterm)
+
+
+atexit.register(_close_at_exit)
+
+
+class StartError(RuntimeError):
+    """:meth:`Controller.start_ready` could not get the box ready to measure. The
+    message says what to do. The lasers are off again, unless it says otherwise.
+
+    ``signal_too_strong`` is True when the cause is the signal level for this probe.
+    ``detail`` is the technical reason, for support.
+    """
+    signal_too_strong = False
+    detail = ""
+
+
+@dataclass(frozen=True)
+class StartReport:
+    """What :meth:`Controller.start_ready` did. Having one means the box is ready to measure."""
+    calibrated: bool          # this start's pressure calibration succeeded
+    message: str
+    seconds: float            # how long the start took
+    lock: object = None       # the LockReport of the check; None after quick=True
 
 
 @dataclass(frozen=True)
@@ -67,7 +123,7 @@ PUBLIC_NAMES = ('buffer', 'buffer_capacity', 'buffer_head', 'calibrate_lock', 'c
                 'capture', 'capture_dark', 'check_lock', 'clear_stored_lock_gains', 'close', 'connect', 'connected',
                 'device_serial', 'lock_gains', 'locked', 'measure_signal_level', 'monitor', 'record',
                 'request_telemetry', 'restart', 'restore_lock_gains', 'running', 'samples_received', 'self_test',
-                'snapshot', 'start', 'status', 'stop', 'store_signal_level', 'stream_stats', 'streaming',
+                'snapshot', 'start', 'start_ready', 'status', 'stop', 'store_signal_level', 'stream_stats', 'streaming',
                 'telemetry', 'verbose', 'wait_ready', 'warm')
 
 
@@ -75,11 +131,14 @@ class Controller:
     """
     The Ultracoustics box: one per box, from one script at a time.
 
+    A script that creates one must keep its work under
+    ``if __name__ == "__main__":``: the USB reader is a second process, which
+    imports the script when it starts.
+
     Usage::
 
         with Controller() as ctrl:
-            ctrl.start()
-            ctrl.check_lock(retune=True)    # or wait_ready() if a burst cannot be tolerated
+            ctrl.start_ready()              # lasers on, ready and calibrated
             recording = ctrl.capture(1.0)
             ctrl.record("long_run", duration_s=60)
 
@@ -103,8 +162,9 @@ class Controller:
             Print messages about USB traffic and captures.
         ring_seconds : float, optional
             How many seconds of samples the live ring holds: 1.2 by default.
-            A monitor's event (``pre_s + post_s``) and :meth:`snapshot` are limited
-            by it. Each second takes 20 MB of memory.
+            A monitor's event (``pre_s + post_s``) and :meth:`snapshot` can use
+            the ring less 0.2 s: about 1.0 s by default. Each second takes 20 MB
+            of memory.
         packet_diagnostics_path : str or None, optional
             For support: the reader writes a log of USB packet headers here.
         packet_diagnostics_attach_s : float, optional
@@ -114,6 +174,7 @@ class Controller:
                                     packet_diagnostics_attach_s)
         #: The Calibration that captures and recordings keep with their data.
         self.calibration = None
+        self._dark = None        # the lasers-off reference of the last start_ready()
         self._recorders = set()
         self._monitors = set()
 
@@ -130,6 +191,8 @@ class Controller:
             If no box is found, or another program has it open.
         """
         self._box.connect()
+        _open.add(self)              # lasers off however the script ends, short of being killed outright
+        _exit_on_sigterm()
 
     def __enter__(self):
         if not self.connected:
@@ -211,8 +274,9 @@ class Controller:
 
     @property
     def stream_stats(self) -> Optional[dict]:
-        """The stream's packet counters: ``packets``, ``drops_host``, ``malformed``
-        and ``last_seq`` among them. ``None`` when not connected."""
+        """The stream's packet counters, as a dict: ``packets``, ``drops_seq``,
+        ``drops_fw``, ``transfer_errors``, ``transfer_timeouts`` and ``malformed``
+        among them. ``None`` when not connected."""
         return self._box.stream_stats
 
     @property
@@ -247,12 +311,186 @@ class Controller:
 
         Starts the stream if needed, confirms IDLE, selects optical diagnostics
         so :attr:`locked` and the lock calls can see the 638, then confirms
-        START. This returns before the box has locked: follow it with
-        :meth:`check_lock` or :meth:`wait_ready`.
+        START. This returns before the box is ready to measure: most scripts
+        want :meth:`start_ready`, which does the whole start-up. After this one,
+        follow with :meth:`check_lock` or :meth:`wait_ready`.
         """
         self._box._ensure_connected()
         if not self._box._running:
             self._box.restart(timeout_s)
+
+    def start_ready(self, quick: bool = False, *, progress=None, cancel=None) -> StartReport:
+        """Turn the box on and get it ready to measure, in one call. Returns a :class:`StartReport`.
+
+        This is what START does in the GUI, and takes about 30 seconds: the
+        lasers-off (dark) reference, lasers on, the wait for the box to settle on
+        the sensor, a check of its control settings (corrected and stored on the box
+        when they need it, which adds about a minute), then this start's pressure
+        calibration. Keep the probe still and the surroundings quiet until it returns.
+        A start that fails usually says so within 90 seconds, or a few minutes if it
+        was correcting the settings.
+
+        If only the pressure calibration fails (surroundings too noisy, say), the box
+        is still ready: ``report.calibrated`` is False and ``report.message`` says
+        why. An earlier start's calibration, if this Controller has one, then stays
+        attached to new data: do not trust pressure values from it.
+        ``report.lock.ok`` is False when the control settings could not be checked.
+
+        ``quick=True`` skips every check: lasers on, then wait only until the box
+        reports it is on the sensor, a few seconds (it gives up after 30). Nothing
+        is measured or corrected, the signal may still drift for the first seconds,
+        and there is no new pressure calibration. A box that is running and ready
+        is left as it is.
+
+        ``progress(event)`` is called with ``{"stage", "fraction", ...}`` as it goes,
+        and ``cancel()`` returning True stops it. An exception raised by either
+        stops the start, turns the lasers off and is raised again.
+
+        Raises
+        ------
+        StartError
+            If the box did not become ready, with what to do next. The lasers are
+            turned off first; the message says so if that could not be confirmed.
+            ``signal_too_strong`` is True when the cause is the signal level, and
+            ``detail`` holds the technical reason, for support. Refused, with the
+            box left as it was, while a recording or monitor is running.
+        """
+        began = time.monotonic()
+        self._box._ensure_connected()
+        if self._recorders or self._monitors:
+            raise StartError("starting disturbs the signal: finish the recording or monitor first")
+        callers, strong = [], []     # an exception from the caller's progress or cancel; a saturated detector
+
+        def cancelled():
+            if not callers and cancel is not None:
+                try:
+                    return bool(cancel())
+                except Exception as exc:
+                    callers.append(exc)
+            return bool(callers)
+
+        def watch(event):
+            if not strong and self._detector_saturated():
+                strong.append(True)
+            if progress is not None and not callers:
+                try:
+                    progress(event)
+                except Exception as exc:
+                    callers.append(exc)
+
+        try:
+            try:
+                report = (self._start_quick(began, cancelled) if quick
+                          else self._start_checked(began, watch, cancelled, strong))
+            except StartError:
+                raise
+            except (RuntimeError, OSError) as exc:     # a command the box did not answer, say
+                self._start_failed("the box could not be started: it did not answer a command. Check its power and "
+                                   "the USB cable, then run ctrl.self_test(): its report says what is wrong.",
+                                   detail=f"{type(exc).__name__}: {exc}")
+            except BaseException:                      # Ctrl-C among them: never leave the lasers on
+                self._warn_if_on(self._stop_quietly())
+                raise
+        except StartError:
+            if callers:
+                raise callers[0]
+            raise
+        if callers:
+            self._warn_if_on(self._stop_quietly())
+            raise callers[0]
+        return report
+
+    @staticmethod
+    def _warn_if_on(not_stopped):
+        """When another exception is on its way out, the lasers-on warning still has to be seen."""
+        if not_stopped:
+            warnings.warn(not_stopped.strip(), RuntimeWarning, stacklevel=3)
+
+    def _start_quick(self, began, cancelled):
+        self.start()
+        settling = time.monotonic() + QUICK_SETTLE_GRACE_S
+        while not self.locked and time.monotonic() < settling and not cancelled():
+            time.sleep(0.1)
+        if not self.locked and not cancelled():    # it had stopped itself, or was in standby: start() did nothing
+            self.restart()
+        while not self.locked:
+            if cancelled():
+                self._start_failed("start-up cancelled.")
+            if time.monotonic() - began > QUICK_START_TIMEOUT_S:
+                strong = self._detector_saturated()
+                self._start_failed(self._not_ready(f"it was not ready after {QUICK_START_TIMEOUT_S:g} s", strong),
+                                   strong)
+            time.sleep(0.1)
+        return StartReport(False, "ready, without checks. " + self._units_note(), time.monotonic() - began)
+
+    def _start_checked(self, began, watch, cancelled, strong):
+        self.stop(timeout_s=4.0)
+        dark, no_dark = None, ""
+        try:
+            dark = self.capture_dark()
+        except (RuntimeError, OSError, nepcal.CalibrationError) as exc:    # none: an earlier calibration's will do
+            no_dark = str(exc)
+        self._dark = dark
+        self.start()
+        lock = self.check_lock(retune=True, progress=watch, cancel=cancelled)
+        if not lock.ready:
+            if lock.status == "cancelled":
+                self._start_failed("start-up cancelled.")
+            why = ("it did not settle on the sensor" if lock.status == "not_ready"
+                   else "its control settings could not be set")
+            self._start_failed(self._not_ready(why, bool(strong)), bool(strong) or self._detector_saturated(),
+                               lock.message)
+        ready = "ready" if lock.ok else ("ready (its control settings could not be checked this start: "
+                                         "the surroundings may be too noisy)")
+        if dark is None and self.calibration is None:
+            return StartReport(False, f"{ready}, but with no pressure calibration: the lasers-off reference could "
+                               f"not be taken ({no_dark}). " + self._units_note(), time.monotonic() - began, lock)
+        try:
+            self.calibrate_pressure(dark)
+        except (CaptureError, nepcal.CalibrationError) as exc:
+            if not self.locked:
+                self._start_failed(self._not_ready("it stopped being ready during the pressure calibration"),
+                                   detail=str(exc))
+            return StartReport(False, f"{ready}, but this start's pressure calibration did not succeed ({exc}). "
+                               + self._units_note() + " To try again without restarting, keep the probe still "
+                               "and the surroundings quiet, then call ctrl.calibrate_pressure().",
+                               time.monotonic() - began, lock)
+        return StartReport(True, f"{ready}, and calibrated for sound pressure", time.monotonic() - began, lock)
+
+    def _units_note(self):
+        return ("An earlier start's calibration is still attached to new data: do not trust pressure values from it."
+                if self.calibration is not None else "Data is in optical power only, without sound pressure.")
+
+    def _detector_saturated(self):
+        """The newest 100 ms sits at the top of the detector's range."""
+        try:
+            counts = self.snapshot(0.1).counts()
+        except RuntimeError:
+            return False
+        return float(counts.mean()) >= CLIP_FRACTION * ADC_MAX_VALUE
+
+    def _not_ready(self, why, saturated=False):
+        if saturated or self._detector_saturated():
+            return ("the signal is too strong for the detector, so the box cannot get ready. The signal level needs "
+                    "setting for this probe, once: in the GUI, Diagnostics > Adjust signal level; in a script, "
+                    "level = ctrl.measure_signal_level(), then ctrl.store_signal_level(level), which changes a "
+                    "setting kept on the box. Then start again.")
+        return (f"the box did not become ready: {why}. Run ctrl.self_test(): its report says what is wrong. "
+                "A probe that is unplugged or moving is the commonest cause.")
+
+    def _stop_quietly(self):
+        """Lasers off after a failed start. Returns what to tell the user if that could not be confirmed."""
+        try:
+            self.stop(timeout_s=4.0)
+        except (RuntimeError, OSError) as exc:    # close() tries again
+            return (f" The box could not be confirmed stopped ({exc}): the lasers may still be on. "
+                    "Use the box's button or power switch.")
+        return ""
+
+    def _start_failed(self, message, signal_too_strong=False, detail=""):
+        error = StartError(message + self._stop_quietly())
+        error.signal_too_strong, error.detail = signal_too_strong, detail
+        raise error
 
     def restart(self, timeout_s: float = 4.0):
         """Stop the laser measurement system if it is on, and start it again: as
@@ -283,14 +521,22 @@ class Controller:
         return None if reason is None else BoxFault(int(metrics.fault_code), reason)
 
     def warm(self):
-        """Standby: lasers off, temperatures held, for a faster :meth:`start`."""
+        """Standby: lasers off, temperatures held, for a faster next start.
+
+        Sent without waiting for the box's answer. Start again with :meth:`restart`
+        or :meth:`start_ready`: :meth:`start` does nothing when this Controller has
+        already started the box.
+        """
         self._box._ensure_connected()
         self._box._send(CMD_WARM)
 
     def close(self):
         """Stop the box (confirmed), end the stream and release the USB device."""
         self._end_recordings()
-        self._box.close()
+        try:
+            self._box.close()
+        finally:
+            _open.discard(self)
 
     # -- Lock -----------------------------------------------------------------
 
@@ -313,7 +559,7 @@ class Controller:
 
     def calibrate_lock(self, store: bool = True, *, progress=None, cancel=None, report_dir=None):
         """The full lock calibration: measure this probe's lock loop and design its
-        gains, about two minutes, and a minute more to store them. Returns a
+        gains, about two minutes, and about a minute more to store them. Returns a
         :class:`LockReport`. See :func:`ultracoustics.lock.calibrate_lock`.
         """
         return _lock.calibrate_lock(self, store, progress=progress, cancel=cancel, report_dir=report_dir)
@@ -361,15 +607,24 @@ class Controller:
 
     def measure_signal_level(self, progress=None, cancel=None):
         """Recommend the 1550 nm laser's setting for this probe, as the GUI's Diagnostics >
-        Adjust signal level. Changes nothing. Returns a :class:`SignalLevel`, or None if
-        cancelled. See :mod:`ultracoustics.signal_level`.
+        Adjust signal level. Returns a :class:`SignalLevel`, or None if cancelled.
+
+        It takes a few minutes, with the lasers on, and leaves the box stopped: call
+        :meth:`start_ready` again afterwards. It changes nothing on the box. Nothing
+        may be recording or monitoring. :class:`SignalLevelError` if no setting fits
+        this probe. See :mod:`ultracoustics.signal_level`.
         """
         from .signal_level import measure_signal_level
         return measure_signal_level(self, progress=progress, cancel=cancel)
 
     def store_signal_level(self, level, progress=None):
         """Store a :class:`SignalLevel`'s recommended setting and check the box comes back
-        at it. Returns a :class:`StoredSignalLevel`.
+        at it. Returns a :class:`StoredSignalLevel`: check its ``verified``.
+
+        This changes a setting kept on the box: do it by hand, once for a probe, not
+        automatically in a measurement script. It takes a few minutes, with the
+        lasers on, cannot be cancelled, and leaves the box stopped: call
+        :meth:`start_ready` again afterwards. Nothing may be recording or monitoring.
         """
         from .signal_level import store_signal_level
         return store_signal_level(self, level, progress=progress)
@@ -387,8 +642,9 @@ class Controller:
         ValueError
             If *duration_s* is not positive.
         CaptureError
-            If any sample was lost or, with *require_lock*, the lock was not
-            confirmed from start to finish.
+            If any sample was lost, no samples arrived for 2 s (the stream
+            stopped) or, with *require_lock*, the lock was not confirmed from
+            start to finish.
         """
         count = int(round(duration_s * SAMPLE_RATE))
         if count <= 0:
@@ -435,7 +691,7 @@ class Controller:
 
         *dark* is from :meth:`capture_dark`; without it, the dark of the calibration
         in use. Keep the probe in quiet surroundings with a settled lock: this
-        reads pressure off the dome's thermal motion.
+        reads pressure off the sensor's thermal motion.
 
         Raises
         ------
@@ -445,6 +701,8 @@ class Controller:
             If there is no dark reference, no fit was possible, or something
             other than thermal noise was in it.
         """
+        if dark is None:
+            dark = self._dark
         if dark is None and self.calibration is not None:
             dark = self.calibration.dark
         if dark is None:
@@ -470,17 +728,27 @@ class Controller:
         before they reached the computer appear in its ``dropped``, and in the
         file's ``broadsonic:stream_drops_end``. Returns the recorder: its
         ``open()`` gives the :class:`Recording`, and ``samples``, ``lost``,
-        ``dropped`` and ``reason`` say how it went. With ``wait=False`` it
-        returns at once and runs on: ``stop()`` and ``join()`` end it. The lock
-        is checked at the start only. *meta* replaces the SigMF fields, and
-        ``on_finished(recorder)`` is called from the recorder's thread at the end.
+        ``dropped``, ``not_ready_s`` and ``reason`` say how it went. With
+        ``wait=False`` it returns at once and runs on: ``stop()`` and ``join()``
+        end it, and its ``error`` holds what ``wait=True`` would have raised.
+
+        The lock is required at the start only. After that the recording carries
+        on if the lock is lost: ``not_ready_s`` counts the seconds recorded while
+        the box was not ready, and the file has a ``not ready`` annotation where
+        each such stretch begins. If no samples arrive for 2 s the recording stops.
+        *meta* replaces the SigMF fields, and ``on_finished(recorder)`` is called
+        from the recorder's thread at the end.
 
         Raises
         ------
+        ValueError
+            With ``wait=True`` and neither *duration_s* nor *max_bytes*.
         FileExistsError
-            If *path* already has a recording.
+            If *path*, or its first split part ``path_001``, already has a
+            recording. Split parts never overwrite a file.
         CaptureError
-            If *require_lock* and the lock is not confirmed.
+            If *require_lock* and the lock is not confirmed at the start, or
+            (with ``wait=True``) no samples arrived for 2 s.
         OSError
             If the recording could not be written (with ``wait=True``).
         """
@@ -489,15 +757,18 @@ class Controller:
         base = new_recording_base(path)
         self._box.begin_stream()
         if require_lock and not self.locked:
-            raise CaptureError("the lock is not confirmed: run start() and check_lock() or wait_ready() "
-                               "first, or pass require_lock=False")
+            raise CaptureError("the box is not ready to measure (the lock is not confirmed). Before a start: run "
+                               "ctrl.start_ready(). After one: the probe moved or the signal was lost. ctrl.stop() "
+                               "returns why if the box stopped itself; then start_ready() again, and "
+                               "ctrl.self_test() if it keeps happening.")
         def finished(recorder):
             self._recorders.discard(recorder)
             if on_finished is not None:
                 on_finished(recorder)
 
         recorder = ContinuousRecorder(self, base, SAMPLE_RATE, meta or self._recording_meta("continuous"),
-                                      max_seconds=duration_s or 0, max_bytes=max_bytes, on_finished=finished)
+                                      max_seconds=duration_s or 0, max_bytes=max_bytes, on_finished=finished,
+                                      require_lock=require_lock)
         self._recorders.add(recorder)
         recorder.start()
         if wait:
@@ -527,9 +798,9 @@ class Controller:
         monitor's thread. Call ``stop()`` on the monitor to end it, then ``summary()``
         says what was watched. With *require_lock* it watches only while the lock
         holds, so it can be started before the lock settles and says when it is
-        not watching.
+        not watching. Time with no samples arriving at all counts as not watched too.
 
-        Run :meth:`check_lock` first: its burst is refused while a monitor runs.
+        Run :meth:`start_ready` first: it is refused while a monitor runs.
         *single*, *sink*, *events_during_alarm*, *meta* and *start* are what the GUI
         needs: see :class:`Monitor`.
 

@@ -59,8 +59,6 @@ MIN_ABOVE_THRESHOLD_DAC = 1000
 FRINGE_TRIES = 4
 #: The first guess at brightest fringe over the 638-off level, before it is measured
 INITIAL_FRINGE_SCALE = 2.0
-STORED_WARMUP_S = 2.0
-LEVEL_SAMPLES = 200000
 #: The master's program sequence (power up, SPI, ACK, power down, 2 s), with margin
 PROGRAM_SETTLE_S = 4.5
 #: The master's BootFaultCode_t for a refused / timed-out DAC write
@@ -95,8 +93,8 @@ def measure(ctrl, progress=None, cancel=None, sample_rate=10_000_000):
         run.key = 'stored'
         run.stage('Stopping the box…')
         ctrl.stop_system_confirmed(timeout_s=sr.STOP_TIMEOUT_S)
-        dark = float(ctrl.collect_fresh(LEVEL_SAMPLES, timeout_s=5.0).mean())
-        stored = _stored_level(run)
+        dark = float(ctrl.collect_fresh(sr.LEVEL_SAMPLES, timeout_s=5.0).mean())
+        stored = sr._stored_level(run)
 
         run.key = 'sweep'
         run.stage('Powering both laser boards…')
@@ -267,18 +265,6 @@ def _fringe_check(run, laser, dac_1550, full, attempt, tries=FRINGE_TRIES):
             'unlocked_counts': levels[0], 'peak_fraction': levels[peak] / full}
 
 
-def _stored_level(run):
-    """The reflected level with the 1550 on its own firmware (its stored DAC), 638 off."""
-    ctrl = run.ctrl
-    run.stage('Running the 1550 nm laser at its current setting…')
-    with sr._manual_session(ctrl):
-        ctrl.start_1550_automatic(warmup_s=STORED_WARMUP_S, cancel=run.cancelled)
-        run.check()
-        samples = ctrl.collect_fresh(LEVEL_SAMPLES, timeout_s=5.0)
-        run.say('Stopping (confirmed shutdown)…')
-    return {'level_counts': float(samples.mean()), 'std_counts': float(samples.std())}
-
-
 def first_hop(dac, mean, std, dark, threshold):
     """Index of the first mode hop on a 1550 sweep, or None.
 
@@ -390,7 +376,7 @@ def write_setpoint(ctrl, result, progress=None):
     if after in DAC_WRITE_FAULTS and after != before:
         raise RuntimeError(f'the box did not store it: {sr.fault_name(after)}.')
     run.key = 'verify'
-    level = _stored_level(run)['level_counts']
+    level = sr._stored_level(run)['level_counts']
     ctrl.stop_system_confirmed(timeout_s=sr.STOP_TIMEOUT_S)
     expected, dark = result['expected_level_counts'], result['dark_counts']
     rows = result['sweep']['rows']
