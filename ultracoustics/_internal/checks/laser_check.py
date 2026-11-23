@@ -1,8 +1,8 @@
 """Laser self-check: choose the 1550 nm laser's operating power on the box.
 
 The 1550 runs at a DAC word in its own flash (0x08004000; 15885 when blank),
-which its bootloader writes when the master sends CMD_PROGRAM_1550, as the lab's
-diagnostics app does. This check picks that word on the closed box with the
+which its bootloader writes when the master sends CMD_PROGRAM_1550. This check
+picks that word on the closed box with the
 probe in, so the laser stays clear of its mode hops and the detector stays
 below full scale on the probe's brightest fringe:
 
@@ -10,9 +10,8 @@ below full scale on the probe's brightest fringe:
    off, and the reflected level on the main detector.
 2. The 1550 swept 0 -> SWEEP_TOP_DAC with the 638 off, reading the main
    detector after each confirmed SET. A mode hop shows as a jump in the AC
-   noise (the lab's RIN profiles: +9 to +17 dB, the first at DAC 17900-24900
-   on the lasers measured, 700-2700 DAC wide, often a second near 23000-25000
-   and a third near 28600-30500). A hop starts at the first point at least
+   noise, several dB high and some hundreds to a few thousand DAC wide, and a
+   laser can have more than one. A hop starts at the first point at least
    HOP_JUMP_DB above the points before it, with the next still HOP_HOLD_DB
    above, and ends at its last point before HOP_SETTLE_POINTS in a row are back
    under HOP_HOLD_DB above the noise before it. Each later hop is found the
@@ -39,7 +38,7 @@ from ...signal_level import STAGES  # noqa: F401  (the measurement's stages: the
 from . import system_report as sr
 
 #: Above the report's 25000 (system_report.LI_TOP_DAC), so the sweep reaches the
-#: second and third modes on the lasers measured; well under the firmware's 43253
+#: laser's higher modes; well under the firmware's 43253
 SWEEP_TOP_DAC = 35000
 SWEEP_STEP = 100
 SETTLE_S = 0.005
@@ -50,8 +49,7 @@ HOP_MARGIN_DAC = 1000
 HOP_JUMP_DB = 6.0
 HOP_HOLD_DB = 3.0
 HOP_HISTORY = 8                # points before a candidate hop that set its baseline
-#: Quiet points in a row that end a hop (3 and 5 agree on the lab's RIN profiles; 2 cuts
-#: some hops short)
+#: Quiet points in a row that end a hop (2 cuts some hops short)
 HOP_SETTLE_POINTS = 5
 MIN_SIGNAL_COUNTS = 50
 #: Less light than this back from the probe at the sweep's top: no probe
@@ -63,8 +61,7 @@ FRINGE_TRIES = 4
 INITIAL_FRINGE_SCALE = 2.0
 STORED_WARMUP_S = 2.0
 LEVEL_SAMPLES = 200000
-#: The master's program sequence (power up, SPI, ACK, power down, 2 s) and
-#: the diagnostics app's wait for it (PROGRAM_SETPOINT_SETTLE_S)
+#: The master's program sequence (power up, SPI, ACK, power down, 2 s), with margin
 PROGRAM_SETTLE_S = 4.5
 #: The master's BootFaultCode_t for a refused / timed-out DAC write
 DAC_WRITE_FAULTS = (8, 9)

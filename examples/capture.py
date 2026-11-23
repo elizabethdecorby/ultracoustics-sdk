@@ -26,8 +26,9 @@ def main():
         rec = ctrl.capture(1.0)                # the next second, checked for lost samples and lock
         print("saved", rec.save("capture"))
 
-        job = ctrl.record("long_run", duration_s=10)    # straight to disk: any length
-        print(f"recorded {job.samples / rec.sample_rate:.1f} s, {job.lost} samples lost")
+        # Straight to disk, any length. It gives back the recorder, which says how it went.
+        recorder = ctrl.record("long_run", duration_s=10)
+        print(f"recorded {recorder.samples / rec.sample_rate:.1f} s, {recorder.lost} samples lost")
 
 
 if __name__ == "__main__":     # needed: the USB reader runs in a process of its own, which imports this file

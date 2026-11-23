@@ -350,13 +350,17 @@ class Monitor(threading.Thread):
 
     @property
     def stopped(self):
+        """Whether :meth:`stop` has been called."""
         return self._stop_event.is_set()
 
     @property
     def active_alarms(self):
+        """The names of the triggers whose alarm is raised now."""
         return tuple(alarm.label for alarm in self.alarms if alarm.active)
 
     def stop(self, timeout=1.0):
+        """Stop watching, and wait up to *timeout* seconds for the monitor to finish
+        its files. :meth:`summary` then says how the run went."""
         self._stop_event.set()
         if self.is_alive() and threading.current_thread() is not self:
             self.join(timeout)

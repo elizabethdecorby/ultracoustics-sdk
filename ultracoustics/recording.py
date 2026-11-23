@@ -175,14 +175,17 @@ class Recording:
 
     @property
     def length(self):
+        """How many samples it holds."""
         return len(self.samples)
 
     @property
     def duration_s(self):
+        """How long it is, in seconds."""
         return self.length / self.sample_rate
 
     @property
     def end_s(self):
+        """The time of its last sample on its own time axis, in seconds."""
         return self.t0_s + self.duration_s
 
     @property
@@ -192,6 +195,7 @@ class Recording:
 
     @property
     def is_event(self):
+        """Whether it is a monitor's event or a file of them, not a plain recording."""
         return self.kind in ('event', 'event-file')
 
     def index(self, t_s):
@@ -199,6 +203,7 @@ class Recording:
         return int(np.clip(round((t_s - self.t0_s) * self.sample_rate), 0, self.length))
 
     def time(self, index):
+        """The time (s, on its own time axis) of the sample at *index*."""
         return self.t0_s + index / self.sample_rate
 
     def _range(self, t0_s, t1_s):

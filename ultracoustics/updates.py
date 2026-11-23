@@ -40,9 +40,8 @@ MANIFEST_SCHEMA = 1
 MAX_MANIFEST_BYTES = 1 << 20
 MAX_IMAGE_BYTES = 128 * 1024
 
-#: The keys that may approve firmware: Ed25519 public keys, raw and base64.
-#: tools/publish_update.py in the GUI repository makes one with ``new-key``. Keep
-#: an old key here for a while after replacing it, for releases it approved.
+#: The keys that may approve firmware: Ed25519 public keys, raw and base64. An
+#: old key stays here for a while after it is replaced, for releases it approved.
 FIRMWARE_KEYS = ()
 
 BOARD_NAMES = {"main": "Main board", "1550": "1550 nm laser board",
@@ -177,6 +176,23 @@ def verify_release(board, release):
         except InvalidSignature:
             continue
     raise refused
+
+
+def require_approved(board, data, release):
+    """Raise :class:`FirmwareRefused` unless *release* is approved for *board* and
+    lists exactly these bytes. The last check before an image is written: the
+    code that sends it calls this itself, so no caller can leave it out."""
+    if board not in BOARD_NAMES:
+        raise ValueError(f"unknown board {board!r}; use one of {tuple(BOARD_NAMES)}")
+    if not _valid_release(release):
+        raise FirmwareRefused(
+            f"This {BOARD_NAMES[board]} image comes with no approved release. Firmware goes on "
+            "a box through update_firmware() or install_firmware().")
+    verify_release(board, release)
+    digest = hashlib.sha256(data).hexdigest()
+    if all(image["sha256"] != digest for image in release.get("images", {}).values()):
+        raise FirmwareRefused(
+            f"{BOARD_NAMES[board]} {release['version']} does not list this image (SHA-256 {digest}).")
 
 
 def download_image(image, timeout_s=30.0):
@@ -338,13 +354,16 @@ class UpdateReport:
 
     @property
     def sdk_update(self):
+        """Whether a newer SDK than this one is published."""
         return newer_version(self.sdk_latest, self.sdk_running)
 
     @property
     def firmware_updates(self):
+        """The boards with a firmware update available, one :class:`BoardStatus` each."""
         return tuple(status for status in self.boards if status.update_available)
 
     def describe(self):
+        """The report as a few lines of text, to print."""
         sdk = f"update available: {self.sdk_latest}" if self.sdk_update else "up to date"
         lines = [f"Ultracoustics SDK {self.sdk_running}: {sdk}",
                  f"Firmware: {STATE_TEXT[firmware_summary(self.boards)]}"]
@@ -487,7 +506,7 @@ def install_firmware(board, image, manifest=None, progress=None,
     _check_box(board, release, build, listed, before, warnings, laser)
     sleep(USB_SETTLE_S)
     try:
-        problem = _transfer(board, data, serial, say, sleep, clock)
+        problem = _transfer(board, data, serial, say, sleep, clock, release)
         say("Confirming the new firmware…")
         after, warnings = read_firmware_versions(progress=say, sleep=sleep, clock=clock)
         sleep(USB_SETTLE_S)
@@ -514,10 +533,10 @@ def install_firmware(board, image, manifest=None, progress=None,
             "to": target, "firmware": after}
 
 
-def _transfer(board, data, serial, say, sleep, clock):
-    """Write the image, as the fleet scripts do. Returns any uncertain master error."""
+def _transfer(board, data, serial, say, sleep, clock, release):
+    """Write the image. Returns any uncertain master error."""
     if board == "main":
-        problem = _write_image(board, data, serial, say)
+        problem = _write_image(board, data, serial, say, release)
         say("Waiting for the box to restart…")
         _wait_for_box(serial, sleep, clock)
         sleep(1.0)
@@ -525,7 +544,7 @@ def _transfer(board, data, serial, say, sleep, clock):
     say("Turning the laser rails off…")
     _rails_off(serial)
     sleep(1.0)
-    problem = _write_image(board, data, serial, say)
+    problem = _write_image(board, data, serial, say, release)
     sleep(2.0)
     _rails_off(serial)
     sleep(USB_SETTLE_S)
@@ -610,9 +629,11 @@ def _rails_off(serial):
         connection.close()
 
 
-def _write_image(board, data, serial, say):
-    """Send the image. For the master returns any transport error instead of
-    raising: its reset can cut the last reply, so only the read-back can tell."""
+def _write_image(board, data, serial, say, release):
+    """Send the image, with the approved *release* that lists it: the programmer
+    checks both again before its first byte. For the master returns any transport
+    error instead of raising: its reset can cut the last reply, so only the
+    read-back can tell."""
     connection = _open_box(serial)
     try:
         programmer = Programmer(connection, verbose=False)
@@ -620,8 +641,8 @@ def _write_image(board, data, serial, say):
             def pages(page, total):
                 say(f"Writing the main board: {100 * (page + 1) // total}%")
             try:
-                programmer.flash_master(data, progress_callback=pages)
-            except ValueError:
+                programmer.flash_master(data, progress_callback=pages, release=release)
+            except (ValueError, FirmwareRefused):
                 raise
             except Exception as exc:
                 return str(exc)
@@ -630,7 +651,7 @@ def _write_image(board, data, serial, say):
         def sent(written, total):
             say(f"Writing the {BOARD_NAMES[board]}: {100 * written // total}%")
         flash = programmer.flash_638 if board == "638" else programmer.flash_1550
-        flash(data, progress_callback=sent)
+        flash(data, progress_callback=sent, release=release)
         return None
     finally:
         connection.close()

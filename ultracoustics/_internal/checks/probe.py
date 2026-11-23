@@ -1,5 +1,5 @@
 """The probe sweep's result, and the probe's dips and first-order mode in it: the
-Self-check's probe step and the lab's probe test."""
+Self-check's probe step."""
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -67,14 +67,14 @@ class ProbeCharacterizationResult:
 
 
 # ---------------------------------------------------------------------------
-# The first-order mode (the lab's probe test and the Self-check's probe step)
+# The first-order mode (the Self-check's probe step)
 # ---------------------------------------------------------------------------
 
 #: Smallest dip listed, as a fraction of the curve's median level.
 DIP_MIN_DEPTH = 0.05
 #: Smallest dip that can be the first-order mode, in percent. Shallower dips are
-#: listed but never picked: on the noisy early probe curves every dip is a 5-14%
-#: wobble, while real modes on good probes are 25-70% deep.
+#: listed but never picked: on a noisy curve every dip is a wobble of a few
+#: percent, while a real mode is tens of percent deep.
 MODE_MIN_DEPTH_PCT = 15.0
 
 
@@ -84,9 +84,7 @@ def find_dips(dac, pd) -> List[Dict[str, Any]]:
     As the 638 DAC rises it heats the probe through its optical modes, and the
     master's photodetector dips at each. A dip's depth is its prominence (how far
     it falls below the lower of the levels either side) as a percentage of that
-    level, the depth an operator reads off the curve by hand. Checked against the
-    saved bench curves and the values read off them: DAC 25,700 at 40.0% (read
-    25,700 / 41%), DAC 25,500 at 39.2% (25,625 / 40%) and DAC 39,600 (40,000).
+    level, the depth an operator reads off the curve by hand.
 
     Each is ``{'index', 'dac', 'pd_counts', 'level', 'depth_pct'}``, where ``level``
     is the surrounding level the depth is measured from.

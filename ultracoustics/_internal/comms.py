@@ -1,5 +1,5 @@
 """
-Low-level communication layer for USB Bulk and USB-Serial connections.
+Low-level communication layer for the USB Bulk connection.
 
 Classes:
     USBBulkConnection -- Manages the USB Bulk link to the Master Board
@@ -7,9 +7,6 @@ Classes:
         provides raw send/receive primitives.
     USBStream -- Streams the ADC through a reader subprocess into a
         shared-memory ring buffer.
-    SerialConnection -- USB-Serial (VCP) link to a Slave Laser Board
-        (STM32G4).  Auto-detects the COM/tty port and exposes a
-        line-oriented text interface.
 """
 
 import os
@@ -24,8 +21,6 @@ import numpy as np
 import usb.core
 import usb.util
 import usb.backend.libusb1
-import serial
-import serial.tools.list_ports
 
 from . import stream_proc
 from . import telemetry as telemetry_wire
@@ -658,90 +653,3 @@ class USBStream:
 # ---------------------------------------------------------------------------
 # USB-Serial (Slave / Laser Board)
 # ---------------------------------------------------------------------------
-
-class SerialConnection:
-    """
-    USB-Serial link to a Slave Laser Board (STM32G4 VCP).
-
-    Auto-detects the correct COM / tty port by VID/PID or description
-    string, then exposes a line-oriented send/receive interface.
-    """
-
-    def __init__(self, port=None, baudrate=115200, verbose=False):
-        self.verbose = verbose
-        self.ser = None
-
-        if port is None:
-            port = self._find_port()
-        if port is None:
-            raise RuntimeError("Laser Board serial port not found.")
-        self._open(port, baudrate)
-
-    # -- Connection -----------------------------------------------------------
-
-    def _find_port(self):
-        """Auto-detect the laser board serial port."""
-        ports = list(serial.tools.list_ports.comports())
-        candidates, unidentified = [], []
-        for p in ports:
-            if "STLINK" in str(p.description).upper():
-                continue
-            # STM32 Virtual COM Port: VID 0x0483 (STMicro) / PID 0x5740.
-            # Match on p.vid/p.pid when pyserial populates them, and also
-            # fall back to the hwid string (e.g. "USB VID:PID=0483:5740...")
-            # which is populated on Windows even when p.vid/p.pid are None.
-            hwid = str(getattr(p, "hwid", "") or "").upper()
-            if (p.vid == 0x0483 and p.pid == 0x5740) or "0483:5740" in hwid:
-                candidates.insert(0, p)
-                continue
-            desc = str(p.description).lower()
-            if "broadsonic" in desc or "ultracoustics" in desc:
-                candidates.insert(0, p)
-            elif ("tty.usbmodem" in p.device or "ttyACM" in p.device
-                  or p.device.upper().startswith("COM")):
-                # Last resort, for when pyserial reports no VID/PID: only
-                # used when it is the sole port, as it could be any device.
-                unidentified.append(p)
-        if not candidates:
-            if len(unidentified) != 1:
-                return None
-            candidates = unidentified
-        target = candidates[0]
-        if self.verbose and len(candidates) > 1:
-            print(f"Multiple candidates, selecting: {target.device}")
-        return target.device
-
-    def _open(self, port, baudrate):
-        try:
-            self.ser = serial.Serial(port, baudrate=baudrate, timeout=0.1)
-            time.sleep(0.1)
-            self.ser.reset_input_buffer()
-            self.ser.reset_output_buffer()
-            if self.verbose:
-                print(f"Laser board connected ({port})")
-        except Exception as e:
-            raise RuntimeError(f"Failed to connect at {port}: {e}")
-
-    def close(self):
-        if self.ser:
-            self.ser.close()
-            self.ser = None
-
-    # -- I/O ------------------------------------------------------------------
-
-    def send(self, cmd: str):
-        """Send a string command (appends CRLF)."""
-        if not self.ser:
-            raise RuntimeError("Not connected")
-        self.ser.write(f"{cmd}\r\n".encode())
-        if self.verbose:
-            print(f"  -> TX: {cmd}")
-
-    def read_line(self):
-        """Non-blocking readline.  Returns stripped string or None."""
-        if not self.ser or not self.ser.in_waiting:
-            return None
-        try:
-            return self.ser.readline().decode("utf-8", errors="ignore").strip()
-        except Exception:
-            return None

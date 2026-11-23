@@ -23,6 +23,5 @@ The SDK installs these from PyPI. Each keeps its own licence.
 | SciPy | BSD 3-Clause |
 | PyUSB | BSD 3-Clause |
 | libusb1 (python-libusb1) | LGPL 2.1 or later |
-| pySerial | BSD 3-Clause |
 | cryptography | Apache 2.0 or BSD 3-Clause, with OpenSSL under Apache 2.0 |
 | truststore (Python 3.10 and later) | MIT |

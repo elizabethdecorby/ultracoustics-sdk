@@ -1,7 +1,6 @@
 """System report: what the box can tell about itself, closed with the probe in.
 
-The customer's version of the lab diagnostics: the tests that need no opening
-and no bench equipment.
+The tests of the box that need no opening and no other equipment.
 
 - the software and USB checks;
 - the laser output on each board's own monitor photodiode;
@@ -12,9 +11,6 @@ and no bench equipment.
 - the lock calibration's measurement (``calibrate_lock_638``), measured only:
   the STOP that ends the report drops the gains it applies, and nothing is
   stored.
-
-The power, attenuation, noise, leakage, safety and shake tests open the box or
-need a meter, the visible-PD board or the shaker, so they stay in the lab.
 
 ``run_report()`` drives a connected, streaming Box from one
 thread and returns JSON-safe step dicts. The caller adds ``device_step()`` once
@@ -50,12 +46,12 @@ TELEMETRY_SETTLE_S = system_checks.TELEMETRY_SETTLE_S
 POWER_UP_ATTEMPTS = system_checks.POWER_UP_ATTEMPTS
 POWER_UP_RETRY_GAP_S = system_checks.POWER_UP_RETRY_GAP_S
 
-# The procedures are the lab's, one implementation each: the checks
+# The procedures have one implementation each: the checks
 # (system_checks), the LI sweep (li_curve), the heat-load step (thermal_step) and
 # the probe's dips (characterization). These are the report's choices for them.
 
 # Laser output on the board's own monitor photodiode: DAC 0 -> top, the 638 to
-# its cap and the 1550 to the lab's 25000 (it never runs near its 43253 limit).
+# its cap and the 1550 to 25000 (it never runs near its 43253 limit).
 LI_TOP_DAC = {1550: 25000, 638: None}
 LI_POINTS = li_curve.POINTS
 
@@ -73,7 +69,7 @@ TEC_RECOVERY_BAND_MDEGC = thermal_step.RECOVERY_BAND_MDEGC
 PRE_EDGE_S = thermal_step.PRE_EDGE_S
 TAIL_S = thermal_step.TAIL_S
 
-# Probe sweep, as the lab runs it.
+# Probe sweep.
 PROBE_STEP = 100
 PROBE_DWELL_S = 0.025
 PROBE_SETTLE_S = 0.005

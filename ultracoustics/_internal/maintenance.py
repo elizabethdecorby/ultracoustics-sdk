@@ -1,5 +1,5 @@
 """
-SDK maintenance utilities: firmware flashing, diagnostics and override control.
+The maintenance link: what a firmware update and the self-test's device read need.
 
 Classes:
     Programmer
@@ -11,14 +11,10 @@ Classes:
     DiagnosticsManager
         Firmware version queries and override-mode control for the Master
         Board and its slave laser boards.  Provides query_firmware_info(),
-        query_slave_version(), read_identity(), write_identity(),
-        read_tec_tuning(), write_tec_tuning(), clear_tec_tuning(),
-        enter_override(), exit_override(),
-        set_power(), set_trigger(), program_1550().
+        query_slave_version(), read_identity(), enter_override(),
+        exit_override(), set_power(), set_trigger().
 
-    LaserSerialController
-        Serial link to a slave laser board for direct current control.
-        Provides connect(), set_current(), disable(), close().
+Nothing here writes a board's stored records or sets a laser's current.
 """
 
 import struct
@@ -26,16 +22,15 @@ import time
 import zlib
 from datetime import datetime, timezone
 
-from .comms import USBBulkConnection, SerialConnection
+from .comms import USBBulkConnection
 from .protocol import (
     CMD_FLASH_1550, CMD_FLASH_638, CMD_IAP,
-    CMD_OVERRIDE_ENTER, CMD_POWER, CMD_TRIGGER, CMD_PROGRAM_1550,
+    CMD_OVERRIDE_ENTER, CMD_POWER, CMD_TRIGGER,
     CMD_BOOT_VERSION, CMD_BOOT_VERSION_638, CMD_FWINFO,
-    CMD_IDENTITY_READ, CMD_IDENTITY_WRITE, BULK_OUT_EP,
+    CMD_IDENTITY_READ, BULK_OUT_EP,
     TARGET_1550, TARGET_638, TARGET_MAIN,
 )
 from . import identity as _identity
-from . import tec_tuning as _tuning
 
 
 # A diagnostic reply can follow a 16,532-byte format-2 stream record on the
@@ -60,6 +55,10 @@ class Programmer:
         * **Board 1 – Master** (STM32H7RS, internal flash, IAP over USB)
         * **Board 2 – 1550 nm slave** (relayed via SPI3, ``CMD_FLASH_1550``)
         * **Board 3 – 638 nm slave** (relayed via SPI2, ``CMD_FLASH_638``)
+
+    Every ``flash_*`` call takes the *release* that names its image, and sends
+    nothing unless Ultracoustics approved that release and it lists exactly these
+    bytes (:func:`ultracoustics.updates.require_approved`).
     """
 
     SLAVE_PAGE_SIZE = 256
@@ -83,6 +82,14 @@ class Programmer:
     def __init__(self, connection: USBBulkConnection, verbose=False):
         self._conn = connection
         self.verbose = verbose
+
+    # -- Approval -------------------------------------------------------------
+
+    def _require_approved(self, board, firmware, release):
+        """Raise :class:`ultracoustics.updates.FirmwareRefused`, before anything is
+        sent, unless *release* is approved and lists *firmware* by SHA-256."""
+        from ..updates import require_approved    # here: updates imports this module
+        require_approved(board, bytes(firmware), release)
 
     # -- Magic header pre-flight --------------------------------------------
 
@@ -146,21 +153,25 @@ class Programmer:
 
     # -- Board 2: 1550 nm Slave -----------------------------------------------
 
-    def flash_1550(self, firmware: bytes, progress_callback=None):
+    def flash_1550(self, firmware: bytes, progress_callback=None, *, release=None):
         """Flash firmware to Board 2 (1550 nm) via SPI3 relay.
 
         Args:
             firmware: Raw .bin contents.
             progress_callback: Optional ``callback(bytes_sent, total_bytes)``.
+            release: The approved release that lists this image; refused without it.
         """
+        self._require_approved("1550", firmware, release)
         self._flash_slave(
             firmware, CMD_FLASH_1550, "1550nm", progress_callback
         )
 
     # -- Board 3: 638 nm Slave ------------------------------------------------
 
-    def flash_638(self, firmware: bytes, progress_callback=None):
-        """Flash firmware to Board 3 (638 nm) via SPI2 relay."""
+    def flash_638(self, firmware: bytes, progress_callback=None, *, release=None):
+        """Flash firmware to Board 3 (638 nm) via SPI2 relay. *release* is the
+        approved release that lists this image; refused without it."""
+        self._require_approved("638", firmware, release)
         self._flash_slave(
             firmware, CMD_FLASH_638, "638nm", progress_callback
         )
@@ -176,7 +187,7 @@ class Programmer:
             return None
 
     def flash_master(self, firmware: bytes, progress_callback=None,
-                     allow_profile_change=False):
+                     allow_profile_change=False, *, release=None):
         """Flash firmware to Board 1 (Master) via In-Application Programming.
 
         The device will reset after a successful commit; the USB connection
@@ -190,7 +201,9 @@ class Programmer:
             firmware: Raw .bin contents (≤ 64 KB).
             progress_callback: Optional ``callback(page_num, total_pages)``.
             allow_profile_change: Allow a system image onto a visible-PD board.
+            release: The approved release that lists this image; refused without it.
         """
+        self._require_approved("main", firmware, release)
         fw = bytearray(firmware)
         fw_size = len(fw)
         if fw_size == 0 or fw_size > self.MASTER_MAX_FW:
@@ -382,123 +395,6 @@ class DiagnosticsManager:
         self._conn.send_command(CMD_IDENTITY_READ, wIndex=target)
         return self._read_identity_reply(_identity.OP_READ, target, timeout_ms)
 
-    def write_identity(self, target, identity, timeout_ms=12000):
-        """Store a new identity record on one board and read it back.
-
-        The board keeps its previous records; the newest one is returned by
-        later reads. ``identity.board`` must match *target*. If
-        ``identity.programmed_at`` is unset it is filled with the current time.
-
-        Returns
-        -------
-        ultracoustics.identity.IdentityResult
-            ``ok`` is True only if the board verified the stored record. The
-            returned ``record`` is what the board holds after the write.
-        """
-        _check_identity_target(target)
-        expected_board = _identity.BOARD_FOR_TARGET[target]
-        if identity.board != expected_board:
-            raise ValueError(
-                f"identity is for board type {identity.board}, target {target} "
-                f"is board type {expected_board}")
-        if identity.programmed_at is None:
-            identity.programmed_at = int(time.time())
-        record = _identity.build_record(identity)
-        self._conn.send_command(CMD_IDENTITY_WRITE, wIndex=target, extra=record)
-        result = self._read_identity_reply(_identity.OP_WRITE, target, timeout_ms)
-        # The firmware checks bytes; this also catches a reply for another write.
-        sent = _identity.parse_record(record).identity
-        if result.ok and (result.record is None
-                          or result.record.identity.details() != sent.details()
-                          or result.record.identity.report_id != sent.report_id):
-            result.status = _identity.STATUS_VERIFY_FAIL
-        return result
-
-    # -- TEC tuning records --------------------------------------------------
-
-    def read_tec_tuning(self, target, timeout_ms=8000):
-        """Read the TEC tuning record stored on one laser board.
-
-        Parameters
-        ----------
-        target : int
-            ``TARGET_1550`` or ``TARGET_638``. Like :meth:`read_identity`,
-            this power-cycles the board into its bootloader.
-
-        Returns
-        -------
-        ultracoustics.tec_tuning.TuningResult
-            ``status`` is ``STATUS_OK`` with ``record`` set, or ``EMPTY``,
-            ``NO_RESPONSE`` (no board / bootloader without tuning support),
-            etc. Raises ``TuningError`` if the mainboard firmware predates
-            tuning records, and ``TimeoutError`` if no reply arrives.
-        """
-        _check_tuning_target(target)
-        self._conn.send_command(CMD_IDENTITY_READ, wValue=_tuning.KIND, wIndex=target)
-        return _tuning.parse_reply(
-            self._read_utid_reply(_identity.OP_READ, target, timeout_ms))
-
-    def write_tec_tuning(self, target, tuning, timeout_ms=15000):
-        """Store a new TEC tuning record on one laser board and read it back.
-
-        The laser app applies the newest record at its next start-up; the
-        write itself power-cycles the board. Fields left as ``None`` keep the
-        firmware's compiled defaults. ``tuning.board`` must match *target*, and
-        the values must pass the firmware bounds (``TuningError`` otherwise,
-        before anything is sent). If ``tuning.tuned_at`` is unset it is filled
-        with the current time.
-
-        On the 638 the write is read-modify-write: the stored record is read
-        first and its lock PI fields are stored again with the new TEC
-        fields, so a TEC write never changes the lock gains. ``tuning`` must
-        leave the lock fields unset. If that read does not return ``OK`` or
-        ``EMPTY``, its result is returned and nothing is written.
-
-        Returns
-        -------
-        ultracoustics.tec_tuning.TuningResult
-            ``ok`` is True only if the board verified the stored record.
-        """
-        _check_tuning_target(target)
-        expected_board = _tuning.BOARD_FOR_TARGET[target]
-        if tuning.board != expected_board:
-            raise ValueError(
-                f"tuning is for board type {tuning.board}, target {target} "
-                f"is board type {expected_board}")
-        if any(getattr(tuning, name) is not None for name in _tuning.LOCK_FIELDS):
-            raise ValueError("write_tec_tuning keeps the stored lock PI fields; "
-                             "lock gains are written with Controller.write_lock_tuning_638")
-        if tuning.tuned_at is None:
-            tuning.tuned_at = int(time.time())
-        record = _tuning.build_record(tuning)  # validates
-        if target == TARGET_638:
-            stored = self.read_tec_tuning(target, timeout_ms)
-            if stored.status not in (_identity.STATUS_OK, _identity.STATUS_EMPTY):
-                return stored
-            time.sleep(_tuning.RMW_GAP_S)
-            record = _tuning.build_record(_tuning.keep_stored(tuning, stored.record, "lock"))
-        self._conn.send_command(CMD_IDENTITY_WRITE, wValue=_tuning.KIND,
-                                wIndex=target, extra=record)
-        result = _tuning.parse_reply(
-            self._read_utid_reply(_identity.OP_WRITE, target, timeout_ms))
-        sent = _tuning.parse_record(record).tuning
-        if result.ok and (result.record is None
-                          or not _tuning.same_record(result.record.tuning, sent)):
-            result.status = _identity.STATUS_VERIFY_FAIL
-        return result
-
-    def clear_tec_tuning(self, target, report_id=None, timeout_ms=15000):
-        """Return a laser board to its compiled TEC gains.
-
-        Slots are append-only, so this stores a record that sets no TEC
-        field. On the 638 it keeps the stored lock PI fields, as
-        :meth:`write_tec_tuning` does.
-        """
-        _check_tuning_target(target)
-        tuning = _tuning.TecTuning(board=_tuning.BOARD_FOR_TARGET[target],
-                                   report_id=report_id)
-        return self.write_tec_tuning(target, tuning, timeout_ms)
-
     # -- Override mode --------------------------------------------------------
 
     def enter_override(self):
@@ -554,16 +450,6 @@ class DiagnosticsManager:
             ``True`` to assert, ``False`` to de-assert.
         """
         self._conn.send_command(CMD_TRIGGER, wValue=int(on), wIndex=target)
-
-    def program_1550(self, dac_val: int):
-        """Write a raw DAC code to the 1550 nm slave laser board.
-
-        Parameters
-        ----------
-        dac_val : int
-            16-bit DAC value (0–65535) controlling the laser drive level.
-        """
-        self._conn.send_command(CMD_PROGRAM_1550, wValue=dac_val)
 
     # -- Internals ------------------------------------------------------------
 
@@ -685,212 +571,6 @@ def _check_identity_target(target):
                          "use TARGET_MAIN, TARGET_1550 or TARGET_638")
 
 
-def _check_tuning_target(target):
-    if target not in _tuning.BOARD_FOR_TARGET:
-        raise ValueError(f"no TEC tuning record on target {target!r}; "
-                         "use TARGET_1550 or TARGET_638")
-
-
 # ---------------------------------------------------------------------------
 # LaserSerialController – serial link for direct laser current control
 # ---------------------------------------------------------------------------
-
-class LaserSerialController:
-    """Serial interface to a slave laser board for current control.
-
-    The two slave lasers use slightly different serial command dialects:
-
-    * **638 nm** – current is set with ``l=<value>`` (equals sign). No
-      explicit enable/disable command is required; the rail power + trigger
-      state set on the master board turn the output on.
-    * **1550 nm** – current is set with ``l <value>`` (space), and the
-      output must be explicitly enabled with ``on`` and disabled with
-      ``off``. The 1550 firmware also emits a temperature log line every
-      ~2 s that must be drained (:meth:`drain`) to avoid overflowing the
-      serial receive buffer during long sweeps.
-
-    The target-aware methods (:meth:`set_current`, :meth:`enable`,
-    :meth:`disable`) pick the correct dialect automatically. The plain
-    :meth:`send` / :meth:`read_line` / :meth:`drain` passthroughs are
-    exposed for anything else.
-
-    Usage::
-
-        from ultracoustics._internal.maintenance import LaserSerialController
-        from ultracoustics._internal.protocol import TARGET_1550
-
-        laser = LaserSerialController(port="COM3", verbose=True)
-        laser.enable(target=TARGET_1550)
-        laser.set_current(2048, target=TARGET_1550)
-        laser.disable(target=TARGET_1550)
-        laser.close()
-    """
-
-    def __init__(self, port=None, verbose=False):
-        """Open the serial connection to a slave laser board.
-
-        Parameters
-        ----------
-        port : str or None, optional
-            Serial port name (e.g. ``'COM3'`` or ``'/dev/ttyUSB0'``).
-            If ``None``, :class:`SerialConnection` will attempt
-            auto-detection.
-        verbose : bool, optional
-            Print diagnostic messages. Defaults to ``False``.
-        """
-        self._serial = SerialConnection(port=port, verbose=verbose)
-        self.verbose = verbose
-
-    # -- Construction helper --------------------------------------------------
-
-    @classmethod
-    def connect_with_retry(cls, timeout_s: float = 15.0,
-                           poll_interval_s: float = 0.5,
-                           port=None, verbose=False) -> "LaserSerialController":
-        """Open the laser serial link, retrying until the slave enumerates.
-
-        After the master board powers a slave rail via override mode, the
-        slave's USB-serial (VCP) port can take a few seconds to appear.
-        Poll for up to *timeout_s* and only re-raise the last error if it
-        still has not enumerated.
-
-        Parameters
-        ----------
-        timeout_s : float
-            Maximum total time to wait for the port to appear.
-        poll_interval_s : float
-            Time between connection attempts.
-        port : str or None
-            Explicit port name, or ``None`` to auto-detect each attempt.
-        verbose : bool
-            Passed through to :class:`LaserSerialController`; the first
-            attempt is verbose, subsequent attempts are quietened.
-
-        Returns
-        -------
-        LaserSerialController
-            A connected controller.
-
-        Raises
-        ------
-        RuntimeError
-            If the slave does not enumerate within *timeout_s*.
-        """
-        import time as _time
-        deadline = _time.time() + timeout_s
-        last_exc = None
-        attempt = 0
-        while _time.time() < deadline:
-            attempt += 1
-            try:
-                if verbose and attempt > 1:
-                    remaining = deadline - _time.time()
-                    print(f"  [{attempt:2d}] slave serial not yet enumerated "
-                          f"({remaining:.1f}s left)...", end="\r")
-                return cls(port=port, verbose=(verbose and attempt == 1))
-            except RuntimeError as exc:
-                last_exc = exc
-                _time.sleep(poll_interval_s)
-        if verbose:
-            print()
-            # Dump every visible COM port so the caller can see whether the
-            # slave enumerated at all (and with what VID/PID/description).
-            # A 638 slave should appear as VID=0x0483 PID=0x5740
-            # "STM32 Virtual ComPort"; a 1550 as the custom Broadsonic PID.
-            try:
-                import serial.tools.list_ports as _lp
-                ports = list(_lp.comports())
-                if ports:
-                    print("  Visible COM ports:")
-                    for _p in ports:
-                        _vid = hex(_p.vid) if _p.vid is not None else "None"
-                        _pid = hex(_p.pid) if _p.pid is not None else "None"
-                        print(f"    {_p.device}  VID={_vid} PID={_pid}  "
-                              f"{_p.description}")
-                else:
-                    print("  No COM ports visible at all — is the slave USB "
-                          "cable connected to the host and the board powered?")
-            except Exception:
-                pass
-        raise RuntimeError(
-            f"Laser serial port not found after {timeout_s:.0f}s "
-            f"({attempt} attempts). Last error: {last_exc}"
-        )
-
-    # -- Target-aware current control ----------------------------------------
-
-    def set_current(self, dac_value: int, target=None):
-        """Set the laser driver current, picking the dialect by target.
-
-        Parameters
-        ----------
-        dac_value : int
-            Raw DAC value forwarded to the slave.
-        target : int or None
-            ``TARGET_1550`` sends the 1550 ``l <value>`` (space) form;
-            ``TARGET_638`` or ``None`` sends the 638 ``l=<value>`` (equals)
-            form. ``None`` preserves the historical default behaviour.
-        """
-        v = int(dac_value)
-        if target == TARGET_1550:
-            self._serial.send(f"l {v}")
-        else:
-            self._serial.send(f"l={v}")
-
-    def enable(self, target=None):
-        """Enable the laser output.
-
-        The 1550 nm slave requires an explicit ``on`` command; the 638 nm
-        slave is enabled by its power rail and trigger state on the master
-        board, so this is a no-op for ``TARGET_638`` / ``None``.
-        """
-        if target == TARGET_1550:
-            self._serial.send("on")
-
-    def disable(self, target=None):
-        """Disable the laser driver.
-
-        For ``TARGET_1550`` this drives the current to 0 (``l 0``) and then
-        sends ``off``. For ``TARGET_638`` / ``None`` it sends ``l=0``
-        (matching the historical behaviour).
-        """
-        if target == TARGET_1550:
-            self._serial.send("l 0")
-            self._serial.send("off")
-        else:
-            self._serial.send("l=0")
-
-    # -- Raw passthrough ------------------------------------------------------
-
-    def send(self, cmd: str):
-        """Send an arbitrary string command (CRLF appended).
-
-        Exposed so callers can issue commands outside the documented
-        ``l``/``on``/``off`` set (e.g. status queries ``s``).
-        """
-        self._serial.send(cmd)
-
-    def read_line(self):
-        """Non-blocking readline. Returns stripped string or ``None``."""
-        return self._serial.read_line()
-
-    def drain(self, max_lines: int = 1000):
-        """Read and discard all pending serial output.
-
-        The 1550 nm slave emits a temperature log line every ~2 s; if left
-        undrained during a slow sweep the serial receive buffer overflows.
-        Call this between setpoints (1550 only) to keep the buffer empty.
-        Returns the number of lines discarded.
-        """
-        n = 0
-        for _ in range(max_lines):
-            if self.read_line() is None:
-                break
-            n += 1
-        return n
-
-    def close(self):
-        """Close the serial connection."""
-        if self._serial:
-            self._serial.close()
-            self._serial = None

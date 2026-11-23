@@ -41,6 +41,7 @@ class NoiseBudget:
 
     @property
     def freqs(self):
+        """The frequency of each bin, Hz: the spectrum's own."""
         return self.spectrum.freqs
 
     @property

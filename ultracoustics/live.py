@@ -21,7 +21,25 @@ from .recorder import copy_span
 
 
 class LiveSpectrum:
+    """The spectrum of the live stream, updated as samples arrive: for a live plot.
+
+    Make one, :meth:`configure` the frequency range and resolution, then call
+    :meth:`update` with a connected :class:`~ultracoustics.Controller` each time
+    the plot redraws. For a spectrum of data you already have, use
+    :meth:`Recording.spectrum <ultracoustics.Recording.spectrum>` instead: it
+    averages every FFT, where this one shows only the newest ``averages``.
+
+    ::
+
+        live = uc.LiveSpectrum()
+        live.configure(0.0, 200e3, fft_size=16384, averages=8)
+        while watching:
+            spectrum = live.update(ctrl)    # a Spectrum in W²/Hz, or None until enough has arrived
+    """
+
     def __init__(self, fs=SAMPLE_RATE, uw_per_count=ADC_TO_POWER_UW):
+        """*fs* is the sample rate in Hz and *uw_per_count* the optical power of one
+        ADC count: leave both alone for a BROADSONIC."""
         self.fs = fs
         self.scale = (uw_per_count * 1e-6) ** 2
         self.plan = spectral.plan_zoom(fs, 0.0, fs / 2, enabled=False)
@@ -32,7 +50,14 @@ class LiveSpectrum:
         self.mean_counts = 0.0  # of the newest data, for the calibration's shot noise
 
     def configure(self, f_lo, f_hi, fft_size, averages, estimator='hann', zoom=True):
-        """Apply view and resolution settings; True if the frequency bins change."""
+        """Set the view (*f_lo* to *f_hi*, Hz) and the resolution; True if the
+        frequency bins change.
+
+        The bin width is ``sample rate / fft_size``, and *averages* is how many of
+        the newest FFTs each spectrum averages. *estimator* is ``'hann'`` or
+        ``'multitaper'``. With *zoom*, a narrow view is computed from the stream
+        reduced to that band, which is much faster at the same bin width.
+        """
         plan = self._plan_for(max(0.0, f_lo), min(self.fs / 2, f_hi), zoom)
         changed = (plan != self.plan or fft_size != self.fft_size)
         resized = changed or averages != self.averages
@@ -58,6 +83,7 @@ class LiveSpectrum:
 
     @property
     def nfft(self):
+        """Points in each FFT actually computed: ``fft_size``, or fewer in a zoomed view."""
         return self.plan.nfft(self.fft_size)
 
     def needed(self):
@@ -70,7 +96,8 @@ class LiveSpectrum:
                                  self.averages * tapers)
 
     def update(self, controller):
-        """A :class:`~.analysis.spectrum.Spectrum` of the newest data, or None."""
+        """A :class:`~ultracoustics.Spectrum` of the newest data from *controller*, or
+        None if not enough has arrived yet."""
         total = int(controller.samples_received)
         if total < self.needed():
             return None
@@ -116,7 +143,7 @@ class LiveSpectrum:
                                                  self.estimator, spectral.MULTITAPER_NW))
 
     def describe(self):
-        """One line for the Resolution card."""
+        """One line saying how the spectrum is being computed, for a display."""
         plan = self.plan
         if plan.decimation == 1:
             return f'Full rate · {self.nfft:,}-pt FFT'

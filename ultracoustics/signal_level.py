@@ -1,4 +1,4 @@
-"""Choosing the 1550 nm laser's power for this probe, as the GUI's Diagnostics › Adjust signal level.
+"""Choosing the 1550 nm laser's power for this probe, as the GUI's Diagnostics > Adjust signal level.
 
 The 1550 nm laser runs at a setting stored on its board. Too high, and the light
 reflected from the probe's brightest fringe saturates the detector; near a mode

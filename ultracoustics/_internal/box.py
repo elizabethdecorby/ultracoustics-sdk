@@ -1,7 +1,7 @@
 """The commands the customer calls stand on, on the master board and the 638.
 
 Not an API. A :class:`~ultracoustics._internal.device.Box` is built from these, and a
-Controller keeps one private. The lab's service tools build on them too.
+Controller keeps one private.
 """
 from dataclasses import replace
 import math

@@ -89,7 +89,7 @@ class Controller:
     samples out as a :class:`Recording`.
     """
 
-    #: The box under it (the lab's service tools give their controller a box with more)
+    #: The class of the private box under it
     _box_class = Box
 
     def __init__(self, verbose=False, ring_seconds: float = 1.2,
@@ -336,16 +336,31 @@ class Controller:
     # -- Checks of the box --------------------------------------------------------
 
     def self_test(self, probe=None, progress=None, cancel=None, probe_serial=None):
-        """The self-test, as the GUI's Diagnostics › Self-check: about six minutes, and the
-        box is left stopped. ``probe_serial`` is the probe's serial number, for the report.
-        Returns a :class:`SelfTestReport`. See :func:`ultracoustics.selftest.run_self_test`.
+        """The self-test, as the GUI's Diagnostics > Self-check: about six minutes, and the
+        box is left stopped. Returns a :class:`SelfTestReport`.
+
+        Keep the probe still and the room quiet. Nothing may be recording or
+        monitoring.
+
+        Parameters
+        ----------
+        probe : ProbeParameters, optional
+            The probe's constants, if Ultracoustics gave you some for this probe.
+            Leave it out to use those of the calibration in use, or the standard ones.
+        progress : callable, optional
+            Called with a dict as each step runs and when it is done, for a display.
+        cancel : callable, optional
+            Return True from it to stop the test after the current step.
+        probe_serial : str, optional
+            The serial number printed on the probe. It is only written into the
+            report, so support can tell which probe was tested.
         """
         from .selftest import run_self_test
         return run_self_test(self, probe=probe, progress=progress, cancel=cancel,
                              probe_serial=probe_serial)
 
     def measure_signal_level(self, progress=None, cancel=None):
-        """Recommend the 1550 nm laser's setting for this probe, as the GUI's Diagnostics ›
+        """Recommend the 1550 nm laser's setting for this probe, as the GUI's Diagnostics >
         Adjust signal level. Changes nothing. Returns a :class:`SignalLevel`, or None if
         cancelled. See :mod:`ultracoustics.signal_level`.
         """

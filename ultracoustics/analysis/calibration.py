@@ -133,6 +133,8 @@ class ProbeParameters:
     name: str = 'Probe 1'
 
     def nep2(self, omega_n, q):
+        """The thermal noise-equivalent pressure², Pa²/Hz, of a dome mode at angular
+        frequency *omega_n* (rad/s) with quality factor *q*."""
         return self.acoustic_correction * float(ucnep.nep_th_squared(
             omega_n, q, m_eff=self.m_eff_kg, a=self.radius_m, T=self.temperature_k))
 
@@ -161,6 +163,18 @@ class Mode:
 
 @dataclass
 class Calibration:
+    """One START's pressure calibration: what turns optical power into sound pressure.
+
+    :meth:`Controller.calibrate_pressure` makes one, recordings keep theirs as
+    ``recording.calibration``, and :func:`load_calibration` opens one the GUI saved.
+    The calls to use are :meth:`to_pressure` (a spectrum in Pa²/Hz),
+    :meth:`sensitivity`, :meth:`noise_budget`, :meth:`pressure_waveform` and
+    :meth:`pa_per_uw`. ``nep2`` is the quietest sound the probe resolves, in Pa²/Hz,
+    and ``fundamental`` the dome's first resonance. The other fields are the fit
+    itself, kept so a recording can be analysed again later.
+
+    A calibration belongs to one probe at one START: do not carry it to another.
+    """
     modes: list               # every fitted mode, sorted by frequency
     probe: ProbeParameters
     dark: Spectrum
@@ -178,10 +192,12 @@ class Calibration:
 
     @property
     def floor_pa2hz(self):
+        """The thermal noise floor in Pa²/Hz: the same number as ``nep2``."""
         return self.nep2
 
     @property
     def fundamental(self):
+        """The dome's first resonance, as a fitted mode: ``f0_hz`` and ``Q``."""
         return fundamental(self.modes, band_top_hz(self.sample_rate))
 
     @cached_property

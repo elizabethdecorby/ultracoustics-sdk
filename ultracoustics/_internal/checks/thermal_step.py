@@ -1,7 +1,7 @@
 """The TEC heat-load step: a laser's own drive stepped 0 -> DAC -> 0 while its TEC holds.
 
-The lab's temperature tests and the Self-check's TEC steps both run
-:func:`run_thermal_step` and :func:`analyse_thermal_step`.
+The Self-check's TEC steps run :func:`run_thermal_step` and
+:func:`analyse_thermal_step`.
 
 The heat the laser dumps into its mount is the disturbance the TEC loop exists
 to reject, so the step needs no serial cable, no scope and no widened target.
@@ -10,7 +10,7 @@ to reject, so the step needs no serial cable, no scope and no widened target.
    at zero. On the 638 the step must be within the board's own cap, read first
    (which also raises the SDK's 638 bound to it), and the box profile that
    chose its compiled gains is recorded.
-2. ``before_settle(laser)``, if given: the lab sets trial gains here.
+2. ``before_settle(laser)``, if given, is called here.
 3. Wait until the TEC holds its target and has settled (``ManualLaser.settle_tec``).
 4. Record the baseline, SET the step, record an edge window, SET zero, record
    the second window. A confirmed STOP ends it on every path.
@@ -168,7 +168,7 @@ def capture_arrays(capture):
     where none) of a capture, and its edge times: ``(t, temp_c, dac, pd, edge_times)``.
 
     Reads samples as rows (``columns`` order, or ThermalSample's when absent) or as
-    dicts (the lab's older captures); edges without ``sensor_t_s`` are placed on the
+    dicts (older captures); edges without ``sensor_t_s`` are placed on the
     board clock through the median offset.
     """
     rows = capture.get('samples') or []

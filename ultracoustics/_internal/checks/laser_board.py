@@ -1,11 +1,11 @@
-"""One laser board in a whole-system manual session, as the lab and the Self-check drive it.
+"""One laser board in a whole-system manual session, as the Self-check drives it.
 
 ``manual_session(ctrl)`` powers both boards with START low and their DACs at zero,
 and ends with a confirmed STOP on every path. Inside it, a :class:`ManualLaser`
 keeps the leases renewed, reads the board's telemetry, sets its DAC with a
 confirmed SET, waits for its TEC and takes photodiode readings no older than a
-SET. The lab's power, noise and heat-load tests and the Self-check's laser
-steps all use it, so a laser is driven one way everywhere.
+SET. Every one of the Self-check's laser steps uses it, so a laser is driven
+one way everywhere.
 """
 import time
 from collections import namedtuple

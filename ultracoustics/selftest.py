@@ -1,6 +1,6 @@
 """The self-test: what the box can tell about itself, closed with the probe in.
 
-It is the GUI's Diagnostics › Self-check. In about six minutes it reads every
+It is the GUI's Diagnostics > Self-check. In about six minutes it reads every
 board's firmware and identity, checks the software and USB link, the detector
 with the lasers off, both lasers' output and temperature control, the probe,
 the lock, the data rate and the spectrum, and measures the lock loop. It changes
@@ -59,6 +59,7 @@ class SelfTestReport:
 
     @property
     def cancelled(self):
+        """Whether ``cancel()`` stopped the self-test before it finished."""
         return bool(self.data.get("cancelled"))
 
     @property
@@ -126,7 +127,7 @@ def probe_serial_text(value):
 
 def short_uid(usb_serial):
     """The short form of a box's 24-character USB serial: its CRC-32 in eight hex
-    digits, as the lab names a box until its main board has a serial. None for none."""
+    digits, which names a box whose main board has no serial of its own. None for none."""
     uid = (usb_serial or "").strip().strip(".")
     if uid in ("", "N/A"):
         return None
